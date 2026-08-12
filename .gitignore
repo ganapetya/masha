@@ -12,6 +12,7 @@
 # Do copy: this repo's own files
 # ---------------------------------------------------------------------------
 !/.gitignore
+!/README.md
 !/git-push-all.sh
 !/ROSpider_WORKSPACE_MEMO.md
 !/.stop_ros.sh
