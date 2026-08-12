@@ -1,0 +1,72 @@
+# robots-world — git root is $HOME (~)
+#
+# Policy: do NOT copy the machine. Only copy Masha project trees.
+# Everything at ~ is ignored unless explicitly un-ignored below.
+
+# ---------------------------------------------------------------------------
+# Do not copy: all of home (dotfiles, caches, Downloads, third_party, …)
+# ---------------------------------------------------------------------------
+/*
+
+# ---------------------------------------------------------------------------
+# Do copy: this repo's own files
+# ---------------------------------------------------------------------------
+!/.gitignore
+!/git-push-all.sh
+!/ROSpider_WORKSPACE_MEMO.md
+!/.stop_ros.sh
+
+# Do copy: ROS 2 workspace, desktop tools, wifi manager
+!/ros2_ws/
+!/software/
+!/wifi_manager/
+
+# ---------------------------------------------------------------------------
+# Do not copy: generated / runtime / oversized / nested-git junk
+# inside the trees we do copy
+# ---------------------------------------------------------------------------
+
+# colcon / ROS build products
+/ros2_ws/build/
+/ros2_ws/install/
+/ros2_ws/log/
+/ros2_ws/**/COLCON_IGNORE
+
+# vendor / nested git metadata (kept on disk, not pushed)
+**/.git.nested
+**/.git.vendor-backup/
+**/.git.bak/
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+
+# TensorRT / PyTorch weights (Jetson-specific or > GitHub 100MB limit)
+**/*.engine
+**/*.pt
+
+# iFlytek / MSC runtime state and temp audio
+**/msc/
+/ros2_ws/src/xf_mic_asr_offline/tmp/
+/ros2_ws/src/xf_mic_asr_offline/config/msc/res/asr/GrmBuilld/
+**/*.pcm
+
+# Device-tree blobs (board firmware, not app code)
+**/*.dtb
+**/*.dtbo
+**/.dtb/
+
+# Archives and editor junk
+**/*.zip
+**/*~
+**/.DS_Store
+**/.idea/
+**/.vscode/
+
+# Tool / wifi logs
+**/*.log
+/software/**/log/
+/wifi_manager/wifi.log
