@@ -71,3 +71,6 @@
 **/*.log
 /software/**/log/
 /wifi_manager/wifi.log
+
+# Local WiFi credentials (keep wifi_conf.py.example)
+/wifi_manager/wifi_conf.py

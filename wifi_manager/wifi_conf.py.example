@@ -1,0 +1,10 @@
+#!/usr/bin/python3
+# coding:utf8
+#
+# Copy to wifi_conf.py on the robot. Do not commit wifi_conf.py.
+
+WIFI_MODE = 2  # 1 = AP, 2 = STA
+# WIFI_AP_SSID = 'WN-Robot'  # AP SSID must start with WN- for the app
+WIFI_AP_PASSWORD = ''
+WIFI_STA_SSID = ''
+WIFI_STA_PASSWORD = ''
