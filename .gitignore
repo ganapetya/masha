@@ -1,4 +1,4 @@
-# robots-world — git root is $HOME (~)
+# masha — git root is $HOME (~), remote is github.com/ganapetya/masha
 #
 # Policy: do NOT copy the machine. Only copy Masha project trees.
 # Everything at ~ is ignored unless explicitly un-ignored below.

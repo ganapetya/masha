@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Add, commit, and push the home-root robots-world repo.
+# Add, commit, and push the home-root Masha repo (github.com/ganapetya/masha).
 #
 # Usage:
 #   ./git-push-all.sh                     # commit with a timestamp message, then push
@@ -83,7 +83,7 @@ trap - EXIT
 
 if ! git remote get-url origin >/dev/null 2>&1; then
   echo "No 'origin' remote. Add it with:" >&2
-  echo "  git remote add origin git@github.com:ganapetya/robots-world.git" >&2
+  echo "  git remote add origin git@github.com:ganapetya/masha.git" >&2
   exit 1
 fi
 
