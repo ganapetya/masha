@@ -99,6 +99,7 @@ File: **`~/ros2_ws/.typerc`**
 | `ASR_LANGUAGE` | `Chinese`, `English` |
 | `ASR_MODE` | `online`, `offline` |
 | `MIC_TYPE` | `xf`, `WonderEchoPro` |
+| `BRINGUP_PROFILE` | `slim` (default), `full` — **not in Tool**; edit `.typerc` |
 | `VERSION` | display-only from typerc |
 | WiFi AP name | derived `WN-<serial>` via serial number |
 
@@ -312,14 +313,21 @@ sudo systemctl restart start_app_node.service
 
 ### What bringup starts (`bringup.launch.py`)
 
-1. `startup_check` — buzz, OLED SSID/IP; if mic `/dev/ring_mic`, launches xf mic test  
+Default **`BRINGUP_PROFILE=slim`** in `~/ros2_ws/.typerc`. Restore the old tree with `profile:=full` or `BRINGUP_PROFILE=full`.
+
+Always (slim and full):
+
+1. `startup_check` — buzz, OLED SSID/IP. Voice launch only if `voice` is on **and** `/dev/ring_mic` exists  
 2. `controller` — board, servos, arm IK, move_controller, EKF, IMU filter, OLED  
 3. Depth camera (`DEPTH_CAMERA_TYPE`)  
 4. LiDAR (`LIDAR_TYPE`)  
-5. rosbridge websocket + web_video_server  
-6. `start_app.launch.py` — perform_actions, lidar, line_following, hand_gesture, intelligent_kick, self_balancing  
-7. Joystick control  
-8. `init_pose` (action `init`)
+5. `init_pose` (action `init`)
+
+Only on **`full`** (or the matching flag: `start_apps`, `joystick`, `rosbridge`, `web_video`, `voice`):
+
+6. rosbridge websocket + web_video_server  
+7. `start_app.launch.py` — perform_actions, lidar, line_following, hand_gesture, intelligent_kick, self_balancing  
+8. Joystick control
 
 ### Env bootstrap
 
@@ -327,7 +335,7 @@ sudo systemctl restart start_app_node.service
 ~/.zshrc
   → ~/ros2_ws/.zshrc
       → ~/ros2_ws/.robotrc
-          → ~/ros2_ws/.typerc     # ASR_LANGUAGE, cameras, need_compile, ROS_DOMAIN_ID
+          → ~/ros2_ws/.typerc     # ASR_LANGUAGE, cameras, need_compile, ROS_DOMAIN_ID, BRINGUP_PROFILE
           → /opt/ros/humble
           → ~/ros2_ws/install
           → ~/third_party/{third_party_ws,aurora_ws,orbbec_ws,rtabmap_ws}/install
@@ -349,7 +357,7 @@ Apps under bringup use a common pattern:
 /<app>/heartbeat      SetBool  (keep-alive while app is active)
 ```
 
-### Examples (stack must be running)
+### Examples (needs `profile:=full` or `start_apps:=true`)
 
 ```bash
 source ~/.zshrc
@@ -412,7 +420,9 @@ ros2 topic pub --once /controller/cmd_vel geometry_msgs/msg/Twist "{}"
 
 ### App nodes typically present under bringup
 
-`lidar_app`, `line_following`, `hand_gesture`, `hand_trajectory`, `intelligent_kick`, `self_balancing`, `perform_actions`, plus controller/sensor stack.
+On **`slim`**: controller/sensor stack only (no demo apps).
+
+On **`full`**: `lidar_app`, `line_following`, `hand_gesture`, `hand_trajectory`, `intelligent_kick`, `self_balancing`, `perform_actions`, plus controller/sensor stack.
 
 Debug launches (from `~/ros2_ws/command`):
 

@@ -42,10 +42,19 @@ def get_wlan():
         return '0.0.0.0'
 
 
+def _as_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ('true', '1', 'yes', 'on')
+    return bool(value)
+
+
 def main():
-    threading.Thread(target=check_mic, daemon=False).start()
     rclpy.init()
     node = rclpy.create_node('startup')
+    node.declare_parameter('enable_voice', False)
+    enable_voice = _as_bool(node.get_parameter('enable_voice').value)
+    if enable_voice:
+        threading.Thread(target=check_mic, daemon=False).start()
     buzzer_pub = node.create_publisher(BuzzerState, '/ros_robot_controller/set_buzzer', 1)
     oled_pub = node.create_publisher(OLEDState, '/ros_robot_controller/set_oled', 1)
     time.sleep(50)
