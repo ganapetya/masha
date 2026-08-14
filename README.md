@@ -61,6 +61,7 @@ Boot: systemd `start_app_node.service` → `ros2 launch bringup bringup.launch.p
 | Path | Role |
 |------|------|
 | `ros2_ws/src/` | All robot ROS 2 packages |
+| `ros2_ws/info/` | Operator notes (`startup.md`, `desktop.md`) |
 | `software/` | Qt tools + **action groups** (`ActionGroups/*.d6a`) — required at runtime |
 | `wifi_manager/` | AP/STA, physical button, remote discovery |
 | `git-push-all.sh` | Add / commit / push (hides nested vendor `.git` dirs) |
