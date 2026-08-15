@@ -23,15 +23,18 @@ export ASR_LANGUAGE=English
 export ASR_MODE=online
 
 # 麦克风类型：WonderEchoPro/xf
-export MIC_TYPE=WonderEchoPro
+# Hardware is the iFlytek XFM-DP circular 6-mic (serial AIUI on /dev/ring_mic), not WonderEcho Pro.
+export MIC_TYPE=xf
 
 export need_compile=False
 #export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export ROS_DOMAIN_ID=27 # Numbers from 0 to 232
 export CYCLONEDDS_URI=file:///etc/cyclonedds/config.xml
-
+export BRINGUP_JOYSTICK=true
 # slim = motion+sensors (default). full = vendor phone/demo tree.
 export BRINGUP_PROFILE=slim
+# Listen for "Hello Hiwonder" on the 6-mic without loading the full phone/demo tree.
+export BRINGUP_VOICE=true
 
 echo -e "\033[32m----------------------------------------------
 当前环境是ROS2|The current environment is ROS2

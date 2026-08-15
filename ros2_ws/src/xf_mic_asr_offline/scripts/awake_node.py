@@ -11,12 +11,99 @@ import serial
 import threading
 from rclpy.node import Node
 from std_srvs.srv import Trigger
-from std_msgs.msg import Int32, Bool
+from std_msgs.msg import Int32, Bool, String
 from xf_mic_asr_offline_msgs.srv import SetString
 
+AIUI_LOG = '/tmp/xf_mic_aiui.log'
+
+
+def _iter_json_objects(text):
+    i = 0
+    n = len(text)
+    while i < n:
+        start = text.find('{', i)
+        if start < 0:
+            return
+        depth = 0
+        in_str = False
+        esc = False
+        ended = False
+        for j in range(start, n):
+            ch = text[j]
+            if esc:
+                esc = False
+                continue
+            if ch == '\\' and in_str:
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    yield text[start:j + 1]
+                    i = j + 1
+                    ended = True
+                    break
+        if not ended:
+            return
+
+
+def _walk_aiui(obj, acc):
+    if isinstance(obj, dict):
+        ivw = obj.get('ivw')
+        if isinstance(ivw, dict) and 'angle' in ivw:
+            try:
+                acc['angle'] = int(ivw['angle'])
+            except (TypeError, ValueError):
+                pass
+        for key in ('text', 'w', 'word', 'rec', 'result', 'keyword'):
+            val = obj.get(key)
+            if isinstance(val, str):
+                piece = val.strip()
+                if piece and piece not in ('{', '}', '[', ']'):
+                    acc['texts'].append(piece)
+        for val in obj.values():
+            _walk_aiui(val, acc)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_aiui(item, acc)
+    elif isinstance(obj, str):
+        raw = obj.strip()
+        if raw.startswith('{') or raw.startswith('['):
+            try:
+                _walk_aiui(json.loads(raw), acc)
+            except Exception:
+                pass
+
+
+def parse_aiui_payload(result):
+    acc = {'angle': None, 'texts': []}
+    if not result:
+        return acc
+    blobs = []
+    try:
+        blobs.append(result.decode('utf-8', errors='ignore'))
+    except Exception:
+        blobs.append('')
+    blobs.append(str(result).replace('\\', ''))
+    for blob in blobs:
+        for raw in _iter_json_objects(blob):
+            try:
+                _walk_aiui(json.loads(raw), acc)
+            except Exception:
+                continue
+    return acc
+
+
 class CircleMic:
-    def __init__(self, port, flag_pub, angle_pub):
-        self.serialHandle = serial.Serial(None, 115200, serial.EIGHTBITS, serial.PARITY_NONE, serial.STOPBITS_ONE, timeout=0.02)
+    def __init__(self, port, flag_pub, angle_pub, iat_pub=None, logger=None):
+        self.serialHandle = serial.Serial(None, 115200, serial.EIGHTBITS, serial.PARITY_NONE, serial.STOPBITS_ONE, timeout=0.05)
         self.serialHandle.rts = False
         self.serialHandle.dtr = False
         self.serialHandle.setPort(port)
@@ -27,6 +114,8 @@ class CircleMic:
         self.pattern = re.compile(r"{\"content.*?aiui_event\"}")
         self.flag_pub = flag_pub
         self.angle_pub = angle_pub
+        self.iat_pub = iat_pub
+        self.logger = logger
 
     # 麦克风阵列切换(microphone array switching)
     def switch_mic(self, mic="mic6_circle"):
@@ -156,34 +245,105 @@ class CircleMic:
     def val_map(self, x, in_min, in_max, out_min, out_max):
         return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
+    def _read_exact(self, n, timeout=0.4):
+        buf = bytearray()
+        deadline = time.time() + timeout
+        while len(buf) < n and time.time() < deadline:
+            chunk = self.serialHandle.read(n - len(buf))
+            if chunk:
+                buf.extend(chunk)
+            else:
+                time.sleep(0.005)
+        return bytes(buf)
+
+    def _log_packet(self, result):
+        try:
+            with open(AIUI_LOG, 'a', encoding='utf-8') as fh:
+                fh.write('%.3f %r\n' % (time.time(), result[:800]))
+        except Exception:
+            pass
+
+    def _fallback_angle(self, result):
+        match = re.search(br'"angle"\s*:\s*([0-9]+(?:\.[0-9]+)?)', result)
+        if not match:
+            return None
+        try:
+            return int(float(match.group(1)))
+        except (TypeError, ValueError):
+            return None
+
+    def _publish_wake(self, angle):
+        mapped = self.val_map(angle, 0, 360, 360, 0) + 240
+        if mapped >= 360:
+            mapped -= 360
+        if self.flag_pub is not None:
+            flag = Bool()
+            flag.data = True
+            self.flag_pub.publish(flag)
+        if self.angle_pub is not None:
+            msg = Int32()
+            msg.data = int(mapped)
+            self.angle_pub.publish(msg)
+        if self.logger is not None:
+            self.logger.info('wake angle=%s' % int(mapped))
+        try:
+            from xf_mic_asr_offline import voice_play
+            voice_play.play('awake', language='English')
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warn('wake play failed: %s' % exc)
+
+    def _publish_iat(self, texts):
+        joined = ' '.join(texts).strip()
+        joined = re.sub(r'\s+', ' ', joined)
+        if len(joined) < 2 or len(joined) > 80:
+            return
+        if '{' in joined or '}' in joined:
+            return
+        if self.iat_pub is not None:
+            msg = String()
+            msg.data = joined
+            self.iat_pub.publish(msg)
+        if self.logger is not None:
+            self.logger.info('serial iat: %s' % joined)
+
     # 检测是否唤醒以及唤醒对应角度(detect whether the robot has been woken up and the corresponding angle of the wakeup signal)
     def get_awake_result(self):
-        while True:
-            recv_data = self.serialHandle.read()
-            if recv_data == b'\xa5':
+        while self.running:
+            try:
                 recv_data = self.serialHandle.read()
-                if recv_data == b'\x01':
+                if recv_data == b'\xa5':
                     recv_data = self.serialHandle.read()
-                    if recv_data == b'\x04':
-                        recv_data = self.serialHandle.read(4)
-                        result = self.serialHandle.read((recv_data[1] << 8 | recv_data[0]) + 1)
-                        if b'content' in result:
-                            m = re.search(self.pattern, str(result).replace('\\', ''))
-                            if m is not None:
-                                m = m.group(0).replace('"{"', '{"').replace('}"', '}')
-                                if m is not None:
-                                    angle = int(json.loads(m)['content']['info']['ivw']['angle'])
-                                    if self.flag_pub is not None and self.angle_pub is not None:
-                                        msg = Bool()
-                                        msg.data = True
-                                        self.flag_pub.publish(msg)
-                                        angle = self.val_map(angle, 0, 360, 360, 0) + 240  # 和圆形兼容(compatible with the circle)
-                                        if angle >= 360:
-                                            angle -= 360
-                                        msg = Int32()
-                                        msg.data = int(angle)
-                                    self.angle_pub.publish(msg)
-            time.sleep(0.02)
+                    if recv_data == b'\x01':
+                        recv_data = self.serialHandle.read()
+                        if recv_data == b'\x04':
+                            header = self._read_exact(4, timeout=0.2)
+                            if len(header) < 2:
+                                continue
+                            need = (header[1] << 8 | header[0]) + 1
+                            result = self._read_exact(need, timeout=0.5)
+                            if not result:
+                                continue
+                            self._log_packet(result)
+                            parsed = parse_aiui_payload(result)
+                            angle = parsed['angle']
+                            if angle is None:
+                                angle = self._fallback_angle(result)
+                            is_wake = (
+                                angle is not None or
+                                b'ivw' in result or
+                                b'hello hi wonder' in result
+                            )
+                            if is_wake:
+                                self._publish_wake(0 if angle is None else angle)
+                            if parsed['texts']:
+                                self._publish_iat(parsed['texts'])
+                else:
+                    time.sleep(0.02)
+            except Exception as exc:
+                if self.logger is not None:
+                    self.logger.warn('serial parse error: %s' % exc)
+                time.sleep(0.05)
     
 class AwakeNode(Node):
     def __init__(self, name):
@@ -206,8 +366,11 @@ class AwakeNode(Node):
 
         self.awake_angle_pub = self.create_publisher(Int32, '~/angle', 1)
         self.awake_flag_pub = self.create_publisher(Bool, '~/awake_flag', 1)
+        self.iat_pub = self.create_publisher(String, '~/iat', 10)
 
-        self.mic = CircleMic(port, self.awake_flag_pub, self.awake_angle_pub)
+        self.mic = CircleMic(
+            port, self.awake_flag_pub, self.awake_angle_pub,
+            iat_pub=self.iat_pub, logger=self.get_logger())
         if enable_setting:
             self.mic.switch_mic(mic_type)
             self.mic.set_wakeup_word(awake_word)
@@ -239,6 +402,7 @@ class AwakeNode(Node):
         return response
 
     def shutdown(self):
+        self.mic.running = False
         self.mic.serialHandle.close()
         time.sleep(1)
        

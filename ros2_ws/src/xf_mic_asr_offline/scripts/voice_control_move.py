@@ -3,6 +3,7 @@
 
 # 语音控制移动(voice control move)
 import os
+import re
 import json
 import math
 import time
@@ -22,6 +23,68 @@ from servo_controller_msgs.msg import ServosPosition
 from ros_robot_controller_msgs.msg import BuzzerState
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from servo_controller.action_group_controller import ActionGroupController
+
+SPECIAL_WORDS = {
+    '唤醒成功(wake-up-success)',
+    '休眠(Sleep)',
+    '失败5次(Fail-5-times)',
+    '失败10次(Fail-10-times)',
+    '失败10次(Fail-10-times',
+}
+
+# Longer phrases first so "go forward" wins over "forward".
+COMMAND_ALIASES = (
+    ('go forwards', 'go forward'),
+    ('go forward', 'go forward'),
+    ('move forward', 'go forward'),
+    ('walk forward', 'go forward'),
+    ('go backward', 'go backward'),
+    ('go backwards', 'go backward'),
+    ('move backward', 'go backward'),
+    ('walk backward', 'go backward'),
+    ('go back', 'go backward'),
+    ('move back', 'go backward'),
+    ('turn to the left', 'turn left'),
+    ('turn to the right', 'turn right'),
+    ('turn left', 'turn left'),
+    ('turn right', 'turn right'),
+    ('move left', 'move left'),
+    ('move right', 'move right'),
+    ('come here', 'come here'),
+    ('come over', 'come here'),
+    ('跳个舞吧', 'dance'),
+    ('左平移', 'move left'),
+    ('右平移', 'move right'),
+    ('前进', 'go forward'),
+    ('后退', 'go backward'),
+    ('左转', 'turn left'),
+    ('右转', 'turn right'),
+    ('过来', 'come here'),
+    ('停下', 'stop'),
+    ('stop', 'stop'),
+    ('dance', 'dance'),
+    ('forward', 'go forward'),
+    ('backward', 'go backward'),
+    ('back', 'go backward'),
+    ('come', 'come here'),
+)
+
+
+def match_command(raw):
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text in SPECIAL_WORDS:
+        return text
+    normalized = text.lower()
+    normalized = re.sub(r'[^a-z0-9\u4e00-\u9fff\s]', ' ', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    if not normalized:
+        return None
+    for phrase, command in COMMAND_ALIASES:
+        if phrase == normalized or phrase in normalized:
+            return command
+    return normalized
 
 MAX_SCAN_ANGLE = 240  # 激光的扫描角度,去掉总是被遮挡的部分degree(laser scanning angle, removing obstructed degrees)
 CAR_WIDTH = 0.4  # meter
@@ -64,7 +127,7 @@ class VoiceControMovelNode(Node):
         time.sleep(self.get_parameter('delay').value)
 
         self.get_logger().info('唤醒口令: 小幻小幻(Wake up word: hello hiwonder)')
-        self.get_logger().info('唤醒后15秒内可以不用再唤醒(No need to wake up within 15 seconds after waking up)')
+        self.get_logger().info('唤醒后可以说指令(After wake-up say: go forward / turn left / dance / come here)')
         self.get_logger().info('控制指令: 左转 右转 前进 后退 过来 跳个舞吧(Voice command: turn left/turn right/go forward/go backward/come here /dance)')
         self.time_stamp = time.time()
         self.current_time_stamp = time.time()
@@ -88,23 +151,17 @@ class VoiceControMovelNode(Node):
         voice_play.play(name, language=self.language)
 
     def words_callback(self, msg):
-        self.words = json.dumps(msg.data, ensure_ascii=False)[1:-1]
-        if self.language == 'Chinese':
+        self.words = match_command(msg.data)
+        if self.language == 'Chinese' and self.words not in SPECIAL_WORDS and self.words:
             self.words = self.words.replace(' ', '')
         self.get_logger().info('words:%s' % self.words)
-        if self.words is not None and self.words not in ['唤醒成功(wake-up-success)', '休眠(Sleep)', '失败5次(Fail-5-times)',
-                                                         '失败10次(Fail-10-times']:
-            pass
-        elif self.words == '唤醒成功(wake-up-success)':
-            self.play('awake')
-        elif self.words == '休眠(Sleep)':
-            msg = BuzzerState()
-            msg.freq = 1000
-            msg.on_time = 0.1
-
-            msg.off_time = 0.01
-            msg.repeat = 1
-            self.buzzer_pub.publish(msg)
+        if self.words == '休眠(Sleep)':
+            buzz = BuzzerState()
+            buzz.freq = 1000
+            buzz.on_time = 0.1
+            buzz.off_time = 0.01
+            buzz.repeat = 1
+            self.buzzer_pub.publish(buzz)
 
     def angle_callback(self, msg):
         self.angle = msg.data
@@ -116,58 +173,74 @@ class VoiceControMovelNode(Node):
     def main(self):
         while True:
             if self.words is not None:
-                self.move = True
+                words = self.words
+                self.words = None
+                if words in SPECIAL_WORDS:
+                    continue
                 twist = Twist()
-                if self.words == '前进' or self.words == 'go forward':
+                matched = True
+                if words in ('前进', 'go forward'):
                     self.play('go')
-                    self.time_stamp = time.time() + 4
-                    twist.linear.x = 0.05
-                elif self.words == '后退' or self.words == 'go backward':
+                    self.controller.traveling(gait=2, stride=40, height=20, direction=0, time=0.7, steps=6)
+                    self.time_stamp = time.time() + 5
+                    twist.linear.x = 0.12
+                elif words in ('后退', 'go backward'):
                     self.play('back')
-                    self.time_stamp = time.time() + 4
-                    twist.linear.x = -0.05
-                elif self.words == '左转' or self.words == 'turn left':
+                    self.controller.traveling(gait=2, stride=40, height=20, direction=180, time=0.7, steps=6)
+                    self.time_stamp = time.time() + 5
+                    twist.linear.x = -0.12
+                elif words in ('左转', 'turn left'):
                     self.play('turn_left')
-                    self.time_stamp = time.time() + 4
-                    twist.angular.z = 0.3
-                elif self.words == '右转' or self.words == 'turn right':
+                    self.controller.traveling(gait=2, stride=0, height=20, rotation=18, time=0.7, steps=6)
+                    self.time_stamp = time.time() + 5
+                    twist.angular.z = 0.4
+                elif words in ('右转', 'turn right'):
                     self.play('turn_right')
-                    self.time_stamp = time.time() + 4
-                    twist.angular.z = -0.3
-                elif self.words == '左平移' or self.words == 'move left':
+                    self.controller.traveling(gait=2, stride=0, height=20, rotation=-18, time=0.7, steps=6)
+                    self.time_stamp = time.time() + 5
+                    twist.angular.z = -0.4
+                elif words in ('左平移', 'move left'):
                     self.play('move_left')
-                    self.time_stamp = time.time() + 4
-                    twist.linear.y = 0.05
-                elif self.words == '右平移' or self.words == 'move right':
+                    self.controller.traveling(gait=2, stride=40, height=20, direction=90, time=0.7, steps=6)
+                    self.time_stamp = time.time() + 5
+                    twist.linear.y = 0.12
+                elif words in ('右平移', 'move right'):
                     self.play('move_right')
-                    self.time_stamp = time.time() + 4
-                    twist.linear.y = -0.05
-                elif self.words == '跳个舞吧' or self.words == 'dance':
+                    self.controller.traveling(gait=2, stride=40, height=20, direction=270, time=0.7, steps=6)
+                    self.time_stamp = time.time() + 5
+                    twist.linear.y = -0.12
+                elif words in ('跳个舞吧', 'dance'):
                     self.play('dance')
                     self.agc_controller.run_action('twist')
-
-                elif self.words == '过来' or self.words == 'come here':
+                elif words in ('过来', 'come here'):
+                    if self.angle is None:
+                        self.get_logger().warn('come here ignored: no wake angle yet')
+                        continue
                     self.play('come')
                     self.get_logger().info('\033[1;32m%s\033[0m' % self.angle)
-
                     if 270 > self.angle > 90:
                         twist.angular.z = -0.3
                         self.time_stamp = time.time() + abs(math.radians(self.angle - 90) / twist.angular.z)
                     else:
                         twist.angular.z = 0.3
                         if self.angle <= 90:
-                            self.angle = 90 - self.angle
+                            turn = 90 - self.angle
                         else:
-                            self.angle = 450 - self.angle
-                        self.time_stamp = time.time() + abs(math.radians(self.angle) / twist.angular.z)
+                            turn = 450 - self.angle
+                        self.time_stamp = time.time() + abs(math.radians(turn) / twist.angular.z)
                     self.lidar_follow = True
-                elif self.words == '休眠(Sleep)':
-                    time.sleep(0.01)
-                self.words = None
-                self.haved_stop = False
-                if self.move:
+                elif words == 'stop':
+                    self.play('stop')
+                    self.controller.traveling(gait=-2, time=1, steps=0)
+                    self.time_stamp = time.time()
+                    self.haved_stop = True
+                else:
+                    matched = False
+                    self.get_logger().info('unmatched command: %s' % words)
+                if matched:
+                    self.move = True
+                    self.haved_stop = False
                     self.cmd_vel_pub.publish(twist)
-
             else:
                 time.sleep(0.01)
             self.current_time_stamp = time.time()

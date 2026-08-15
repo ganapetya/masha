@@ -11,7 +11,7 @@ def launch_setup(context):
         appid = LaunchConfiguration('appid', default="3f498ac9")
         enable_setting = LaunchConfiguration('enable_setting', default='false')
         confidence = LaunchConfiguration('confidence', default='18')  # 语音识别结果自信度阈值，取值：0-100(voice recognition result confidence ranging from 0 to 100)
-        seconds_per_order = LaunchConfiguration('seconds_per_order', default='15')  # 每次语音指令录音长度，单位：秒(recording length of each voice command in seconds)
+        seconds_per_order = LaunchConfiguration('seconds_per_order', default='8')  # 每次语音指令录音长度，单位：秒(recording length of each voice command in seconds)
         chinese_awake_words = LaunchConfiguration('chinese_awake_words', default='xiao3 huan4 xiao3 huan4')
         english_awake_words = LaunchConfiguration('english_awake_words', default='hello hi wonder')
         language = LaunchConfiguration('language', default=os.environ['ASR_LANGUAGE']).perform(context)
@@ -32,6 +32,7 @@ def launch_setup(context):
             package="xf_mic_asr_offline",
             executable="awake_node.py",
             output='screen',
+            additional_env={'PYTHONUNBUFFERED': '1'},
             parameters=[{"port": "/dev/ring_mic",
                          "mic_type": "mic6_circle",
                          "awake_word": awake_words,
@@ -42,6 +43,7 @@ def launch_setup(context):
             package="xf_mic_asr_offline",
             executable="asr_node.py",
             output='screen',
+            additional_env={'PYTHONUNBUFFERED': '1'},
             parameters=[{"confidence": confidence,
                          "seconds_per_order": seconds_per_order}],
         )

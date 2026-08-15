@@ -18,7 +18,8 @@ def launch_setup(context):
         PythonLaunchDescriptionSource(
             os.path.join(xf_mic_asr_offline_package_path, 'launch/mic_init.launch.py')),
         launch_arguments={
-            'enable_setting': 'true',  
+            # Wake word is already stored on the 6-mic; skip the 30s rewrite.
+            'enable_setting': 'false',
         }.items(),
 
     )
@@ -27,7 +28,8 @@ def launch_setup(context):
         package='xf_mic_asr_offline',
         executable='voice_control_move.py',
         output='screen',
-        parameters=[{'delay': 0}], 
+        additional_env={'PYTHONUNBUFFERED': '1'},
+        parameters=[{'delay': 0, 'move': True}],
     )
 
     return [mic_launch, voice_control_move_node]
