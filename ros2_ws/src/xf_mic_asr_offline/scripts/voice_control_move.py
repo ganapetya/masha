@@ -16,7 +16,7 @@ from rclpy.node import Node
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String, Int32
+from std_msgs.msg import String
 from controller import controller_client
 from xf_mic_asr_offline import voice_play
 from servo_controller_msgs.msg import ServosPosition
@@ -94,7 +94,6 @@ class VoiceControMovelNode(Node):
         rclpy.init()
         super().__init__(name)
         
-        self.angle = None
         self.words = None
         self.running = True
         self.haved_stop = False
@@ -119,14 +118,13 @@ class VoiceControMovelNode(Node):
         self.buzzer_pub = self.create_publisher(BuzzerState, '/ros_robot_controller/set_buzzer', 1)
         qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(String, '/asr_node/voice_words', self.words_callback, 1)
-        self.create_subscription(Int32, '/awake_node/angle', self.angle_callback, 1)
 
         self.client = self.create_client(Trigger, '/asr_node/init_finish')
         self.client.wait_for_service()  # 阻塞等待(blocking wait)
         self.declare_parameter('delay', 0)
         time.sleep(self.get_parameter('delay').value)
 
-        self.get_logger().info('唤醒口令: 小幻小幻(Wake up word: hello hiwonder)')
+        self.get_logger().info('唤醒口令: Hello Masha / Hi Masha / Shalom Masha')
         self.get_logger().info('唤醒后可以说指令(After wake-up say: go forward / turn left / dance / come here)')
         self.get_logger().info('控制指令: 左转 右转 前进 后退 过来 跳个舞吧(Voice command: turn left/turn right/go forward/go backward/come here /dance)')
         self.time_stamp = time.time()
@@ -162,13 +160,6 @@ class VoiceControMovelNode(Node):
             buzz.off_time = 0.01
             buzz.repeat = 1
             self.buzzer_pub.publish(buzz)
-
-    def angle_callback(self, msg):
-        self.angle = msg.data
-        self.get_logger().info('angle:%s' % self.angle)
-        self.start_follow = False
-        self.start_follow = False 
-
 
     def main(self):
         while True:
@@ -213,27 +204,19 @@ class VoiceControMovelNode(Node):
                     self.play('dance')
                     self.agc_controller.run_action('twist')
                 elif words in ('过来', 'come here'):
-                    if self.angle is None:
-                        self.get_logger().warn('come here ignored: no wake angle yet')
-                        continue
                     self.play('come')
-                    self.get_logger().info('\033[1;32m%s\033[0m' % self.angle)
-                    if 270 > self.angle > 90:
-                        twist.angular.z = -0.3
-                        self.time_stamp = time.time() + abs(math.radians(self.angle - 90) / twist.angular.z)
-                    else:
-                        twist.angular.z = 0.3
-                        if self.angle <= 90:
-                            turn = 90 - self.angle
-                        else:
-                            turn = 450 - self.angle
-                        self.time_stamp = time.time() + abs(math.radians(turn) / twist.angular.z)
-                    self.lidar_follow = True
+                    self.controller.traveling(gait=2, stride=40, height=20, direction=0, time=0.7, steps=6)
+                    self.time_stamp = time.time() + 5
+                    twist.linear.x = 0.12
                 elif words == 'stop':
                     self.play('stop')
                     self.controller.traveling(gait=-2, time=1, steps=0)
+                    self.cmd_vel_pub.publish(Twist())
                     self.time_stamp = time.time()
                     self.haved_stop = True
+                    self.move = False
+                    self.get_logger().info('stopped, still listening')
+                    continue
                 else:
                     matched = False
                     self.get_logger().info('unmatched command: %s' % words)

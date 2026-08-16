@@ -4,23 +4,31 @@
 import os
 import re
 import time
+import difflib
+import threading
 import subprocess
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from std_srvs.srv import Trigger
-from std_msgs.msg import String, Bool
+from std_msgs.msg import String
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from xf_mic_asr_offline import voice_play
+from xf_mic_asr_offline import identity, voice_play
 
-# iFlytek MSC trial is expired (11212). Use sherpa-onnx on the 6-mic USB
-# stream, one fixed-length capture after the wake beep.
+# Voice is sherpa-onnx on PulseAudio only. See ros2_ws/info/voice.md.
 
 
 SAMPLE_RATE = 16000
+# Stay in command mode this long after the last wake or command.
+LISTEN_SECONDS = 120.0
+# Hold a greeting across a short pause so "Hello" + "Masha" still wakes.
+GREET_HOLD_SECONDS = 2.8
+IDLE_CLIP_SECONDS = 2.4
+ASR_DEBUG_LOG = '/tmp/masha-asr.log'
 SHERPA_ROOT = os.path.expanduser('~/third_party/sherpa-onnx')
 RECORD_DEVICES = (
+    'pulse',
     'plughw:CARD=XFMDPV0018,DEV=0',
     'hw:CARD=XFMDPV0018,DEV=0',
 )
@@ -29,6 +37,16 @@ COMMAND_PHRASES = (
     ('go forward', 'go forward'),
     ('move forward', 'go forward'),
     ('walk forward', 'go forward'),
+    ('go ahead', 'go forward'),
+    ('go fervent', 'go forward'),
+    ('go forwent', 'go forward'),
+    ('go foreword', 'go forward'),
+    ('go forword', 'go forward'),
+    ('go forth', 'go forward'),
+    ('go ford', 'go forward'),
+    ('go for', 'go forward'),
+    ('go fer', 'go forward'),
+    ('goforward', 'go forward'),
     ('go backwards', 'go backward'),
     ('go backward', 'go backward'),
     ('move backward', 'go backward'),
@@ -54,6 +72,29 @@ COMMAND_PHRASES = (
     ('dance', 'dance'),
     ('stop', 'stop'),
 )
+
+_FORWARD_HINTS = (
+    'forward', 'forwards', 'fervent', 'forwent', 'foreword', 'forword',
+    'fourward', 'forth', 'ahead', 'onward', 'onwards',
+)
+_BACKWARD_HINTS = ('backward', 'backwards', 'back')
+_FORWARD_PREFIXES = ('for', 'fer', 'fwd', 'ward')
+SPEECH_PEAK = 0.05
+SILENCE_CHUNKS = 5   # 0.5 s of quiet ends an utterance
+MIN_SPEECH_CHUNKS = 4
+MAX_SPEECH_CHUNKS = 40  # 4 s cap
+
+
+def _close_word(token, target, ratio=0.72):
+    if not token or abs(len(token) - len(target)) > 3:
+        return False
+    return difflib.SequenceMatcher(None, token, target).ratio() >= ratio
+
+
+def _looks_forward(token):
+    if token in _FORWARD_HINTS:
+        return True
+    return _close_word(token, 'forward') or _close_word(token, 'forwards')
 
 
 def _model_files(language):
@@ -83,15 +124,22 @@ def extract_command(text):
     for phrase, command in COMMAND_PHRASES:
         if phrase in low:
             return command
-    tokens = set(low.split())
-    if 'dance' in tokens:
+    tokens = low.split()
+    token_set = set(tokens)
+    if 'dance' in token_set:
         return 'dance'
-    if 'stop' in tokens:
+    if 'stop' in token_set:
         return 'stop'
-    if 'forward' in tokens:
-        return 'go forward'
-    if 'backward' in tokens or 'backwards' in tokens:
+    if token_set & set(_BACKWARD_HINTS):
         return 'go backward'
+    if any(_looks_forward(tok) for tok in tokens):
+        return 'go forward'
+    if 'go' in token_set and any(tok.startswith(('for', 'fer')) for tok in tokens):
+        return 'go forward'
+    if 'left' in token_set:
+        return 'turn left'
+    if 'right' in token_set:
+        return 'turn right'
     return ''
 
 
@@ -101,29 +149,32 @@ class ASRNode(Node):
         super().__init__(name)
 
         self.awake_flag = False
-        self.busy = False
-        self.first_listen = True
-        self.serial_text = ''
         self.session_deadline = 0.0
+        self.ignore_until = 0.0
+        self.last_partial = ''
+        self.last_activity = 0.0
+        self.pending_greeting_until = 0.0
+        self.cmd_chunks = []
+        self.idle_chunks = []
         self.declare_parameter('confidence', 18)
-        self.declare_parameter('seconds_per_order', 4)
+        self.declare_parameter('seconds_per_order', 5)
 
-        self.seconds_per_order = max(int(self.get_parameter('seconds_per_order').value), 3)
+        self.seconds_per_order = min(max(int(self.get_parameter('seconds_per_order').value), 4), 6)
         self.language = os.environ.get('ASR_LANGUAGE', 'English')
 
         self.control = self.create_publisher(String, '~/voice_words', 1)
         self.recognizer = None
+        self.stream = None
         self._load_recognizer()
 
         timer_cb_group = MutuallyExclusiveCallbackGroup()
-        self.create_subscription(Bool, '/awake_node/awake_flag', self.awake_flag_callback, 1)
-        self.create_subscription(String, '/awake_node/iat', self.iat_callback, 10)
-
-        self.create_client(Trigger, '/awake_node/init_finish').wait_for_service()
-
-        self.create_timer(0.1, self.main, callback_group=timer_cb_group)
+        self.create_timer(0.2, self.session_timer, callback_group=timer_cb_group)
         self.create_service(Trigger, '~/init_finish', self.get_node_state)
+        threading.Thread(target=self.audio_loop, daemon=True).start()
+        self.get_logger().info('\033[1;32mI am %s\033[0m' % identity.ROBOT_NAME)
+        self.get_logger().info('\033[1;32mWake on: %s\033[0m' % identity.wake_phrase_log())
         self.get_logger().info('\033[1;32m%s\033[0m' % 'start')
+        self._debug_log('start name=%s wake=%s' % (identity.ROBOT_NAME, identity.wake_phrase_log()))
 
     def _load_recognizer(self):
         import sherpa_onnx
@@ -142,11 +193,16 @@ class ASRNode(Node):
             num_threads=2,
             sample_rate=SAMPLE_RATE,
             feature_dim=80,
-            enable_endpoint_detection=False,
+            enable_endpoint_detection=True,
             decoding_method='greedy_search',
             provider='cpu',
         )
+        self._reset_stream()
         self.get_logger().info('\033[1;32msherpa-onnx ready\033[0m')
+
+    def _reset_stream(self):
+        self.stream = self.recognizer.create_stream()
+        self.last_partial = ''
 
     def get_node_state(self, request, response):
         response.success = True
@@ -157,21 +213,46 @@ class ASRNode(Node):
         msg.data = text
         self.control.publish(msg)
 
-    def awake_flag_callback(self, msg):
-        if not msg.data:
-            return
-        self.awake_flag = True
-        self.first_listen = True
-        self.serial_text = ''
-        self.session_deadline = time.time() + 15.0
-        self._publish_words('唤醒成功(wake-up-success)')
-        self.get_logger().info('\033[1;32m唤醒成功(wake-up-success)\033[0m')
+    def _debug_log(self, line):
+        try:
+            with open(ASR_DEBUG_LOG, 'a', encoding='utf-8') as fh:
+                fh.write('%.3f %s\n' % (time.time(), line))
+        except Exception:
+            pass
 
-    def iat_callback(self, msg):
-        cmd = extract_command(msg.data)
-        if cmd:
-            self.serial_text = cmd
-            self.get_logger().info('got serial command: %s' % cmd)
+    def _keep_awake(self, seconds=LISTEN_SECONDS):
+        self.awake_flag = True
+        self.last_activity = time.time()
+        self.session_deadline = time.time() + seconds
+
+    def _text_is_wake(self, text):
+        if identity.is_wake_phrase(text):
+            return True
+        if identity.has_name(text) and time.time() < self.pending_greeting_until:
+            return True
+        return False
+
+    def _note_partial(self, text):
+        if identity.has_greeting(text):
+            self.pending_greeting_until = time.time() + GREET_HOLD_SECONDS
+        if identity.has_name(text) and time.time() < self.pending_greeting_until:
+            return True
+        return identity.is_wake_phrase(text)
+
+    def _trigger_wake(self, raw_text):
+        already = self.awake_flag
+        self.get_logger().info(
+            '\033[1;32mheard %s: %r\033[0m' % (identity.ROBOT_NAME, raw_text))
+        self._debug_log('wake %r' % raw_text)
+        self.pending_greeting_until = 0.0
+        self._keep_awake()
+        self.cmd_chunks = []
+        self.idle_chunks = []
+        self._reset_stream()
+        if not already:
+            self._publish_words('唤醒成功(wake-up-success)')
+        voice_play.play('awake', language='English')
+        self.ignore_until = time.time() + 0.5
 
     def _open_recorder(self):
         last_err = ''
@@ -195,62 +276,21 @@ class ASRNode(Node):
                 last_err = '%s: %s' % (device, exc)
         raise RuntimeError('arecord failed: %s' % last_err)
 
-    def listen_and_recognize(self):
-        if self.recognizer is None:
-            return ''
-
-        # First listen waits out the wake clip. Later commands in the
-        # same session start recording immediately.
-        if self.first_listen:
-            time.sleep(1.6)
-            self.first_listen = False
-        cmd = extract_command(self.serial_text)
-        if cmd:
-            self.serial_text = ''
-            return cmd
-
-        chunk_bytes = int(SAMPLE_RATE * 0.1) * 2
-        chunks = []
-        peak = 0.0
-        proc = None
+    def _transcribe_chunk(self, samples):
+        self.stream.accept_waveform(SAMPLE_RATE, samples)
+        while self.recognizer.is_ready(self.stream):
+            self.recognizer.decode_stream(self.stream)
+        text = (self.recognizer.get_result(self.stream) or '').strip()
+        if self.language != 'Chinese':
+            text = text.lower()
+        endpoint = False
         try:
-            proc = self._open_recorder()
-            nchunks = int(self.seconds_per_order / 0.1)
-            for i in range(nchunks):
-                if not rclpy.ok():
-                    break
-                cmd = extract_command(self.serial_text)
-                if cmd:
-                    self.serial_text = ''
-                    return cmd
-                raw = proc.stdout.read(chunk_bytes)
-                if not raw:
-                    break
-                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                if i < 2:
-                    continue
-                if samples.size:
-                    peak = max(peak, float(np.max(np.abs(samples))))
-                    chunks.append(samples)
-        except Exception as exc:
-            self.get_logger().error('6-mic record failed: %s' % exc)
-            return ''
-        finally:
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=1)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+            endpoint = bool(self.recognizer.is_endpoint(self.stream))
+        except Exception:
+            endpoint = False
+        return text, endpoint
 
-        if not chunks:
-            self.get_logger().info('listen peak=%.4f no audio' % peak)
-            return ''
-
-        audio = np.concatenate(chunks)
+    def _decode_clip(self, audio):
         stream = self.recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, audio)
         tail = np.zeros(int(SAMPLE_RATE * 0.4), dtype=np.float32)
@@ -258,35 +298,139 @@ class ASRNode(Node):
         stream.input_finished()
         while self.recognizer.is_ready(stream):
             self.recognizer.decode_stream(stream)
-        raw_text = (self.recognizer.get_result(stream) or '').strip()
+        text = (self.recognizer.get_result(stream) or '').strip()
         if self.language != 'Chinese':
-            raw_text = raw_text.lower()
-        cmd = extract_command(raw_text)
-        self.get_logger().info('listen peak=%.4f raw=%r cmd=%r' % (peak, raw_text, cmd))
-        return cmd
+            text = text.lower()
+        return text
 
-    def main(self):
-        if not self.awake_flag or self.busy:
+    def _handle_command_audio(self, chunks):
+        audio = np.concatenate(chunks)
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        text = self._decode_clip(audio)
+        cmd = extract_command(text)
+        self.get_logger().info(
+            'command clip peak=%.3f raw=%r cmd=%r' % (peak, text, cmd))
+        self._debug_log('cmd peak=%.3f raw=%r cmd=%r' % (peak, text, cmd))
+        if self._note_partial(text) or self._text_is_wake(text):
+            self._trigger_wake(text)
             return
-        if time.time() > self.session_deadline:
+        if cmd:
+            self._accept_command(cmd)
+
+    def audio_loop(self):
+        chunk_bytes = int(SAMPLE_RATE * 0.1) * 2
+        proc = None
+        last_log = 0.0
+        last_clip = 0.0
+        while rclpy.ok():
+            try:
+                if proc is None or proc.poll() is not None:
+                    if proc is not None:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    proc = self._open_recorder()
+                raw = proc.stdout.read(chunk_bytes)
+                if not raw:
+                    time.sleep(0.02)
+                    continue
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                if time.time() < self.ignore_until:
+                    self.cmd_chunks = []
+                    self.idle_chunks = []
+                    continue
+
+                if not self.awake_flag:
+                    self.cmd_chunks = []
+                    self.idle_chunks.append(samples)
+                    idle_need = int(IDLE_CLIP_SECONDS / 0.1)
+                    if len(self.idle_chunks) > idle_need:
+                        self.idle_chunks = self.idle_chunks[-idle_need:]
+                    text, endpoint = self._transcribe_chunk(samples)
+                    if text and text != self.last_partial:
+                        self.last_partial = text
+                        now = time.time()
+                        if now - last_log > 0.8:
+                            last_log = now
+                            self.get_logger().info('idle heard: %r' % text)
+                            self._debug_log('idle %r' % text)
+                    if self._note_partial(text) or self._text_is_wake(text):
+                        self._trigger_wake(text)
+                        continue
+                    # Whole-utterance clip catches "Hello"+"Masha" after a reset.
+                    now = time.time()
+                    greeting_hold = now < self.pending_greeting_until
+                    idle_peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+                    if (len(self.idle_chunks) >= 12 and now - last_clip > 0.5
+                            and (greeting_hold or idle_peak > 0.03 or text)):
+                        last_clip = now
+                        clip_text = self._decode_clip(np.concatenate(self.idle_chunks))
+                        if clip_text and clip_text != self.last_partial:
+                            self.get_logger().info('idle clip: %r' % clip_text)
+                            self._debug_log('idle-clip %r' % clip_text)
+                            last_log = now
+                        if self._note_partial(clip_text) or self._text_is_wake(clip_text):
+                            self._trigger_wake(clip_text)
+                            continue
+                    cmd = extract_command(text)
+                    recently = (time.time() - self.last_activity) < LISTEN_SECONDS
+                    if cmd and recently:
+                        self.get_logger().info('still in session, taking %s' % cmd)
+                        self._accept_command(cmd)
+                        continue
+                    # Keep the stream if we just heard "hello" so "Masha" can land.
+                    greeting_hold = time.time() < self.pending_greeting_until
+                    if endpoint and text and not greeting_hold and not self._text_is_wake(text):
+                        self._reset_stream()
+                    continue
+
+                # Awake: wait for a spoken burst, then decode that utterance.
+                # Fixed 5 s windows were mostly silence and late, and sherpa
+                # often wrote "go fervent" for "go forward".
+                peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+                if peak >= SPEECH_PEAK:
+                    self.cmd_chunks.append(samples)
+                    if len(self.cmd_chunks) >= MAX_SPEECH_CHUNKS:
+                        self._handle_command_audio(self.cmd_chunks)
+                        self.cmd_chunks = []
+                    continue
+                if not self.cmd_chunks:
+                    continue
+                self.cmd_chunks.append(samples)
+                trailing_quiet = 0
+                for chunk in reversed(self.cmd_chunks):
+                    chunk_peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+                    if chunk_peak < SPEECH_PEAK:
+                        trailing_quiet += 1
+                    else:
+                        break
+                spoke = len(self.cmd_chunks) - trailing_quiet
+                if trailing_quiet >= SILENCE_CHUNKS and spoke >= MIN_SPEECH_CHUNKS:
+                    self._handle_command_audio(self.cmd_chunks)
+                    self.cmd_chunks = []
+                elif len(self.cmd_chunks) >= MAX_SPEECH_CHUNKS:
+                    self._handle_command_audio(self.cmd_chunks)
+                    self.cmd_chunks = []
+            except Exception as exc:
+                self.get_logger().error('audio loop: %s' % exc)
+                time.sleep(0.3)
+                proc = None
+
+    def _accept_command(self, cmd):
+        self._keep_awake()
+        self._publish_words(cmd)
+        self.get_logger().info('\033[1;32mok %s (still listening)\033[0m' % cmd)
+        # Stop finishes quickly; other commands talk over the prompt wav.
+        self.ignore_until = time.time() + (0.8 if cmd == 'stop' else 1.6)
+        self.cmd_chunks = []
+        self._reset_stream()
+
+    def session_timer(self):
+        if self.awake_flag and time.time() > self.session_deadline:
             self.awake_flag = False
-            self.first_listen = True
-            return
-        self.busy = True
-        try:
-            text = self.listen_and_recognize()
-            self.get_logger().info('\033[1;32mresult: %s\033[0m' % text)
-            if text:
-                self.session_deadline = time.time() + 15.0
-                self._publish_words(text)
-                self.get_logger().info('\033[1;32mok\033[0m')
-                time.sleep(2.8)
-                return
-            if time.time() > self.session_deadline:
-                self.awake_flag = False
-                self.first_listen = True
-        finally:
-            self.busy = False
+            self.get_logger().info('sleep (say Hello Masha to wake)')
+            self._reset_stream()
 
 
 def main():

@@ -73,7 +73,7 @@ class NavigationTransport(Node):
         self.get_logger().info('\033[1;32m%s\033[0m' % 'start')
 
 
-        self.get_logger().info('唤醒口令: 小幻小幻(Wake up word: hello hiwonder)')
+        self.get_logger().info('唤醒口令: Hello Masha / Hi Masha / Shalom Masha')
         self.get_logger().info('唤醒后15秒内可以不用再唤醒(No need to wake up within 15 seconds after waking up)')
         self.get_logger().info('控制指令: 本次任务需要排除易燃物/易爆物/有毒物')
         self.play('running')

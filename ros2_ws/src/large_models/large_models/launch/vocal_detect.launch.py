@@ -12,12 +12,14 @@ def launch_setup(context, *args, **kwargs):
     enable_wakeup = LaunchConfiguration('enable_wakeup', default='true')
     awake_method = LaunchConfiguration('awake_method', default=os.environ['MIC_TYPE'])
     chinese_awake_words = LaunchConfiguration('chinese_awake_words', default='xiao3 huan4 xiao3 huan4')
+    english_awake_words = LaunchConfiguration('english_awake_words', default='hello masha')
     enable_setting = LaunchConfiguration('enable_setting', default='false')
     
     mode_arg = DeclareLaunchArgument('mode', default_value=mode)
     enable_wakeup_arg = DeclareLaunchArgument('enable_wakeup', default_value=enable_wakeup) 
     awake_method_arg = DeclareLaunchArgument('awake_method', default_value=awake_method)
     awake_words_arg = DeclareLaunchArgument('chinese_awake_words', default_value=chinese_awake_words)
+    english_awake_words_arg = DeclareLaunchArgument('english_awake_words', default_value=english_awake_words)
     enable_setting_arg = DeclareLaunchArgument('enable_setting', default_value=enable_setting)
 
     launch_list = [
@@ -25,6 +27,7 @@ def launch_setup(context, *args, **kwargs):
             enable_wakeup_arg,
             awake_method_arg,
             awake_words_arg,
+            english_awake_words_arg,
             enable_setting_arg,
             ] 
 
@@ -80,7 +83,7 @@ def launch_setup(context, *args, **kwargs):
                      # "port": "/dev/ttyCH341USB0",         
                      "mic_type": "mic6_circle",
                      "awake_method": awake_method,
-                     "awake_word": chinese_awake_words,
+                     "awake_word": english_awake_words if os.environ.get('ASR_LANGUAGE') != 'Chinese' else chinese_awake_words,
                      "enable_setting": enable_setting,
                      "enable_wakeup": enable_wakeup,
                      "mode": mode,

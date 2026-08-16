@@ -45,7 +45,7 @@ Environment used by every ROS process (from `~/ros2_ws/.typerc`):
 | `MACHINE_TYPE` | `ROSpider` | Hexapod body |
 | `LIDAR_TYPE` | `LD19` | Lidar driver launch |
 | `DEPTH_CAMERA_TYPE` | `aurora` | Deptrum Aurora 930 |
-| `MIC_TYPE` | `WonderEchoPro` | iFlytek/WonderEcho circular array |
+| `MIC_TYPE` | unused by voice | Voice is sherpa-onnx; see `info/voice.md` |
 | `ASR_LANGUAGE` | `English` | Wake / command language |
 | `ASR_MODE` | `online` | Large-model ASR path (voice nodes still start offline kit) |
 | `ROS_DOMAIN_ID` | `27` | DDS domain; other machines must match |
@@ -77,7 +77,7 @@ These live in `/etc/systemd/system/` and are **enabled** for `multi-user.target`
 | **`button_scan.service`** | `~/wifi_manager/button_scan.py` | Watches two physical buttons. **GPIO 25 (short):** wipe `/etc/wifi/*` and restart `wifi.service` (back to AP). **GPIO 4 (long hold):** beep and `sudo halt` (power off). |
 | **`find_device.service`** | `~/wifi_manager/find_device.py` | UDP listener on **port 9027**. The Hiwonder phone app broadcasts `LOBOT_NET_DISCOVER`; this answers with robot type, SSID, image size so the app can find Masha on the LAN. |
 | **`remote.service`** | `~/wifi_manager/remote.py` | TCP listener on **port 9026**. Phone app sends JSON `{setwifi: {ssid, passwd}}`; this writes STA config to `/etc/wifi/wifi_conf.py` and restarts `wifi.service`. |
-| **`set_default_device.service`** | sleep 10s, then `~/ros2_ws/.set_default_device.sh` | One-shot. Sets PulseAudio **default speaker** to the GeneralPlus USB audio device and **default mic** to the iFlytek XFM-DP. Then exits (`Restart=no`). |
+| **`set_default_device.service`** | sleep 10s, then `~/ros2_ws/.set_default_device.sh` | One-shot. Sets PulseAudio default speaker (USB) and default mic (USB array). Then exits (`Restart=no`). |
 | **`jtop.service`** | `/usr/local/bin/jtop --force` | Background daemon for the `jtop` Jetson stats tool (temps, clocks, GPU). Does not drive the robot. |
 | **`expand_rootfs.service`** | `~/ros2_ws/.expand_rootfs.sh` | **Disabled.** One-shot first-boot disk expand. Not part of a normal power-on. |
 | **`ollama.service`** | `ollama serve` | **Disabled.** Local LLM server. Not started at boot. |
@@ -101,7 +101,7 @@ The Jetson has **no real monitor**. An **HDMI dummy plug** (EDID name `HDP-V104`
 | **`nxserver.service`** | NoMachine remote desktop, TCP **4000**. This is how you see the GNOME desktop from another PC. |
 | **`ssh.service`** | OpenSSH on port **22**. Preferred way to operate without the GUI. |
 | **`docker.service` + `containerd`** | Docker engine. Enabled at boot even if you are not using containers. |
-| **PulseAudio** (user service) | Sound server. Default **output** = USB speaker (GeneralPlus). Default **input** = iFlytek mic array. |
+| **PulseAudio** (user service) | Sound server. Default **output** = USB speaker. Default **input** = USB mic. |
 | **`update-notifier`** | **Disabled** (2026-08-14). Used to launch `update-manager` ~60 s after login; that GUI often busy-looped at ~90% CPU. Override: `~/.config/autostart/update-notifier.desktop`. Timers `update-notifier-download` / `update-notifier-motd` disabled. |
 | **`nvpmodel_indicator`** | **Disabled.** NVIDIA tray applet. Power mode is already set by `nvpmodel.service` (10W). It was forking ~21 copies. |
 | **`gnome-software` / `packagekitd`** | **Disabled / masked.** Ubuntu Software store. `packagekit.service` is masked so it cannot come back. |
@@ -243,22 +243,20 @@ Off on **`slim`**.
 
 ---
 
-## 7. Voice stack (`full` or `voice:=true`, then only if the mic is present)
+## 7. Voice stack (`voice:=true` or `BRINGUP_VOICE=true`, then only if the USB mic is present)
 
-Off on **`slim`**. On `full`, `startup_check` launches this ~50 s after bringup **only** when `/dev/ring_mic` exists (udev rule for the WonderEcho / iFlytek array). Competition launches its own mic stack when you start that launch; it does not need boot voice.
+Canonical write-up: **`ros2_ws/info/voice.md`**. Speech-to-text is sherpa-onnx. Two nodes only.
+
+`startup_check` launches this ~50 s after bringup when the USB mic is present.
 
 Launch: `ros2 launch xf_mic_asr_offline startup_test.launch.py`
 
-Because `MIC_TYPE=WonderEchoPro` (not `xf`), `mic_init.launch.py` starts the WonderEcho path, not the old 6-mic iFlytek ASR nodes.
-
 | Node | What it does |
 |---|---|
-| **`wonder_echo_pro_node`** (`awake` / ASR front-end) | Serial protocol on `/dev/ring_mic`. Detects wake-up and a small set of **on-device commands** (English: go forward/backward, turn left/right, move left/right, dance, come here). Publishes `~/voice_words`. |
-| **`voice_control_move`** | Turns those words into motion: walk, turn, dance action, or “come here” (lidar follow). Uses `/scan` for the follow behavior. |
+| **`asr_node`** | PulseAudio → sherpa-onnx. Wake on Hello / Hi / Shalom Masha. Then motion commands. Plays **I’m here**. |
+| **`voice_control_move`** | Canonical phrase → walk / turn / stop / dance. |
 
-The **iFlytek XFM-DP** USB device is the **microphone** (listen only). Playback goes to the **GeneralPlus USB speaker** (separate gadget on the same USB hub). The circular mic array does **not** speak.
-
-If `MIC_TYPE` were `xf`, boot would instead start `awake_node`, `asr_node`, and `voice_control` (offline iFlytek ASR). That path is **not** used on this image.
+The USB mic is listen-only. Playback goes to the GeneralPlus USB speaker.
 
 ---
 
@@ -270,7 +268,7 @@ If `MIC_TYPE` were `xf`, boot would instead start `awake_node`, `asr_node`, and 
 | Bus servos (legs + arm) | Held in `init` pose |
 | Deptrum Aurora 930 | Depth + RGB streaming |
 | LD19 lidar | Scanning |
-| WonderEcho Pro / iFlytek XFM-DP | Idle on slim. Listening for wake / commands only if voice is enabled |
+| USB microphone (PulseAudio default source) | Idle unless voice is enabled; then sherpa listens |
 | GeneralPlus USB audio (`1b3f:2008`) | Speaker for TTS / prompts |
 | HDMI dummy plug `HDP-V104` | Fake monitor so GNOME/NoMachine work |
 | Wi‑Fi + GPIO 24 LED | AP/STA + status blink |

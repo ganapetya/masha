@@ -17,10 +17,7 @@ def launch_setup(context):
     mic_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(xf_mic_asr_offline_package_path, 'launch/mic_init.launch.py')),
-        launch_arguments={
-            # Wake word is already stored on the 6-mic; skip the 30s rewrite.
-            'enable_setting': 'false',
-        }.items(),
+        launch_arguments={}.items(),
 
     )
 

@@ -31,7 +31,7 @@ class VocalDetect(Node):
         self.declare_parameter('port', '/dev/ring_mic')
         self.declare_parameter('enable_wakeup', True)
         self.declare_parameter('enable_setting', False)
-        self.declare_parameter('awake_word', 'hello hi wonder')
+        self.declare_parameter('awake_word', 'hello masha')
         self.declare_parameter('mode', 1)
         self.declare_parameter('offline', 'false')
         self.declare_parameter('punct_model', '')

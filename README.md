@@ -19,7 +19,7 @@ A denser filesystem memo is in [`ROSpider_WORKSPACE_MEMO.md`](ROSpider_WORKSPACE
 | LiDAR | LD19 (`LIDAR_TYPE=LD19`) |
 | Depth camera | Deptrum Aurora 930 (`DEPTH_CAMERA_TYPE=aurora`) |
 | IMU | On the controller board, fused in `robot_localization` |
-| Mic | WonderEchoPro (iFlytek package still present) |
+| Mic | USB array via PulseAudio; speech-to-text is sherpa-onnx (`ros2_ws/info/voice.md`) |
 | UI | OLED, buzzer, LEDs, joystick / gamepad |
 
 Runtime switches are in `ros2_ws/.typerc`: machine type, lidar, camera, mic, ASR online/offline, language, `ROS_DOMAIN_ID=27`.

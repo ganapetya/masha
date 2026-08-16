@@ -3,16 +3,14 @@
 <package format="3">
   <name>xf_mic_asr_offline</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Masha voice: sherpa-onnx wake and commands. See ros2_ws/info/voice.md.</description>
   <maintainer email="1270161395@qq.com">ubuntu</maintainer>
   <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>ament_cmake_python</buildtool_depend>
 
-  <depend>rclcpp</depend>
   <depend>rclpy</depend>
-  <depend>xf_mic_asr_offline_msgs</depend>
   <depend>ros_robot_controller_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>

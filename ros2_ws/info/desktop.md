@@ -98,7 +98,7 @@ File: **`~/ros2_ws/.typerc`**
 | `MACHINE_TYPE` | `ROSpider` |
 | `ASR_LANGUAGE` | `Chinese`, `English` |
 | `ASR_MODE` | `online`, `offline` |
-| `MIC_TYPE` | `xf`, `WonderEchoPro` |
+| `MIC_TYPE` | unused by the sherpa voice stack (`info/voice.md`) |
 | `BRINGUP_PROFILE` | `slim` (default), `full` — **not in Tool**; edit `.typerc` |
 | `VERSION` | display-only from typerc |
 | WiFi AP name | derived `WN-<serial>` via serial number |

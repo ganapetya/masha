@@ -22,9 +22,8 @@ export ASR_LANGUAGE=English
 # 大模型类型设置：online/offline
 export ASR_MODE=online
 
-# 麦克风类型：WonderEchoPro/xf
-# Hardware is the iFlytek XFM-DP circular 6-mic (serial AIUI on /dev/ring_mic), not WonderEcho Pro.
-export MIC_TYPE=xf
+# Voice is sherpa-onnx (see ros2_ws/info/voice.md). MIC_TYPE is unused by the voice launch.
+export MIC_TYPE=usb
 
 export need_compile=False
 #export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
@@ -33,7 +32,7 @@ export CYCLONEDDS_URI=file:///etc/cyclonedds/config.xml
 export BRINGUP_JOYSTICK=true
 # slim = motion+sensors (default). full = vendor phone/demo tree.
 export BRINGUP_PROFILE=slim
-# Listen for "Hello Hiwonder" on the 6-mic without loading the full phone/demo tree.
+# Boot the sherpa voice stack (Hello Masha → commands). See ros2_ws/info/voice.md.
 export BRINGUP_VOICE=true
 
 echo -e "\033[32m----------------------------------------------
