@@ -30,7 +30,7 @@ Two ROS nodes. Nothing else.
 |---|---|
 | PulseAudio default source | The microphone. Record with `pulse`. |
 | PulseAudio default sink | The speaker. Play wavs with `aplay`. |
-| `asr_node.py` | Wake + commands. One recognizer. Plays **I’m here**. |
+| `asr_node.py` | Wake + commands. One recognizer. Plays **I’m here** on a side thread so listen never blocks. Session timeout is its own thread, not a ROS timer. |
 | `identity.py` | Name and greeting spellings. |
 | `voice_control_move.py` | Canonical phrase → walk / turn / stop / dance. |
 | `feedback_voice/english/*.wav` | Spoken replies. |
@@ -56,6 +56,6 @@ Debug file: `/tmp/masha-asr.log` (`idle`, `wake`, `cmd peak= raw= cmd=`).
 - Launch a second copy of the voice stack (it steals the mic).
 - Record with a raw ALSA device while PulseAudio owns it.
 - Add another ASR, a serial wake node, or a keyword-flash service.
-- Speak the command over **I’m here** (she is deaf for that clip).
+- Speak the command over **I’m here** (she ignores the speaker for ~2 s).
 
-Wait for **I’m here**, then say the command.
+Wait for **I’m here**, then say the command. After reboot, a stuck `aplay` must not sit on the listen thread.

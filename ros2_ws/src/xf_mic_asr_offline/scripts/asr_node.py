@@ -13,7 +13,6 @@ from rclpy.node import Node
 from std_srvs.srv import Trigger
 from std_msgs.msg import String
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from xf_mic_asr_offline import identity, voice_play
 
 # Voice is sherpa-onnx on PulseAudio only. See ros2_ws/info/voice.md.
@@ -61,6 +60,8 @@ COMMAND_PHRASES = (
     ('come here', 'come here'),
     ('come over', 'come here'),
     ('跳个舞吧', 'dance'),
+    ("dan's", 'dance'),
+    ('dancing', 'dance'),
     ('左平移', 'move left'),
     ('右平移', 'move right'),
     ('前进', 'go forward'),
@@ -79,10 +80,12 @@ _FORWARD_HINTS = (
 )
 _BACKWARD_HINTS = ('backward', 'backwards', 'back')
 _FORWARD_PREFIXES = ('for', 'fer', 'fwd', 'ward')
-SPEECH_PEAK = 0.05
+SPEECH_PEAK = 0.02
 SILENCE_CHUNKS = 5   # 0.5 s of quiet ends an utterance
-MIN_SPEECH_CHUNKS = 4
+MIN_SPEECH_CHUNKS = 3
 MAX_SPEECH_CHUNKS = 40  # 4 s cap
+# Cover the I'm-here wav without parking the listen thread on aplay.
+AWAKE_PLAY_IGNORE = 2.2
 
 
 def _close_word(token, target, ratio=0.72):
@@ -126,7 +129,7 @@ def extract_command(text):
             return command
     tokens = low.split()
     token_set = set(tokens)
-    if 'dance' in token_set:
+    if 'dance' in token_set or any(_close_word(tok, 'dance') for tok in tokens):
         return 'dance'
     if 'stop' in token_set:
         return 'stop'
@@ -154,6 +157,7 @@ class ASRNode(Node):
         self.last_partial = ''
         self.last_activity = 0.0
         self.pending_greeting_until = 0.0
+        self.need_stream_reset = False
         self.cmd_chunks = []
         self.idle_chunks = []
         self.declare_parameter('confidence', 18)
@@ -167,10 +171,9 @@ class ASRNode(Node):
         self.stream = None
         self._load_recognizer()
 
-        timer_cb_group = MutuallyExclusiveCallbackGroup()
-        self.create_timer(0.2, self.session_timer, callback_group=timer_cb_group)
         self.create_service(Trigger, '~/init_finish', self.get_node_state)
-        threading.Thread(target=self.audio_loop, daemon=True).start()
+        threading.Thread(target=self.session_loop, daemon=True, name='masha-session').start()
+        threading.Thread(target=self.audio_loop, daemon=True, name='masha-audio').start()
         self.get_logger().info('\033[1;32mI am %s\033[0m' % identity.ROBOT_NAME)
         self.get_logger().info('\033[1;32mWake on: %s\033[0m' % identity.wake_phrase_log())
         self.get_logger().info('\033[1;32m%s\033[0m' % 'start')
@@ -251,8 +254,9 @@ class ASRNode(Node):
         self._reset_stream()
         if not already:
             self._publish_words('唤醒成功(wake-up-success)')
-        voice_play.play('awake', language='English')
-        self.ignore_until = time.time() + 0.5
+        # aplay on the USB speaker can stall after reboot. Never do it here.
+        voice_play.play_async('awake', language='English')
+        self.ignore_until = time.time() + AWAKE_PLAY_IGNORE
 
     def _open_recorder(self):
         last_err = ''
@@ -340,78 +344,81 @@ class ASRNode(Node):
                     self.cmd_chunks = []
                     self.idle_chunks = []
                     continue
+                if self.need_stream_reset:
+                    self.need_stream_reset = False
+                    self._reset_stream()
 
-                if not self.awake_flag:
-                    self.cmd_chunks = []
-                    self.idle_chunks.append(samples)
-                    idle_need = int(IDLE_CLIP_SECONDS / 0.1)
-                    if len(self.idle_chunks) > idle_need:
-                        self.idle_chunks = self.idle_chunks[-idle_need:]
-                    text, endpoint = self._transcribe_chunk(samples)
-                    if text and text != self.last_partial:
-                        self.last_partial = text
-                        now = time.time()
-                        if now - last_log > 0.8:
-                            last_log = now
-                            self.get_logger().info('idle heard: %r' % text)
-                            self._debug_log('idle %r' % text)
-                    if self._note_partial(text) or self._text_is_wake(text):
-                        self._trigger_wake(text)
-                        continue
-                    # Whole-utterance clip catches "Hello"+"Masha" after a reset.
+                # Streaming runs in both idle and awake so a stuck aplay/VAD
+                # cannot make her deaf after "I'm here".
+                text, endpoint = self._transcribe_chunk(samples)
+                if text and text != self.last_partial:
+                    self.last_partial = text
                     now = time.time()
-                    greeting_hold = now < self.pending_greeting_until
-                    idle_peak = float(np.max(np.abs(samples))) if samples.size else 0.0
-                    if (len(self.idle_chunks) >= 12 and now - last_clip > 0.5
-                            and (greeting_hold or idle_peak > 0.03 or text)):
-                        last_clip = now
-                        clip_text = self._decode_clip(np.concatenate(self.idle_chunks))
-                        if clip_text and clip_text != self.last_partial:
-                            self.get_logger().info('idle clip: %r' % clip_text)
-                            self._debug_log('idle-clip %r' % clip_text)
-                            last_log = now
-                        if self._note_partial(clip_text) or self._text_is_wake(clip_text):
-                            self._trigger_wake(clip_text)
-                            continue
-                    cmd = extract_command(text)
-                    recently = (time.time() - self.last_activity) < LISTEN_SECONDS
-                    if cmd and recently:
+                    if now - last_log > 0.8:
+                        last_log = now
+                        tag = 'awake' if self.awake_flag else 'idle'
+                        self.get_logger().info('%s heard: %r' % (tag, text))
+                        self._debug_log('%s %r' % (tag, text))
+                if self._note_partial(text) or self._text_is_wake(text):
+                    self._trigger_wake(text)
+                    continue
+                cmd = extract_command(text)
+                recently = self.awake_flag or (
+                    self.last_activity and (time.time() - self.last_activity) < LISTEN_SECONDS)
+                if cmd and recently:
+                    if not self.awake_flag:
                         self.get_logger().info('still in session, taking %s' % cmd)
-                        self._accept_command(cmd)
+                    self._accept_command(cmd)
+                    continue
+
+                self.idle_chunks.append(samples)
+                idle_need = int(IDLE_CLIP_SECONDS / 0.1)
+                if len(self.idle_chunks) > idle_need:
+                    self.idle_chunks = self.idle_chunks[-idle_need:]
+                now = time.time()
+                greeting_hold = now < self.pending_greeting_until
+                peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+                if (len(self.idle_chunks) >= 12 and now - last_clip > 0.5
+                        and (greeting_hold or self.awake_flag or peak > 0.03 or text)):
+                    last_clip = now
+                    clip_text = self._decode_clip(np.concatenate(self.idle_chunks))
+                    if clip_text and clip_text != self.last_partial:
+                        tag = 'awake-clip' if self.awake_flag else 'idle-clip'
+                        self.get_logger().info('%s: %r' % (tag, clip_text))
+                        self._debug_log('%s %r' % (tag, clip_text))
+                        last_log = now
+                    if self._note_partial(clip_text) or self._text_is_wake(clip_text):
+                        self._trigger_wake(clip_text)
                         continue
-                    # Keep the stream if we just heard "hello" so "Masha" can land.
-                    greeting_hold = time.time() < self.pending_greeting_until
+                    clip_cmd = extract_command(clip_text)
+                    if clip_cmd and recently:
+                        if not self.awake_flag:
+                            self.get_logger().info('still in session, taking %s' % clip_cmd)
+                        self._accept_command(clip_cmd)
+                        continue
+
+                if self.awake_flag:
+                    if peak >= SPEECH_PEAK:
+                        self.cmd_chunks.append(samples)
+                    elif self.cmd_chunks:
+                        self.cmd_chunks.append(samples)
+                    if self.cmd_chunks:
+                        trailing_quiet = 0
+                        for chunk in reversed(self.cmd_chunks):
+                            chunk_peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+                            if chunk_peak < SPEECH_PEAK:
+                                trailing_quiet += 1
+                            else:
+                                break
+                        spoke = len(self.cmd_chunks) - trailing_quiet
+                        if ((trailing_quiet >= SILENCE_CHUNKS and spoke >= MIN_SPEECH_CHUNKS)
+                                or len(self.cmd_chunks) >= MAX_SPEECH_CHUNKS):
+                            self._handle_command_audio(self.cmd_chunks)
+                            self.cmd_chunks = []
+                else:
+                    self.cmd_chunks = []
                     if endpoint and text and not greeting_hold and not self._text_is_wake(text):
                         self._reset_stream()
-                    continue
-
-                # Awake: wait for a spoken burst, then decode that utterance.
-                # Fixed 5 s windows were mostly silence and late, and sherpa
-                # often wrote "go fervent" for "go forward".
-                peak = float(np.max(np.abs(samples))) if samples.size else 0.0
-                if peak >= SPEECH_PEAK:
-                    self.cmd_chunks.append(samples)
-                    if len(self.cmd_chunks) >= MAX_SPEECH_CHUNKS:
-                        self._handle_command_audio(self.cmd_chunks)
-                        self.cmd_chunks = []
-                    continue
-                if not self.cmd_chunks:
-                    continue
-                self.cmd_chunks.append(samples)
-                trailing_quiet = 0
-                for chunk in reversed(self.cmd_chunks):
-                    chunk_peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
-                    if chunk_peak < SPEECH_PEAK:
-                        trailing_quiet += 1
-                    else:
-                        break
-                spoke = len(self.cmd_chunks) - trailing_quiet
-                if trailing_quiet >= SILENCE_CHUNKS and spoke >= MIN_SPEECH_CHUNKS:
-                    self._handle_command_audio(self.cmd_chunks)
-                    self.cmd_chunks = []
-                elif len(self.cmd_chunks) >= MAX_SPEECH_CHUNKS:
-                    self._handle_command_audio(self.cmd_chunks)
-                    self.cmd_chunks = []
             except Exception as exc:
                 self.get_logger().error('audio loop: %s' % exc)
                 time.sleep(0.3)
@@ -426,11 +433,18 @@ class ASRNode(Node):
         self.cmd_chunks = []
         self._reset_stream()
 
-    def session_timer(self):
-        if self.awake_flag and time.time() > self.session_deadline:
-            self.awake_flag = False
-            self.get_logger().info('sleep (say Hello Masha to wake)')
-            self._reset_stream()
+    def session_loop(self):
+        # Own thread: aplay / sherpa on the audio thread must not starve sleep.
+        while rclpy.ok():
+            try:
+                if self.awake_flag and time.time() > self.session_deadline:
+                    self.awake_flag = False
+                    self.need_stream_reset = True
+                    self.get_logger().info('sleep (say Hello Masha to wake)')
+                    self._debug_log('sleep')
+            except Exception:
+                pass
+            time.sleep(0.2)
 
 
 def main():

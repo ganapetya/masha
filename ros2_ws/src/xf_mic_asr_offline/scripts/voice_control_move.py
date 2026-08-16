@@ -146,7 +146,8 @@ class VoiceControMovelNode(Node):
         return response
 
     def play(self, name):
-        voice_play.play(name, language=self.language)
+        # Never block the motion thread on aplay (USB speaker can hang after reboot).
+        voice_play.play_async(name, language=self.language)
 
     def words_callback(self, msg):
         self.words = match_command(msg.data)
