@@ -2,6 +2,8 @@
 
 This is the only voice design. Read this before touching wake or commands.
 
+Thread-level process (who listens, who executes): **`info/arch-voice-commands.md`**.
+
 ## Rule
 
 Speech-to-text is **sherpa-onnx**. There is no second recognizer, no serial keyword engine, and no vendor SDK on this path. Do not add one back.
