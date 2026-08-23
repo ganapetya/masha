@@ -1,10 +1,14 @@
 # Hiwonder ROSpider Workspace Memo
 
-**Last updated:** 2026-08-12  
+**Last updated:** 2026-08-23  
 **Machine:** Hiwonder ROSpider (hexapod) on NVIDIA Jetson Orin NX  
 **Primary code path (runtime):** `/home/ubuntu/ros2_ws`  
 **This Grok worktree (dev):** `/home/ubuntu/.grok/worktrees/ubuntu-ros2-ws/masha-workspace`  
 **Git remote:** `http://192.168.11.206:3000/JetSpider/ros2_ws.git` (branch `main`, tip often `jp6.0`)
+
+**Related memo:** [AI Robotics Trio: Cooperation Framework](AI_ROBOTICS_TRIO_COOPERATION.md) — roles for Peter (architect), Gemini Notebook (guru/reviewer), and grok-build (in-code developer). Also at `~/.grok/docs/AI_ROBOTICS_TRIO_COOPERATION.md` and loaded as `~/.grok/rules/cooperation-framework.md`.
+
+**Shared plans + progress (canonical):** `learning-log-and-memory-snippets.md` in the Gemini notebook https://notebook.google.com/notebook/84ec42af-0952-438f-bf1e-0decaa1dd52f
 
 ---
 
