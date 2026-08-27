@@ -10,7 +10,7 @@
 
 **Host ↔ Masha text/file transport:** `~/host-clipboard.txt` — [HOST_CLIPBOARD_TRANSPORT.md](HOST_CLIPBOARD_TRANSPORT.md). Not always SSH; X11 clipboard is optional.
 
-**Sprint tracking repo (grok ↔ Gemini):** `/opt/src/learning-bots-sharing` — [LEARNING_BOTS_SHARING.md](LEARNING_BOTS_SHARING.md). grok-build reads agreements and plans here and submits progress files here (`git@github.com-learning-bots:ganapetya/learning-bots-sharing.git`). Masha robot runtime stays in `~/ros2_ws`. Guru notebook (study/review UI): https://notebook.google.com/notebook/84ec42af-0952-438f-bf1e-0decaa1dd52f
+**Tracking repo (grok ↔ Gemini):** `/opt/src/learning-bots-sharing` — [LEARNING_BOTS_SHARING.md](LEARNING_BOTS_SHARING.md). Quarter plans + week plans inside a quarter. **Now:** Q1 W1 — [CURRENT_PLAN.md](CURRENT_PLAN.md); on week complete write `quarter-01-week-01-result.md`. Masha robot runtime stays in `~/ros2_ws`.
 
 ---
 

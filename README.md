@@ -4,7 +4,7 @@ Masha is a **Hiwonder ROSpider** hexapod. This repository is her software image:
 
 Sister robot **Savelij** will live in a separate repo. Shared world-level notes belong in [robots-world](https://github.com/ganapetya/robots-world).
 
-A denser filesystem memo is in [`ROSpider_WORKSPACE_MEMO.md`](ROSpider_WORKSPACE_MEMO.md). How Peter, Gemini Notebook, and grok-build work together is in [`AI_ROBOTICS_TRIO_COOPERATION.md`](AI_ROBOTICS_TRIO_COOPERATION.md) (v2, 2026-08-27). Agreements, plans, and progress files live in `/opt/src/learning-bots-sharing` — [`LEARNING_BOTS_SHARING.md`](LEARNING_BOTS_SHARING.md). Host ↔ Masha paste/file drop-box is `~/host-clipboard.txt` — [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md). Launch recipes live in [`ros2_ws/command`](ros2_ws/command).
+A denser filesystem memo is in [`ROSpider_WORKSPACE_MEMO.md`](ROSpider_WORKSPACE_MEMO.md). How Peter, Gemini Notebook, and grok-build work together is in [`AI_ROBOTICS_TRIO_COOPERATION.md`](AI_ROBOTICS_TRIO_COOPERATION.md) (v2, 2026-08-27). Agreements, plans, and progress files live in `/opt/src/learning-bots-sharing` — [`LEARNING_BOTS_SHARING.md`](LEARNING_BOTS_SHARING.md). Active plan: [`CURRENT_PLAN.md`](CURRENT_PLAN.md) (Quarter 1, Week 1 as of 2026-08-27). Host ↔ Masha paste/file drop-box is `~/host-clipboard.txt` — [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md). Launch recipes live in [`ros2_ws/command`](ros2_ws/command).
 
 ---
 

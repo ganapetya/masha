@@ -14,33 +14,40 @@ This is the **shared workspace between Peter, grok-build, and Gemini Notebook**.
 From `/opt/src/learning-bots-sharing`, grok-build:
 
 1. **Reads our agreements** (including `cooperation-framework-grok-notebook-v2.md`).
-2. **Reads our plans** (Sprint Plans, learning logs, memory snippets).
-3. **Submits progress files** (sprint progress reports, sprint `src/`, `tests/`) after Peter authorizes the commit and push.
+2. **Reads our plans** — **quarter plans** and **week plans** inside a quarter.
+3. **Submits progress files** after Peter authorizes the commit and push.
 
-Prefer this tree over chat recap when checking what was decided or how far we got.
+Prefer this tree over chat recap.
 
-## Layout grok-build writes
+**Now (2026-08-27):** Quarter 1, Week 1. See [`CURRENT_PLAN.md`](CURRENT_PLAN.md). When that week is complete, write `quarter-01-week-01-result.md` here (not before).
+
+## Plan vs result naming
 
 ```
-/opt/src/learning-bots-sharing/
+learning-bots-sharing/
 ├── cooperation-framework-grok-notebook-v2.md
 ├── learning-log-and-memory-snippets.md
-├── sprint-<number>-<start-date>/
-│   ├── sprint-<number>-progress-report.md
-│   ├── src/
-│   └── tests/
+├── quarter-01-plan.md                 # quarter hub / tracker only
+├── quarter-01-week-01-plan.md         # that week's work
+├── quarter-01-week-01-result.md       # after Week 1 is complete
 └── README.md
 ```
 
+- **Quarter plan** (`quarter-<nn>-plan.md`): syllabus and progress tracker for the quarter. Not a copy of one week’s daily lessons.
+- **Week plan** (`quarter-<nn>-week-<ww>-plan.md`): that week’s goals, lessons, coding task.
+- **Week result** (`quarter-<nn>-week-<ww>-result.md`): what grok-build writes when the week is done.
+
+Week implementation (CMake/C++ playground) that the week plan asks for also lands in this repo, next to that week’s files, after Peter asks to implement.
+
 ## How grok-build uses it
 
-- **Read first.** Before a sprint or when Peter refers to an agreement/plan, look in `/opt/src/learning-bots-sharing` (pull if the remote has moved on).
-- **Write progress here.** Put sprint reports and the sprint’s implementation/tests in the sprint folder above. Do not put Masha robot runtime code here except as the sprint `src/` the plan asks for.
-- **Push only with Peter’s OK.** Gemini Notebook has no GitHub write access. Commit and `git push` from this clone after Peter authorizes.
+- **Read first.** Look here (or GitHub if the local clone is behind) for agreements and plans.
+- **Write results here** using the week-result name above. Do not put Masha robot runtime code here except what a week plan asks to submit.
+- **Push only with Peter’s OK.** Gemini Notebook has no GitHub write access.
 - **Not the paste drop-box.** Host clipboard/files go through `~/host-clipboard.txt` — see [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md).
 
 ## Related
 
+- Current plan: [`CURRENT_PLAN.md`](CURRENT_PLAN.md)
 - Cooperation agreement (v2): [`AI_ROBOTICS_TRIO_COOPERATION.md`](AI_ROBOTICS_TRIO_COOPERATION.md)
 - Host clipboard transport: [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md)
-- Guru notebook (study/review UI, not this git tree): https://notebook.google.com/notebook/84ec42af-0952-438f-bf1e-0decaa1dd52f

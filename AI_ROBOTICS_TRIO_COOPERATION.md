@@ -3,7 +3,7 @@
 **Saved on Masha:** 2026-08-27  
 **Replaces:** 2026-08-25 v1 weekly-loop memo  
 **Canonical source:** https://github.com/ganapetya/learning-bots-sharing/blob/main/cooperation-framework-grok-notebook-v2.md  
-**Local clone of tracking repo:** `/opt/src/learning-bots-sharing` — see [`LEARNING_BOTS_SHARING.md`](LEARNING_BOTS_SHARING.md) (read agreements and plans here; submit progress files here). Remote: `git@github.com-learning-bots:ganapetya/learning-bots-sharing.git`  
+**Local clone of tracking repo:** `/opt/src/learning-bots-sharing` — see [`LEARNING_BOTS_SHARING.md`](LEARNING_BOTS_SHARING.md). Read agreements, **quarter plans**, and **week plans** here; submit week results here. Remote: `git@github.com-learning-bots:ganapetya/learning-bots-sharing.git`  
 **Host ↔ Masha paste/file transport:** `~/host-clipboard.txt` — see [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md)
 
 This is the operational agreement for Peter, Gemini Notebook, and grok-build (Grok on Masha). It is copied from the canonical source above; local notes at the end are Masha-only paths and transport, not a competing design.
@@ -132,8 +132,7 @@ These are machine paths and paste transport. They do not change the roles or spr
 
 - **This agent** is grok-build on Masha (Jetson Orin NX). Follow Peter's architecture and the Guru's Sprint Plan. Do not invent a competing design.
 - **Sprint Plan handoff:** Peter pastes the public download URL (often via `~/host-clipboard.txt`). Fetch the raw text and follow that plan.
-- **Tracking repo on this machine:** `/opt/src/learning-bots-sharing`. Read agreements and plans from this clone; submit progress files here after Peter authorizes. Details: [`LEARNING_BOTS_SHARING.md`](LEARNING_BOTS_SHARING.md).
-- **Masha robot runtime** stays in `~/ros2_ws`. Sprint playground and reports live in `learning-bots-sharing`. Do not dump robot product code into the tracking repo except as the sprint `src/` the plan asks for.
+- **Tracking repo on this machine:** `/opt/src/learning-bots-sharing`. Plans are two-level: `quarter-<nn>-plan.md` (hub/tracker) and `quarter-<nn>-week-<ww>-plan.md` (that week’s work). When a week is complete, write `quarter-<nn>-week-<ww>-result.md`. Details: [`LEARNING_BOTS_SHARING.md`](LEARNING_BOTS_SHARING.md), current: [`CURRENT_PLAN.md`](CURRENT_PLAN.md).
+- **Masha robot runtime** stays in `~/ros2_ws`. Week playground and results live in `learning-bots-sharing`. Do not dump robot product code into the tracking repo except what a week plan asks to submit.
 - **Host clipboard / files:** read `~/host-clipboard.txt`. Do not assume SSH or X11 clipboard. Details: [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md).
 - Copies of this memo: `~/AI_ROBOTICS_TRIO_COOPERATION.md` and `~/.grok/docs/AI_ROBOTICS_TRIO_COOPERATION.md`. Session rule: `~/.grok/rules/cooperation-framework.md`.
-- Gemini Notebook workspace (Guru study/review UI, not the sprint-file channel): https://notebook.google.com/notebook/84ec42af-0952-438f-bf1e-0decaa1dd52f
