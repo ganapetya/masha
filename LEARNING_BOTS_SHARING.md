@@ -3,6 +3,7 @@
 **Local clone on Masha:** `/opt/src/learning-bots-sharing`  
 **GitHub:** https://github.com/ganapetya/learning-bots-sharing  
 **SSH remote:** `git@github.com-learning-bots:ganapetya/learning-bots-sharing.git`  
+**How grok-build pulls:** [`LEARNING_BOTS_SHARING_PULL.md`](LEARNING_BOTS_SHARING_PULL.md) (do not use bare `git pull` from the Grok shell)  
 **Saved:** 2026-08-27  
 **Copies:** `~/LEARNING_BOTS_SHARING.md` and `~/.grok/docs/LEARNING_BOTS_SHARING.md`  
 **Session rule:** `~/.grok/rules/learning-bots-sharing.md`
@@ -41,7 +42,7 @@ Week implementation (CMake/C++ playground) that the week plan asks for also land
 
 ## How grok-build uses it
 
-- **Read first.** Look here (or GitHub if the local clone is behind) for agreements and plans.
+- **Read first.** Pull with the command in [`LEARNING_BOTS_SHARING_PULL.md`](LEARNING_BOTS_SHARING_PULL.md), then read this clone. Do not use bare `git pull` from Grok.
 - **Write results here** using the week-result name above. Do not put Masha robot runtime code here except what a week plan asks to submit.
 - **Push only with Peter’s OK.** Gemini Notebook has no GitHub write access.
 - **Not the paste drop-box.** Host clipboard/files go through `~/host-clipboard.txt` — see [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md).
@@ -49,5 +50,6 @@ Week implementation (CMake/C++ playground) that the week plan asks for also land
 ## Related
 
 - Current plan: [`CURRENT_PLAN.md`](CURRENT_PLAN.md)
+- How grok-build pulls this clone: [`LEARNING_BOTS_SHARING_PULL.md`](LEARNING_BOTS_SHARING_PULL.md)
 - Cooperation agreement (v2): [`AI_ROBOTICS_TRIO_COOPERATION.md`](AI_ROBOTICS_TRIO_COOPERATION.md)
 - Host clipboard transport: [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md)
