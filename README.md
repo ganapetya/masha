@@ -4,7 +4,7 @@ Masha is a **Hiwonder ROSpider** hexapod. This repository is her software image:
 
 Sister robot **Savelij** will live in a separate repo. Shared world-level notes belong in [robots-world](https://github.com/ganapetya/robots-world).
 
-A denser filesystem memo is in [`ROSpider_WORKSPACE_MEMO.md`](ROSpider_WORKSPACE_MEMO.md). How Peter, Gemini Notebook, and grok-build work together is in [`AI_ROBOTICS_TRIO_COOPERATION.md`](AI_ROBOTICS_TRIO_COOPERATION.md). Launch recipes live in [`ros2_ws/command`](ros2_ws/command).
+A denser filesystem memo is in [`ROSpider_WORKSPACE_MEMO.md`](ROSpider_WORKSPACE_MEMO.md). How Peter, Gemini Notebook, and grok-build work together is in [`AI_ROBOTICS_TRIO_COOPERATION.md`](AI_ROBOTICS_TRIO_COOPERATION.md) (v2, 2026-08-27). Agreements, plans, and progress files live in `/opt/src/learning-bots-sharing` — [`LEARNING_BOTS_SHARING.md`](LEARNING_BOTS_SHARING.md). Host ↔ Masha paste/file drop-box is `~/host-clipboard.txt` — [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md). Launch recipes live in [`ros2_ws/command`](ros2_ws/command).
 
 ---
 
@@ -131,6 +131,6 @@ TensorRT engines must be exported **on this Jetson**. `kinematics.so` is aarch64
 
 Remote: `git@github.com:ganapetya/masha.git`  
 SSH key (Masha → GitHub): `~/.ssh/id_ed25519_github_robots_world`  
-Host → Masha SSH snippet: `Desktop/host-masha-ssh.config` (X11 forward for clipboard). Do not put passwords in SSH config; use a host key + `ssh-copy-id`.
+Host ↔ Masha text/file transport: `~/host-clipboard.txt` (not always SSH). See [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md). Optional SSH snippet: `Desktop/host-masha-ssh.config`. Do not put passwords in SSH config; use a host key + `ssh-copy-id`.
 
 Vendor trees still have their own `.git` (LAN Gitea). `git-push-all.sh` hides them during `git add` so this repo is one tree, not submodules.

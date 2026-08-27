@@ -1,14 +1,16 @@
 # Hiwonder ROSpider Workspace Memo
 
-**Last updated:** 2026-08-23  
+**Last updated:** 2026-08-27  
 **Machine:** Hiwonder ROSpider (hexapod) on NVIDIA Jetson Orin NX  
 **Primary code path (runtime):** `/home/ubuntu/ros2_ws`  
 **This Grok worktree (dev):** `/home/ubuntu/.grok/worktrees/ubuntu-ros2-ws/masha-workspace`  
 **Git remote:** `http://192.168.11.206:3000/JetSpider/ros2_ws.git` (branch `main`, tip often `jp6.0`)
 
-**Related memo:** [AI Robotics Trio: Cooperation Framework](AI_ROBOTICS_TRIO_COOPERATION.md) — roles for Peter (architect), Gemini Notebook (guru/reviewer), and grok-build (in-code developer). Also at `~/.grok/docs/AI_ROBOTICS_TRIO_COOPERATION.md` and loaded as `~/.grok/rules/cooperation-framework.md`.
+**Related memo:** [AI Robotics Trio: Cooperation Framework (v2)](AI_ROBOTICS_TRIO_COOPERATION.md) — Peter (architect/pilot), Gemini Notebook (math guru/reviewer), grok-build (code builder). Canonical: `ganapetya/learning-bots-sharing` `cooperation-framework-grok-notebook-v2.md`. Also at `~/.grok/docs/AI_ROBOTICS_TRIO_COOPERATION.md`; session rule `~/.grok/rules/cooperation-framework.md`. Replaces the 2026-08-25 weekly-loop memo.
 
-**Shared plans + progress (canonical):** `learning-log-and-memory-snippets.md` in the Gemini notebook https://notebook.google.com/notebook/84ec42af-0952-438f-bf1e-0decaa1dd52f
+**Host ↔ Masha text/file transport:** `~/host-clipboard.txt` — [HOST_CLIPBOARD_TRANSPORT.md](HOST_CLIPBOARD_TRANSPORT.md). Not always SSH; X11 clipboard is optional.
+
+**Sprint tracking repo (grok ↔ Gemini):** `/opt/src/learning-bots-sharing` — [LEARNING_BOTS_SHARING.md](LEARNING_BOTS_SHARING.md). grok-build reads agreements and plans here and submits progress files here (`git@github.com-learning-bots:ganapetya/learning-bots-sharing.git`). Masha robot runtime stays in `~/ros2_ws`. Guru notebook (study/review UI): https://notebook.google.com/notebook/84ec42af-0952-438f-bf1e-0decaa1dd52f
 
 ---
 
