@@ -1,0 +1,32 @@
+proud_up_node:
+  ros__parameters:
+    image_topic: /depth_cam/rgb/image_raw
+    servo_topic: servo_controller
+    controller_ready_service: /controller_manager/init_finish
+    init_pose_ready_service: /init_pose/init_finish
+    wait_for_ready: true
+    run_on_start: true
+    settle_seconds: 2.0
+    ready_timeout_seconds: 180.0
+    capture_timeout_seconds: 30.0
+    jpeg_quality: 90
+    snapshot_path: /tmp/masha-up.jpg
+    image_qos_reliable: false
+    email_subject: "Masha is up"
+    # Camera-forward arm: ActionGroups/init_horizontal.d6a joints 19-24.
+    arm_duration: 1.5
+    arm_id19: 500.0
+    arm_id20: 810.0
+    arm_id21: 180.0
+    arm_id22: 150.0
+    arm_id23: 500.0
+    arm_id24: 500.0
+    # Leave empty so proud_up_node fills them from src/proud_up/.env (gitignored).
+    smtp_host: ""
+    smtp_port: 587
+    smtp_user: ""
+    smtp_password: ""
+    smtp_from: ""
+    smtp_to: ""
+    smtp_encryption: starttls
+    smtp_verbose: false

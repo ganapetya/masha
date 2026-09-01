@@ -27,10 +27,15 @@ def launch_setup(context):
         controller_package_path = get_package_share_directory('controller')
         app_package_path = get_package_share_directory('app')
         peripherals_package_path = get_package_share_directory('peripherals')
+        proud_up_package_path = get_package_share_directory('proud_up')
     else:
         controller_package_path = '/home/ubuntu/ros2_ws/src/driver/controller'
         app_package_path = '/home/ubuntu/ros2_ws/src/app'
         peripherals_package_path = '/home/ubuntu/ros2_ws/src/peripherals'
+        try:
+            proud_up_package_path = get_package_share_directory('proud_up')
+        except Exception:
+            proud_up_package_path = '/home/ubuntu/ros2_ws/src/proud_up'
 
     profile = LaunchConfiguration('profile').perform(context).strip().lower()
     if profile not in ('slim', 'full'):
@@ -42,6 +47,7 @@ def launch_setup(context):
     rosbridge = _resolve_flag(context, 'rosbridge', profile_is_full)
     web_video = _resolve_flag(context, 'web_video', profile_is_full)
     voice = _resolve_flag(context, 'voice', profile_is_full)
+    proud_up = LaunchConfiguration('proud_up').perform(context).strip().lower() in _TRUE
 
     controller_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -107,6 +113,15 @@ def launch_setup(context):
                 os.path.join(peripherals_package_path, 'launch/joystick_control.launch.py')),
         ))
 
+    if proud_up:
+        actions.append(Node(
+            package='proud_up',
+            executable='proud_up_node',
+            name='proud_up_node',
+            output='screen',
+            parameters=[os.path.join(proud_up_package_path, 'config/proud_up.yaml')],
+        ))
+
     return actions
 
 
@@ -141,6 +156,11 @@ def generate_launch_description():
             'voice',
             default_value=os.environ.get('BRINGUP_VOICE', 'auto'),
             description='Let startup_check launch the voice stack if /dev/ring_mic exists. auto follows profile.',
+        ),
+        DeclareLaunchArgument(
+            'proud_up',
+            default_value=os.environ.get('BRINGUP_PROUD_UP', 'true'),
+            description='Start proud_up_node: camera-forward pose, snapshot, email "Masha is up".',
         ),
         OpaqueFunction(function=launch_setup),
     ])

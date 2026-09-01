@@ -57,3 +57,9 @@ qtcreator-*
 
 # Catkin custom files
 CATKIN_IGNORE
+
+# Local secrets (proud_up SMTP and anything else named .env)
+.env
+**/.env
+!.env.example
+!**/.env.example
