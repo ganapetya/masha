@@ -1,5 +1,9 @@
 # Masha
 
+<p align="center">
+  <img src="images/cosmos-masha.jpeg" alt="Masha, a Hiwonder ROSpider hexapod, on an alien world" width="420">
+</p>
+
 Masha is a **Hiwonder ROSpider** hexapod. This repository is her software image: ROS 2 Humble on a Jetson Orin NX. Git root is the robot home directory (`/home/ubuntu`). Develop on a Linux host, then `git pull` and `colcon build` on the Jetson.
 
 Sister robot **Savelij** will live in a separate repo. Shared world-level notes belong in [robots-world](https://github.com/ganapetya/robots-world).
@@ -60,6 +64,7 @@ Boot: systemd `start_app_node.service` → `ros2 launch bringup bringup.launch.p
 
 | Path | Role |
 |------|------|
+| `images/` | README art (`cosmos-masha.jpeg`) |
 | `ros2_ws/src/` | All robot ROS 2 packages |
 | `ros2_ws/info/` | Operator notes (`startup.md`, `desktop.md`) |
 | `software/` | Qt tools + **action groups** (`ActionGroups/*.d6a`) — required at runtime |
