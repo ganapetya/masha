@@ -260,6 +260,22 @@ void HumanDetector::reset_track() {
   last_person_ = cv::Rect();
 }
 
+void HumanDetector::apply_runtime_cfg(const HumanDetectConfig &cfg) {
+  cfg_.image_scale = cfg.image_scale;
+  cfg_.scale_factor = cfg.scale_factor;
+  cfg_.min_neighbors = cfg.min_neighbors;
+  cfg_.min_face = cfg.min_face;
+  cfg_.min_upper = cfg.min_upper;
+  cfg_.min_full = cfg.min_full;
+  cfg_.person_conf = cfg.person_conf;
+  cfg_.person_iou = cfg.person_iou;
+  cfg_.enable_face_refine = cfg.enable_face_refine;
+  cfg_.person_head_frac = cfg.person_head_frac;
+  cfg_.max_box_frac = cfg.max_box_frac;
+  cfg_.max_aspect = cfg.max_aspect;
+  cfg_.track_gate_frac = cfg.track_gate_frac;
+}
+
 bool HumanDetector::looks_like_person(const cv::Rect &r, int width, int height,
                                       const HumanDetectConfig &cfg) {
   if (r.width < 20 || r.height < 32) {

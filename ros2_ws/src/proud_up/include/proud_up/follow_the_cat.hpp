@@ -11,6 +11,7 @@
 // A pixel (u, v) is not a 3D point; it is a ray. Depth is unknown this week.
 
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -123,6 +124,8 @@ class HumanDetector {
   bool using_cuda() const { return using_cuda_; }
   double last_detect_ms() const { return last_detect_ms_; }
   void reset_track();
+  // Copy runtime scalars (thresholds, gates). Does not reload ONNX / cascades.
+  void apply_runtime_cfg(const HumanDetectConfig &cfg);
   std::optional<CardDetection> detect(const cv::Mat &bgr);
 
  private:
@@ -270,5 +273,14 @@ void draw_debug_overlay(cv::Mat &bgr, const std::optional<CardDetection> &det,
                         const char *phase, const GazeAngles *angles = nullptr,
                         const DetectionStats *stats = nullptr,
                         const char *note = nullptr);
+
+// Coast fills a dropped YOLO box for gaze hold. Walk must not use that box.
+inline bool is_coasted_detection(const CardDetection &det) {
+  return det.label != nullptr && std::strcmp(det.label, "coast") == 0;
+}
+
+inline bool walk_detection_valid(const std::optional<CardDetection> &det) {
+  return det.has_value() && !is_coasted_detection(*det);
+}
 
 }  // namespace proud_up

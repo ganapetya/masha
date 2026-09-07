@@ -76,6 +76,9 @@ follow_the_cat_node:
     lost_timeout_seconds: 6.0
     walk_seconds: 3.0
     walk_speed: 0.05
+    # If cmd_vel goes quiet while walking (detect/control stall), halt via
+    # Traveling gait 0 then -2. Never publish a zero Twist (in-place gait).
+    walk_watchdog_seconds: 0.3
     center_yaw_tol: 0.08
     center_pitch_tol: 0.20
     servo_duration: 0.08

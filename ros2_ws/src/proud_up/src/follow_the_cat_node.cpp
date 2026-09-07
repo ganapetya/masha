@@ -7,8 +7,9 @@
 // best-effort image sub, 10 Hz timer, mutex, services, servo + cmd_vel pubs.
 //
 // Threads: image/camera_info callbacks only store shared_ptrs under mutex_.
-// The timer copies those pointers, drops the lock, then runs OpenCV / Eigen.
-// Two callback groups + MultiThreadedExecutor make that overlap real.
+// detect_tick runs OpenCV / YOLO. control_tick runs the phase machine, servos,
+// and walk. watchdog_tick halt_legs if cmd_vel goes quiet while walking.
+// Four mutually exclusive callback groups + MultiThreadedExecutor.
 //
 // Gaze is incremental (integrate_gaze), not rest+angle: commanding rest+yaw
 // every tick hunts, because a centered card would snap the arm back to rest.
@@ -32,12 +33,14 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/imgproc.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <kinematics_msgs/msg/traveling.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -107,55 +110,54 @@ class FollowTheCatNode : public rclcpp::Node {
     dry_run_ = declare_parameter<bool>("dry_run", false);
     target_mode_ = declare_parameter<std::string>("target", "human");
 
-    HumanDetectConfig human_cfg;
-    human_cfg.cascade_dir = declare_parameter<std::string>(
+    human_cfg_.cascade_dir = declare_parameter<std::string>(
         "cascade_dir", "/usr/share/opencv4/haarcascades");
-    human_cfg.lbp_dir = declare_parameter<std::string>(
+    human_cfg_.lbp_dir = declare_parameter<std::string>(
         "lbp_dir", "/usr/share/opencv4/lbpcascades");
-    human_cfg.image_scale = declare_parameter<double>("human_image_scale", 0.45);
-    human_cfg.scale_factor = declare_parameter<double>("human_scale_factor", 1.2);
-    human_cfg.min_neighbors = declare_parameter<int>("human_min_neighbors", 3);
-    human_cfg.min_face = declare_parameter<int>("min_face", 24);
-    human_cfg.min_upper = declare_parameter<int>("min_upper", 50);
-    human_cfg.min_full = declare_parameter<int>("min_full", 60);
-    human_cfg.enable_upper = declare_parameter<bool>("enable_upper_body", false);
-    human_cfg.enable_full = declare_parameter<bool>("enable_full_body", false);
-    human_cfg.person_conf = declare_parameter<double>("person_conf", 0.45);
-    human_cfg.person_iou = declare_parameter<double>("person_iou", 0.45);
-    human_cfg.person_imgsz = declare_parameter<int>("person_imgsz", 320);
-    human_cfg.dnn_cuda = declare_parameter<bool>("dnn_cuda", true);
-    human_cfg.enable_face_refine = declare_parameter<bool>("enable_face_refine", false);
-    human_cfg.person_head_frac = declare_parameter<double>("person_head_frac", 0.45);
-    human_cfg.max_box_frac = declare_parameter<double>("max_box_frac", 0.40);
-    human_cfg.max_aspect = declare_parameter<double>("person_max_aspect", 1.05);
-    human_cfg.track_gate_frac = declare_parameter<double>("track_gate_frac", 0.22);
-    human_cfg.person_onnx = declare_parameter<std::string>("person_onnx", "");
-    if (human_cfg.person_onnx.empty()) {
+    human_cfg_.image_scale = declare_parameter<double>("human_image_scale", 0.45);
+    human_cfg_.scale_factor = declare_parameter<double>("human_scale_factor", 1.2);
+    human_cfg_.min_neighbors = declare_parameter<int>("human_min_neighbors", 3);
+    human_cfg_.min_face = declare_parameter<int>("min_face", 24);
+    human_cfg_.min_upper = declare_parameter<int>("min_upper", 50);
+    human_cfg_.min_full = declare_parameter<int>("min_full", 60);
+    human_cfg_.enable_upper = declare_parameter<bool>("enable_upper_body", false);
+    human_cfg_.enable_full = declare_parameter<bool>("enable_full_body", false);
+    human_cfg_.person_conf = declare_parameter<double>("person_conf", 0.45);
+    human_cfg_.person_iou = declare_parameter<double>("person_iou", 0.45);
+    human_cfg_.person_imgsz = declare_parameter<int>("person_imgsz", 320);
+    human_cfg_.dnn_cuda = declare_parameter<bool>("dnn_cuda", true);
+    human_cfg_.enable_face_refine = declare_parameter<bool>("enable_face_refine", false);
+    human_cfg_.person_head_frac = declare_parameter<double>("person_head_frac", 0.45);
+    human_cfg_.max_box_frac = declare_parameter<double>("max_box_frac", 0.40);
+    human_cfg_.max_aspect = declare_parameter<double>("person_max_aspect", 1.05);
+    human_cfg_.track_gate_frac = declare_parameter<double>("track_gate_frac", 0.22);
+    human_cfg_.person_onnx = declare_parameter<std::string>("person_onnx", "");
+    if (human_cfg_.person_onnx.empty()) {
       try {
-        human_cfg.person_onnx =
+        human_cfg_.person_onnx =
             ament_index_cpp::get_package_share_directory("proud_up") + "/models/yolov8n.onnx";
       } catch (const std::exception &) {
-        human_cfg.person_onnx.clear();
+        human_cfg_.person_onnx.clear();
       }
     }
-    if (!human_cfg.person_onnx.empty()) {
-      std::ifstream probe(human_cfg.person_onnx);
+    if (!human_cfg_.person_onnx.empty()) {
+      std::ifstream probe(human_cfg_.person_onnx);
       if (!probe.good()) {
-        RCLCPP_ERROR(get_logger(), "person ONNX missing: %s", human_cfg.person_onnx.c_str());
-        human_cfg.person_onnx.clear();
+        RCLCPP_ERROR(get_logger(), "person ONNX missing: %s", human_cfg_.person_onnx.c_str());
+        human_cfg_.person_onnx.clear();
       }
     }
-    human_ = std::make_unique<HumanDetector>(human_cfg);
+    human_ = std::make_unique<HumanDetector>(human_cfg_);
     if (target_mode_ == "human" && !human_->ok()) {
       RCLCPP_ERROR(get_logger(),
                    "no person detector (cascade %s / %s, onnx %s) — gaze will miss",
-                   human_cfg.lbp_dir.c_str(), human_cfg.cascade_dir.c_str(),
-                   human_cfg.person_onnx.c_str());
+                   human_cfg_.lbp_dir.c_str(), human_cfg_.cascade_dir.c_str(),
+                   human_cfg_.person_onnx.c_str());
     } else if (target_mode_ == "human") {
       RCLCPP_INFO(get_logger(), "person detector onnx=%s cuda=%s face=%s",
-                  human_->person_ok() ? human_cfg.person_onnx.c_str() : "off",
+                  human_->person_ok() ? human_cfg_.person_onnx.c_str() : "off",
                   human_->using_cuda() ? "yes" : "no",
-                  human_cfg.cascade_dir.empty() ? "off" : "lbp");
+                  human_cfg_.cascade_dir.empty() ? "off" : "lbp");
     }
 
     detect_cfg_.threshold = declare_parameter<int>("threshold", 90);
@@ -209,16 +211,18 @@ class FollowTheCatNode : public rclcpp::Node {
     confirm_frames_ = declare_parameter<int>("confirm_frames", 3);
     max_jump_px_ = declare_parameter<double>("max_jump_px", 180.0);
     debug_max_width_ = declare_parameter<int>("debug_max_width", 640);
+    walk_watchdog_seconds_ = declare_parameter<double>("walk_watchdog_seconds", 0.3);
 
     gaze_id19_ = rest_.id19;
     gaze_id22_ = rest_.id22;
 
-    // Two mutually exclusive groups so the image callback and the 10 Hz timer
-    // can actually overlap on a MultiThreadedExecutor. The default group is
-    // mutually exclusive for the *whole node*, which would serialize them and
-    // hide the race the mutex is there to prevent.
+    // Mutually exclusive groups so image store, YOLO, control, and the walk
+    // watchdog can overlap on a MultiThreadedExecutor. The default group is
+    // mutually exclusive for the *whole node*, which would serialize them.
     image_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    detect_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     control_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    watchdog_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
     servo_pub_ = create_publisher<servo_controller_msgs::msg::ServosPosition>(servo_topic_, 1);
     cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 1);
@@ -226,14 +230,12 @@ class FollowTheCatNode : public rclcpp::Node {
     image_pub_ = create_publisher<sensor_msgs::msg::Image>("~/image_result", 1);
 
     // Aurora publishes best-effort. A default *reliable* subscription on
-    // Humble often sees zero frames — proud_up_node already uses KeepLast(5)
-    // + best_effort for this reason. camera_info is typically reliable; we
-    // still match the image QoS so a best-effort info topic would work too.
-    rclcpp::QoS image_qos(rclcpp::KeepLast(5));
+    // Humble often sees zero frames. SensorDataQoS is KeepLast(5)+best_effort.
+    // camera_info is typically reliable; we still match the image QoS so a
+    // best-effort info topic would work too.
+    rclcpp::QoS image_qos = rclcpp::SensorDataQoS();
     if (image_qos_reliable_) {
       image_qos.reliable();
-    } else {
-      image_qos.best_effort();
     }
     rclcpp::SubscriptionOptions image_opts;
     image_opts.callback_group = image_cb_group_;
@@ -270,7 +272,14 @@ class FollowTheCatNode : public rclcpp::Node {
           response->message = phase_name(phase_);
         });
 
-    timer_ = create_wall_timer(50ms, [this]() { tick(); }, control_cb_group_);
+    param_cb_ = add_on_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter> &params) {
+          return on_set_parameters(params);
+        });
+
+    detect_timer_ = create_wall_timer(50ms, [this]() { detect_tick(); }, detect_cb_group_);
+    control_timer_ = create_wall_timer(50ms, [this]() { control_tick(); }, control_cb_group_);
+    watchdog_timer_ = create_wall_timer(100ms, [this]() { watchdog_tick(); }, watchdog_cb_group_);
     started_at_ = now();
     phase_started_at_ = started_at_;
 
@@ -330,8 +339,10 @@ class FollowTheCatNode : public rclcpp::Node {
       rest_sent_ = false;
       ema_ready_ = false;
       coast_det_.reset();
+      latest_det_.reset();
       last_seen_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
       last_fresh_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      last_walk_cmd_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
       seen_streak_ = 0;
       reset_track_pending_ = true;
       pan_i_ = 0.0;
@@ -351,6 +362,8 @@ class FollowTheCatNode : public rclcpp::Node {
       stopping_ = true;
       lock_active_ = false;
       coast_det_.reset();
+      latest_det_.reset();
+      last_walk_cmd_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
       set_phase_locked(Phase::Done);
     }
     halt_legs();
@@ -372,42 +385,48 @@ class FollowTheCatNode : public rclcpp::Node {
     }
     if (next == Phase::Moving) {
       walk_started_at_ = now();
+      last_walk_cmd_at_ = walk_started_at_;
     }
   }
 
-  void tick() {
+  void detect_tick() {
     sensor_msgs::msg::Image::ConstSharedPtr image;
     sensor_msgs::msg::CameraInfo::ConstSharedPtr info;
     bool stopping;
     DetectionConfig detect_cfg;
-    PulseMapping pulse_map;
-    bool enable_walk;
-    bool dry_run;
+    HumanDetectConfig human_cfg;
+    std::string target_mode;
     bool reset_track = false;
+    double lost_timeout;
+    double aim_u;
+    double aim_v;
+    Phase overlay_phase = Phase::Idle;
     {
       // Copy pointers / small values, then drop the lock BEFORE OpenCV.
-      // Holding it across toCvCopy would stall the callback thread (and
-      // therefore the DDS executor) for every frame.
       std::lock_guard<std::mutex> lock(mutex_);
       image = latest_image_;
       info = latest_info_;
       stopping = stopping_;
       detect_cfg = detect_cfg_;
-      pulse_map = pulse_map_;
-      enable_walk = enable_walk_;
-      dry_run = dry_run_;
+      human_cfg = human_cfg_;
+      target_mode = target_mode_;
       reset_track = reset_track_pending_;
       reset_track_pending_ = false;
+      lost_timeout = lost_timeout_seconds_;
+      aim_u = aim_u_offset_px_;
+      aim_v = aim_v_offset_px_;
+      overlay_phase = phase_;
     }
 
     if (stopping) {
       return;
     }
 
-    maybe_mark_ready();
-
     if (reset_track && human_) {
       human_->reset_track();
+    }
+    if (human_) {
+      human_->apply_runtime_cfg(human_cfg);
     }
 
     CameraIntrinsics K = fallback_intrinsics();
@@ -450,25 +469,25 @@ class FollowTheCatNode : public rclcpp::Node {
       }
       if (cv_ptr && !cv_ptr->image.empty()) {
         annotated = cv_ptr->image;
-        if (target_mode_ == "human") {
+        if (target_mode == "human") {
           det = human_->detect(annotated);
           const double ms = human_->last_detect_ms();
           if (ms > 80.0) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                                 "person detect took %.0f ms — loop is lagging", ms);
+                                 "person detect took %.0f ms — control loop is free", ms);
           }
         } else {
           det = detect_black_rectangle(annotated, detect_cfg, &det_stats);
         }
         {
           // Hold the last box for lost_timeout_seconds so a single YOLO miss
-          // (you turn, a frame is dark) does not snap idle in 0.8 s.
+          // does not snap idle. Coast is gaze-only; walk must not use it.
           std::lock_guard<std::mutex> lock(mutex_);
           if (det) {
             coast_det_ = det;
             last_fresh_at_ = now();
           } else if (coast_det_ && last_fresh_at_.nanoseconds() != 0 &&
-                     (now() - last_fresh_at_).seconds() <= lost_timeout_seconds_) {
+                     (now() - last_fresh_at_).seconds() <= lost_timeout) {
             det = coast_det_;
             det->label = "coast";
           } else {
@@ -502,11 +521,9 @@ class FollowTheCatNode : public rclcpp::Node {
           }
           if (det) {
             det->center = center;
-            // Drive the aim point to the *visual* centre of the frame (magenta
-            // cross), not K.cx — that is what "centre me in the picture" means.
             CameraIntrinsics aim = K;
-            aim.cx = 0.5 * static_cast<double>(annotated.cols) + aim_u_offset_px_;
-            aim.cy = 0.5 * static_cast<double>(annotated.rows) + aim_v_offset_px_;
+            aim.cx = 0.5 * static_cast<double>(annotated.cols) + aim_u;
+            aim.cy = 0.5 * static_cast<double>(annotated.rows) + aim_v;
             const Eigen::Vector3d ray = pixel_to_ray(center.u, center.v, aim);
             angles = ray_to_yaw_pitch(ray);
             const Eigen::Quaterniond q = gaze_quaternion(angles.yaw, angles.pitch);
@@ -519,13 +536,68 @@ class FollowTheCatNode : public rclcpp::Node {
       }
     }
 
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_det_ = det;
+      latest_angles_ = angles;
+      target_.seen = static_cast<bool>(det);
+      if (det) {
+        target_.u = det->center.u;
+        target_.v = det->center.v;
+        target_.stamp = image_stamp;
+        if (!is_coasted_detection(*det)) {
+          last_seen_at_ = now();
+        }
+      }
+      overlay_phase = phase_;
+    }
+
+    if (!annotated.empty()) {
+      char err_note[128];
+      if (det) {
+        const double du = det->center.u - 0.5 * annotated.cols - aim_u;
+        std::snprintf(err_note, sizeof(err_note),
+                      "du=%+.0f px  yaw=%+.1f deg  det=%.0fms", du,
+                      angles.yaw * 180.0 / kPi,
+                      human_ ? human_->last_detect_ms() : 0.0);
+      } else {
+        std::snprintf(err_note, sizeof(err_note), "stand in front of Masha, face the camera");
+      }
+      draw_debug_overlay(annotated, det, phase_name(overlay_phase), det ? &angles : nullptr,
+                         &det_stats, err_note);
+      publish_debug_image(annotated, image);
+    }
+  }
+
+  void control_tick() {
+    maybe_mark_ready();
+
+    std::optional<CardDetection> det;
+    GazeAngles angles;
+    PulseMapping pulse_map;
+    bool enable_walk;
+    bool dry_run;
+    bool stopping;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping = stopping_;
+      det = latest_det_;
+      angles = latest_angles_;
+      pulse_map = pulse_map_;
+      enable_walk = enable_walk_;
+      dry_run = dry_run_;
+    }
+
+    if (stopping) {
+      return;
+    }
+
     geometry_msgs::msg::Twist twist;  // only published when linear.x != 0
     bool publish_twist = false;
     bool publish_servos = false;
     bool halt_after_unlock = false;
     ArmPulses arm = rest_;
     double servo_dt = servo_duration_;
-    Phase overlay_phase = Phase::Idle;
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -533,19 +605,7 @@ class FollowTheCatNode : public rclcpp::Node {
         return;
       }
 
-      target_.seen = static_cast<bool>(det);
-      if (det) {
-        target_.u = det->center.u;
-        target_.v = det->center.v;
-        target_.stamp = image_stamp;
-        if (det->label == nullptr || std::strcmp(det->label, "coast") != 0) {
-          last_seen_at_ = now();
-        }
-      }
-
-      if (!hardware_ready_) {
-        overlay_phase = phase_;
-      } else {
+      if (hardware_ready_) {
         switch (phase_) {
           case Phase::Idle:
             tick_idle_locked(det, angles, pulse_map, arm, servo_dt, publish_servos);
@@ -572,29 +632,8 @@ class FollowTheCatNode : public rclcpp::Node {
           case Phase::Done:
             break;
         }
-        overlay_phase = phase_;
       }
-    }
 
-    const char *phase_str = phase_name(overlay_phase);
-    if (!annotated.empty()) {
-      char err_note[128];
-      if (det) {
-        const double du = det->center.u - 0.5 * annotated.cols - aim_u_offset_px_;
-        std::snprintf(err_note, sizeof(err_note),
-                      "du=%+.0f px  yaw=%+.1f deg  det=%.0fms", du,
-                      angles.yaw * 180.0 / kPi,
-                      human_ ? human_->last_detect_ms() : 0.0);
-      } else {
-        std::snprintf(err_note, sizeof(err_note), "stand in front of Masha, face the camera");
-      }
-      draw_debug_overlay(annotated, det, phase_str, det ? &angles : nullptr, &det_stats,
-                         err_note);
-      publish_debug_image(annotated, image);
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
       if (stopping_) {
         publish_servos = false;
         publish_twist = false;
@@ -620,9 +659,41 @@ class FollowTheCatNode : public rclcpp::Node {
       } else {
         cmd_vel_pub_->publish(twist);
       }
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_walk_cmd_at_ = now();
+      }
     }
     if (halt_after_unlock) {
       halt_legs();
+    }
+  }
+
+  void watchdog_tick() {
+    bool should_halt = false;
+    double timeout = 0.3;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      timeout = walk_watchdog_seconds_;
+      if (stopping_ || !walking_active_ || timeout <= 0.0) {
+        return;
+      }
+      if (last_walk_cmd_at_.nanoseconds() == 0) {
+        return;
+      }
+      if ((now() - last_walk_cmd_at_).seconds() <= timeout) {
+        return;
+      }
+      walking_active_ = false;
+      lock_active_ = false;
+      set_phase_locked(Phase::Lost);
+      should_halt = true;
+    }
+    if (should_halt) {
+      halt_legs();
+      RCLCPP_WARN(get_logger(),
+                  "walk watchdog: no cmd_vel for %.2f s; halt_legs (Traveling, not zero Twist)",
+                  timeout);
     }
   }
 
@@ -693,7 +764,7 @@ class FollowTheCatNode : public rclcpp::Node {
       return;
     }
     seen_streak_ = confirm_frames_;
-    const bool coasting = det->label != nullptr && std::strcmp(det->label, "coast") == 0;
+    const bool coasting = is_coasted_detection(*det);
     if (!coasting) {
       publish_servos = apply_gaze(arm, servo_dt, angles, pulse_map);
     }
@@ -719,8 +790,12 @@ class FollowTheCatNode : public rclcpp::Node {
                           const PulseMapping &pulse_map, ArmPulses &arm, double &servo_dt,
                           bool &publish_servos, geometry_msgs::msg::Twist &twist,
                           bool &publish_twist, bool &halt_after_unlock) {
-    if (!det) {
-      // Abort immediately if the blob is lost — do not keep walking blind.
+    const bool stale_box =
+        last_fresh_at_.nanoseconds() == 0 ||
+        (now() - last_fresh_at_).seconds() > walk_watchdog_seconds_;
+    if (!walk_detection_valid(det) || stale_box) {
+      // Abort immediately on miss, coast, or a stale box (detect_tick stuck).
+      // Coast is gaze-only; walk requires a fresh detection.
       halt_after_unlock = true;
       set_phase_locked(Phase::Lost);
       return;
@@ -809,6 +884,186 @@ class FollowTheCatNode : public rclcpp::Node {
     traveling_pub_->publish(stand);
   }
 
+  rcl_interfaces::msg::SetParametersResult on_set_parameters(
+      const std::vector<rclcpp::Parameter> &params) {
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+
+    auto reject = [&](const std::string &reason) {
+      result.successful = false;
+      result.reason = reason;
+    };
+
+    for (const auto &p : params) {
+      const std::string &name = p.get_name();
+      if (name == "person_onnx" || name == "cascade_dir" || name == "lbp_dir" ||
+          name == "dnn_cuda" || name == "person_imgsz" || name == "enable_upper_body" ||
+          name == "enable_full_body" || name == "image_topic" || name == "camera_info_topic" ||
+          name == "servo_topic" || name == "cmd_vel_topic") {
+        reject(name + " cannot be changed at runtime");
+        return result;
+      }
+      if (name == "ema_alpha") {
+        const double v = p.as_double();
+        if (v <= 0.0 || v > 1.0) {
+          reject("ema_alpha must be in (0, 1]");
+          return result;
+        }
+      }
+      if (name == "walk_speed" || name == "walk_seconds" || name == "lock_seconds" ||
+          name == "lost_timeout_seconds" || name == "walk_watchdog_seconds" ||
+          name == "gaze_gain" || name == "max_step_pulses" || name == "deadband_rad" ||
+          name == "person_conf" || name == "person_iou" || name == "max_jump_px") {
+        if (p.as_double() < 0.0) {
+          reject(name + " must be >= 0");
+          return result;
+        }
+      }
+      if (name == "confirm_frames" && p.as_int() < 1) {
+        reject("confirm_frames must be >= 1");
+        return result;
+      }
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    double new_pan_min = pulse_map_.pan_min;
+    double new_pan_max = pulse_map_.pan_max;
+    double new_tilt_min = pulse_map_.tilt_min;
+    double new_tilt_max = pulse_map_.tilt_max;
+    for (const auto &p : params) {
+      if (p.get_name() == "pan_min") {
+        new_pan_min = p.as_double();
+      } else if (p.get_name() == "pan_max") {
+        new_pan_max = p.as_double();
+      } else if (p.get_name() == "tilt_min") {
+        new_tilt_min = p.as_double();
+      } else if (p.get_name() == "tilt_max") {
+        new_tilt_max = p.as_double();
+      }
+    }
+    if (new_pan_min >= new_pan_max) {
+      reject("pan_min must be < pan_max");
+      return result;
+    }
+    if (new_tilt_min >= new_tilt_max) {
+      reject("tilt_min must be < tilt_max");
+      return result;
+    }
+    for (const auto &p : params) {
+      const std::string &name = p.get_name();
+      if (name == "enable_walk") {
+        enable_walk_ = p.as_bool();
+      } else if (name == "dry_run") {
+        dry_run_ = p.as_bool();
+      } else if (name == "target") {
+        target_mode_ = p.as_string();
+      } else if (name == "yaw_sign") {
+        pulse_map_.yaw_sign = p.as_double();
+      } else if (name == "pitch_sign") {
+        pulse_map_.pitch_sign = p.as_double();
+      } else if (name == "pan_min") {
+        pulse_map_.pan_min = static_cast<float>(p.as_double());
+      } else if (name == "pan_max") {
+        pulse_map_.pan_max = static_cast<float>(p.as_double());
+      } else if (name == "tilt_min") {
+        pulse_map_.tilt_min = static_cast<float>(p.as_double());
+      } else if (name == "tilt_max") {
+        pulse_map_.tilt_max = static_cast<float>(p.as_double());
+      } else if (name == "lock_seconds") {
+        lock_seconds_ = p.as_double();
+      } else if (name == "lost_timeout_seconds") {
+        lost_timeout_seconds_ = p.as_double();
+      } else if (name == "walk_seconds") {
+        walk_seconds_ = p.as_double();
+      } else if (name == "walk_speed") {
+        walk_speed_ = p.as_double();
+      } else if (name == "walk_watchdog_seconds") {
+        walk_watchdog_seconds_ = p.as_double();
+      } else if (name == "center_yaw_tol") {
+        center_yaw_tol_ = p.as_double();
+      } else if (name == "center_pitch_tol") {
+        center_pitch_tol_ = p.as_double();
+      } else if (name == "servo_duration") {
+        servo_duration_ = p.as_double();
+      } else if (name == "gaze_gain") {
+        gaze_gain_ = p.as_double();
+      } else if (name == "gaze_ki") {
+        gaze_ki_ = p.as_double();
+      } else if (name == "max_step_pulses") {
+        max_step_pulses_ = p.as_double();
+      } else if (name == "deadband_rad") {
+        deadband_rad_ = p.as_double();
+      } else if (name == "aim_u_offset_px") {
+        aim_u_offset_px_ = p.as_double();
+      } else if (name == "aim_v_offset_px") {
+        aim_v_offset_px_ = p.as_double();
+      } else if (name == "ema_alpha") {
+        ema_alpha_ = p.as_double();
+      } else if (name == "max_jump_px") {
+        max_jump_px_ = p.as_double();
+      } else if (name == "confirm_frames") {
+        confirm_frames_ = static_cast<int>(p.as_int());
+      } else if (name == "debug_max_width") {
+        debug_max_width_ = static_cast<int>(p.as_int());
+      } else if (name == "threshold") {
+        detect_cfg_.threshold = static_cast<int>(p.as_int());
+      } else if (name == "loose_threshold") {
+        detect_cfg_.loose_threshold = static_cast<int>(p.as_int());
+      } else if (name == "min_area") {
+        detect_cfg_.min_area = p.as_double();
+      } else if (name == "max_area") {
+        detect_cfg_.max_area = p.as_double();
+      } else if (name == "max_area_frac") {
+        detect_cfg_.max_area_frac = p.as_double();
+      } else if (name == "min_aspect") {
+        detect_cfg_.min_aspect = p.as_double();
+      } else if (name == "max_aspect") {
+        detect_cfg_.max_aspect = p.as_double();
+      } else if (name == "min_solidity") {
+        detect_cfg_.min_solidity = p.as_double();
+      } else if (name == "blur_ksize") {
+        detect_cfg_.blur_ksize = static_cast<int>(p.as_int());
+      } else if (name == "morph_ksize") {
+        detect_cfg_.morph_ksize = static_cast<int>(p.as_int());
+      } else if (name == "border_margin") {
+        detect_cfg_.border_margin = static_cast<int>(p.as_int());
+      } else if (name == "reject_border") {
+        detect_cfg_.reject_border = p.as_bool();
+      } else if (name == "require_quad") {
+        detect_cfg_.require_quad = p.as_bool();
+      } else if (name == "require_portrait") {
+        detect_cfg_.require_portrait = p.as_bool();
+      } else if (name == "person_conf") {
+        human_cfg_.person_conf = p.as_double();
+      } else if (name == "person_iou") {
+        human_cfg_.person_iou = p.as_double();
+      } else if (name == "enable_face_refine") {
+        human_cfg_.enable_face_refine = p.as_bool();
+      } else if (name == "person_head_frac") {
+        human_cfg_.person_head_frac = p.as_double();
+      } else if (name == "max_box_frac") {
+        human_cfg_.max_box_frac = p.as_double();
+      } else if (name == "person_max_aspect") {
+        human_cfg_.max_aspect = p.as_double();
+      } else if (name == "track_gate_frac") {
+        human_cfg_.track_gate_frac = p.as_double();
+      } else if (name == "human_image_scale") {
+        human_cfg_.image_scale = p.as_double();
+      } else if (name == "human_scale_factor") {
+        human_cfg_.scale_factor = p.as_double();
+      } else if (name == "human_min_neighbors") {
+        human_cfg_.min_neighbors = static_cast<int>(p.as_int());
+      } else if (name == "min_face") {
+        human_cfg_.min_face = static_cast<int>(p.as_int());
+      } else if (name == "min_upper") {
+        human_cfg_.min_upper = static_cast<int>(p.as_int());
+      } else if (name == "min_full") {
+        human_cfg_.min_full = static_cast<int>(p.as_int());
+      }
+    }
+    return result;
+  }
+
   void publish_debug_image(const cv::Mat &bgr,
                            const sensor_msgs::msg::Image::ConstSharedPtr &source) {
     cv_bridge::CvImage out;
@@ -844,30 +1099,32 @@ class FollowTheCatNode : public rclcpp::Node {
   bool logged_fallback_intrinsics_{false};
 
   DetectionConfig detect_cfg_;
+  HumanDetectConfig human_cfg_;
   PulseMapping pulse_map_;
   ArmPulses rest_;
   std::string target_mode_{"human"};
   std::unique_ptr<HumanDetector> human_;
 
   double lock_seconds_{2.0};
-  double lost_timeout_seconds_{2.5};
+  double lost_timeout_seconds_{6.0};
   double walk_seconds_{3.0};
   double walk_speed_{0.05};
+  double walk_watchdog_seconds_{0.3};
   double center_yaw_tol_{0.08};
   double center_pitch_tol_{0.20};
-  double servo_duration_{0.12};
+  double servo_duration_{0.08};
   double ready_timeout_seconds_{30.0};
-  double gaze_gain_{0.45};
-  double gaze_ki_{0.35};
-  double max_step_pulses_{28.0};
-  double deadband_rad_{0.02};
+  double gaze_gain_{0.18};
+  double gaze_ki_{0.0};
+  double max_step_pulses_{8.0};
+  double deadband_rad_{0.06};
   double aim_u_offset_px_{0.0};
   double aim_v_offset_px_{0.0};
   double pan_i_{0.0};
-  double ema_alpha_{0.35};
-  double max_jump_px_{400.0};
-  int debug_max_width_{320};
-  int confirm_frames_{1};
+  double ema_alpha_{0.30};
+  double max_jump_px_{180.0};
+  int debug_max_width_{640};
+  int confirm_frames_{3};
   float gaze_id19_{500.0f};
   float gaze_id22_{150.0f};
   double ema_u_{0.0};
@@ -876,7 +1133,9 @@ class FollowTheCatNode : public rclcpp::Node {
   int seen_streak_{0};
 
   rclcpp::CallbackGroup::SharedPtr image_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr detect_cb_group_;
   rclcpp::CallbackGroup::SharedPtr control_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr watchdog_cb_group_;
   rclcpp::Publisher<servo_controller_msgs::msg::ServosPosition>::SharedPtr servo_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<kinematics_msgs::msg::Traveling>::SharedPtr traveling_pub_;
@@ -888,17 +1147,23 @@ class FollowTheCatNode : public rclcpp::Node {
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr init_finish_srv_;
-  rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr detect_timer_;
+  rclcpp::TimerBase::SharedPtr control_timer_;
+  rclcpp::TimerBase::SharedPtr watchdog_timer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
 
   std::mutex mutex_;
   Phase phase_{Phase::Idle};
   TargetState target_;
   sensor_msgs::msg::Image::ConstSharedPtr latest_image_;
   sensor_msgs::msg::CameraInfo::ConstSharedPtr latest_info_;
+  std::optional<CardDetection> latest_det_;
+  GazeAngles latest_angles_;
   rclcpp::Time started_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time phase_started_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_seen_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_fresh_at_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_walk_cmd_at_{0, 0, RCL_ROS_TIME};
   std::optional<CardDetection> coast_det_;
   rclcpp::Time lock_started_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time walk_started_at_{0, 0, RCL_ROS_TIME};
@@ -921,8 +1186,8 @@ int main(int argc, char **argv) {
     }
   });
 
-  // MultiThreadedExecutor: image callback group and timer group can run at the
-  // same time. The mutex in the node is what makes that safe.
+  // MultiThreadedExecutor: image, detect, control, and watchdog groups can run
+  // at the same time. The mutex in the node is what makes that safe.
   rclcpp::executors::MultiThreadedExecutor exec;
   exec.add_node(node);
   exec.spin();

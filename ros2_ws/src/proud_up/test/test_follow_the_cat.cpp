@@ -1,4 +1,5 @@
 #include <cmath>
+#include <optional>
 
 #include <gtest/gtest.h>
 #include <opencv2/core.hpp>
@@ -25,6 +26,7 @@ using proud_up::near_optical_axis;
 using proud_up::pixel_to_ray;
 using proud_up::PulseMapping;
 using proud_up::ray_to_yaw_pitch;
+using proud_up::walk_detection_valid;
 
 namespace {
 
@@ -241,6 +243,22 @@ TEST(FollowTheCat, IntegrateGazeSlewLimit) {
   err.yaw = 1.0;  // huge optical error
   const GazePulses next = integrate_gaze(current, err, map, 1.0, 18.0, 0.0);
   EXPECT_NEAR(next.id19, 518.0f, 0.01);
+}
+
+TEST(FollowTheCat, CoastDetectionIsNotValidForWalk) {
+  EXPECT_FALSE(walk_detection_valid(std::nullopt));
+
+  proud_up::CardDetection person;
+  person.label = "person";
+  EXPECT_TRUE(walk_detection_valid(person));
+
+  proud_up::CardDetection face;
+  face.label = "face";
+  EXPECT_TRUE(walk_detection_valid(face));
+
+  proud_up::CardDetection coast;
+  coast.label = "coast";
+  EXPECT_FALSE(walk_detection_valid(coast));
 }
 
 TEST(FollowTheCat, YawSignFlipsPanPulseDirection) {
