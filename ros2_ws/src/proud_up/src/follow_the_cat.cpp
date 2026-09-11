@@ -13,175 +13,15 @@
 namespace proud_up {
 namespace {
 
-int odd_or_zero(int k) {
-  if (k < 3) {
-    return 0;
-  }
-  return (k % 2 == 0) ? (k + 1) : k;
-}
-
-bool touches_image_border(const std::vector<cv::Point> &contour, int width, int height,
-                          int margin) {
-  const cv::Rect box = cv::boundingRect(contour);
-  const int m = std::max(0, margin);
-  return box.x <= m || box.y <= m || (box.x + box.width) >= (width - m) ||
-         (box.y + box.height) >= (height - m);
-}
-
-bool looks_like_portrait_phone(const std::vector<cv::Point> &contour, const DetectionConfig &cfg,
-                               double area, double max_area, std::vector<cv::Point> *approx_out,
-                               double *aspect_out, DetectionStats *stats) {
-  if (area < cfg.min_area || area > max_area) {
-    if (stats) {
-      ++stats->rejected_area;
-    }
-    return false;
-  }
-
-  const double peri = cv::arcLength(contour, true);
-  std::vector<cv::Point> approx;
-  cv::approxPolyDP(contour, approx, cfg.poly_eps_frac * peri, true);
-  const int n = static_cast<int>(approx.size());
-  const bool vertex_ok = n >= cfg.min_vertices && n <= cfg.max_vertices;
-  const bool convex = approx.size() >= 3 && cv::isContourConvex(approx);
-
-  const cv::Rect box = cv::boundingRect(contour);
-  const double aspect =
-      static_cast<double>(box.width) / static_cast<double>(std::max(1, box.height));
-  const bool aspect_ok = aspect >= cfg.min_aspect && aspect <= cfg.max_aspect;
-  const bool portrait_ok = !cfg.require_portrait || (box.height > box.width);
-
-  const double box_area = static_cast<double>(std::max(1, box.width * box.height));
-  const double solidity = area / box_area;
-  const bool solid_ok = solidity >= cfg.min_solidity;
-
-  bool ok = aspect_ok && portrait_ok && solid_ok && convex;
-  if (cfg.require_quad) {
-    ok = ok && vertex_ok;
-  }
-  if (!ok) {
-    if (stats) {
-      ++stats->rejected_shape;
-    }
-    return false;
-  }
-  if (approx_out) {
-    *approx_out = std::move(approx);
-  }
-  if (aspect_out) {
-    *aspect_out = aspect;
-  }
-  return true;
-}
-
-Pixel centroid(const std::vector<cv::Point> &contour) {
-  const cv::Moments m = cv::moments(contour);
-  Pixel p;
-  if (std::abs(m.m00) < 1e-6) {
-    const cv::Rect box = cv::boundingRect(contour);
-    p.u = box.x + box.width * 0.5;
-    p.v = box.y + box.height * 0.5;
-    return p;
-  }
-  // Spatial moments: (m10/m00, m01/m00) is the area centroid in px.
-  p.u = m.m10 / m.m00;
-  p.v = m.m01 / m.m00;
-  return p;
-}
-
-}  // namespace
-
-std::optional<CardDetection> pick_black_portrait(const cv::Mat &gray, const DetectionConfig &cfg,
-                                                 int threshold, DetectionStats *stats) {
-  // Inverted threshold: dark pixels (the phone) become 255, the white wall
-  // becomes 0. A white-card detector could never do this split.
-  cv::Mat mask;
-  cv::threshold(gray, mask, threshold, 255, cv::THRESH_BINARY_INV);
-
-  const int morph = odd_or_zero(cfg.morph_ksize);
-  if (morph > 0) {
-    const cv::Mat kernel =
-        cv::getStructuringElement(cv::MORPH_RECT, cv::Size(morph, morph));
-    cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
-  }
-
-  std::vector<std::vector<cv::Point>> contours;
-  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-  if (stats) {
-    stats->contours += static_cast<int>(contours.size());
-  }
-
-  const double frame_area = static_cast<double>(gray.cols) * static_cast<double>(gray.rows);
-  double max_area = cfg.max_area;
-  if (cfg.max_area_frac > 0.0) {
-    max_area = std::min(max_area, cfg.max_area_frac * frame_area);
-  }
-
-  std::optional<CardDetection> best;
-  for (const auto &contour : contours) {
-    if (cfg.reject_border &&
-        touches_image_border(contour, gray.cols, gray.rows, cfg.border_margin)) {
-      if (stats) {
-        ++stats->rejected_border;
-      }
-      continue;
-    }
-    const double area = cv::contourArea(contour);
-    std::vector<cv::Point> approx;
-    double aspect = 0.0;
-    if (!looks_like_portrait_phone(contour, cfg, area, max_area, &approx, &aspect, stats)) {
-      continue;
-    }
-    if (best && area <= best->area) {
-      continue;
-    }
-    CardDetection det;
-    det.center = centroid(contour);
-    det.contour = contour;
-    det.approx = std::move(approx);
-    det.area = area;
-    det.aspect = aspect;
-    best = std::move(det);
-  }
-  return best;
-}
-
-std::optional<CardDetection> detect_black_rectangle(const cv::Mat &bgr, const DetectionConfig &cfg,
-                                                    DetectionStats *stats) {
-  if (bgr.empty()) {
-    return std::nullopt;
-  }
-
-  cv::Mat gray;
-  if (bgr.channels() == 1) {
-    gray = bgr;
-  } else {
-    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
-  }
-
-  const int blur = odd_or_zero(cfg.blur_ksize);
-  if (blur > 0) {
-    cv::GaussianBlur(gray, gray, cv::Size(blur, blur), 0.0);
-  }
-
-  auto det = pick_black_portrait(gray, cfg, cfg.threshold, stats);
-  if (det) {
-    return det;
-  }
-  // Aurora 640x400 is dim; a "black" phone can sit around gray 100. Retry looser.
-  if (cfg.loose_threshold > cfg.threshold) {
-    if (stats) {
-      stats->used_loose_pass = true;
-    }
-    det = pick_black_portrait(gray, cfg, cfg.loose_threshold, stats);
-  }
-  return det;
-}
-
-namespace {
-
-CardDetection box_to_detection(const cv::Rect &r, const char *label, double head_frac) {
-  CardDetection det;
+// Turn an OpenCV rectangle into the common PersonDetection the node uses.
+//
+// head_frac chooses the aim pixel along the box height:
+//   0.0 = top edge, 0.5 = middle, 1.0 = bottom.
+// For a YOLO person box we use ~0.45 (torso). For a face we use 0.50
+// (middle of the face). The contour is just the four corners, so the
+// debug overlay can draw a green rectangle.
+PersonDetection box_to_detection(const cv::Rect &r, const char *label, double head_frac) {
+  PersonDetection det;
   det.center.u = r.x + r.width * 0.5;
   det.center.v = r.y + r.height * head_frac;
   det.area = static_cast<double>(r.area());
@@ -211,16 +51,11 @@ struct HumanDetector::PersonNet {
 HumanDetector::HumanDetector(const HumanDetectConfig &cfg) : cfg_(cfg) {
   const auto haar = [&](const char *file) { return cfg_.cascade_dir + "/" + file; };
   const auto lbp = [&](const char *file) { return cfg_.lbp_dir + "/" + file; };
-  // LBP is ~5–10× faster than Haar on this CPU. Haar alt2 is the fallback.
+  // LBP is much faster than Haar on this CPU. Haar alt2 is only the fallback
+  // if the LBP xml files are missing.
   ok_ = face_.load(lbp("lbpcascade_frontalface.xml")) ||
         face_.load(lbp("lbpcascade_frontalface_improved.xml")) ||
         face_.load(haar("haarcascade_frontalface_alt2.xml"));
-  if (cfg_.enable_upper) {
-    have_upper_ = upper_.load(haar("haarcascade_upperbody.xml"));
-  }
-  if (cfg_.enable_full) {
-    have_full_ = full_.load(haar("haarcascade_fullbody.xml"));
-  }
 
   if (!cfg_.person_onnx.empty()) {
     try {
@@ -265,8 +100,6 @@ void HumanDetector::apply_runtime_cfg(const HumanDetectConfig &cfg) {
   cfg_.scale_factor = cfg.scale_factor;
   cfg_.min_neighbors = cfg.min_neighbors;
   cfg_.min_face = cfg.min_face;
-  cfg_.min_upper = cfg.min_upper;
-  cfg_.min_full = cfg.min_full;
   cfg_.person_conf = cfg.person_conf;
   cfg_.person_iou = cfg.person_iou;
   cfg_.enable_face_refine = cfg.enable_face_refine;
@@ -283,14 +116,15 @@ bool HumanDetector::looks_like_person(const cv::Rect &r, int width, int height,
   }
   const double aspect = static_cast<double>(r.width) / static_cast<double>(std::max(1, r.height));
   if (aspect > cfg.max_aspect) {
-    return false;  // curtains / sofa are landscape
+    return false;  // a sofa or a curtain is usually wider than it is tall
   }
   const double frac =
       static_cast<double>(r.area()) / static_cast<double>(std::max(1, width * height));
   if (frac > cfg.max_box_frac || frac < 0.008) {
     return false;
   }
-  // A box glued to the top of the frame is the curtain rod, not a torso.
+  // A box stuck to the top of the frame, covering less than half the
+  // height, is almost always the curtain rail, not a torso.
   if (r.y <= 6 && r.height < static_cast<int>(height * 0.55)) {
     return false;
   }
@@ -327,8 +161,10 @@ std::optional<cv::Rect> HumanDetector::detect_person_box(const cv::Mat &bgr) {
     out = out.clone();
   }
 
-  // Ultralytics YOLOv8 ONNX: [1, 84, N] = (cx,cy,w,h) + 80 COCO scores, in
-  // the stretched 320×320 blob. Class 0 is person.
+  // Ultralytics YOLOv8 ONNX output is [1, 84, N]:
+  //   4 box numbers (centre x, centre y, width, height) plus 80 COCO class
+  //   scores, all in the stretched 320×320 blob. Class 0 is "person".
+  // We reshape to N × 84 so each row is one candidate.
   cv::Mat pred;
   if (out.dims == 3 && out.size[1] == 84) {
     pred = out.reshape(1, out.size[1]);  // 84 × N
@@ -350,8 +186,9 @@ std::optional<cv::Rect> HumanDetector::detect_person_box(const cv::Mat &bgr) {
   }
   for (int i = 0; i < pred.rows; ++i) {
     const float *row = pred.ptr<float>(i);
-    // COCO class 0 = person. Do not require it to beat "chair"/"couch"
-    // on the same anchor — a seated person often loses that argmax.
+    // row[4] is the COCO "person" score. We do not require person to beat
+    // "chair" or "couch" on the same candidate. A seated person often
+    // loses that comparison, and we would miss them.
     const float person_s = row[4];
     if (person_s < conf_th) {
       continue;
@@ -383,8 +220,8 @@ std::optional<cv::Rect> HumanDetector::detect_person_box(const cv::Mat &bgr) {
 
   int best_i = keep[0];
   if (have_last_person_) {
-    // Stay on the same body. Picking the *largest* box walked the arm up
-    // onto the window curtain and stuck there.
+    // Stay on the same body. Picking the largest box each frame walked
+    // the camera onto a window curtain and left it stuck there.
     const cv::Point last_c(last_person_.x + last_person_.width / 2,
                            last_person_.y + last_person_.height / 2);
     const double gate =
@@ -419,8 +256,8 @@ std::optional<cv::Rect> HumanDetector::detect_person_box(const cv::Mat &bgr) {
   return boxes[best_i];
 }
 
-std::optional<CardDetection> HumanDetector::detect_face_in(const cv::Mat &bgr,
-                                                          const cv::Rect &roi) {
+std::optional<PersonDetection> HumanDetector::detect_face_in(const cv::Mat &bgr,
+                                                             const cv::Rect &roi) {
   if (!ok_ || bgr.empty()) {
     return std::nullopt;
   }
@@ -428,7 +265,8 @@ std::optional<CardDetection> HumanDetector::detect_face_in(const cv::Mat &bgr,
   if (region.width <= 0 || region.height <= 0) {
     region = cv::Rect(0, 0, bgr.cols, bgr.rows);
   } else {
-    // Search the upper 65% of the person box, padded, for a frontal face.
+    // Search the upper 65% of the person box, with a little padding, for
+    // a face looking at the camera.
     region.height = std::max(1, static_cast<int>(region.height * 0.65));
     region.x = std::max(0, region.x - 8);
     region.y = std::max(0, region.y - 8);
@@ -470,9 +308,9 @@ std::optional<CardDetection> HumanDetector::detect_face_in(const cv::Mat &bgr,
   return box_to_detection(f, "face", 0.50);
 }
 
-std::optional<CardDetection> HumanDetector::detect(const cv::Mat &bgr) {
+std::optional<PersonDetection> HumanDetector::detect(const cv::Mat &bgr) {
   const auto t0 = std::chrono::steady_clock::now();
-  auto finish = [&](std::optional<CardDetection> out) {
+  auto finish = [&](std::optional<PersonDetection> out) {
     last_detect_ms_ = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
@@ -491,8 +329,9 @@ std::optional<CardDetection> HumanDetector::detect(const cv::Mat &bgr) {
           return finish(face);
         }
       }
-      // Aim at the torso, not the top of the box. head_frac=0.12 walked
-      // pitch onto the curtain and then locked there.
+      // Aim at the torso, not the top of the YOLO box. A small head_frac
+      // (for example 0.12) pointed the camera at the curtain and the
+      // lock-on-centre test then treated that as success.
       const double frac =
           (cfg_.person_head_frac > 0.05 && cfg_.person_head_frac < 0.9) ? cfg_.person_head_frac
                                                                        : 0.45;
@@ -500,58 +339,22 @@ std::optional<CardDetection> HumanDetector::detect(const cv::Mat &bgr) {
     }
   }
 
-  // Close-up facing the camera with no YOLO box (or no ONNX loaded).
+  // Close-up facing the camera with no YOLO box (or no ONNX file loaded).
   if (auto face = detect_face_in(bgr, cv::Rect())) {
     return finish(face);
   }
 
-  if (have_upper_ || have_full_) {
-    cv::Mat gray;
-    if (bgr.channels() == 1) {
-      gray = bgr;
-    } else {
-      cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
-    }
-    const double s = (cfg_.image_scale > 0.2 && cfg_.image_scale < 1.0) ? cfg_.image_scale : 1.0;
-    cv::Mat small;
-    if (s < 0.999) {
-      cv::resize(gray, small, cv::Size(), s, s, cv::INTER_AREA);
-    } else {
-      small = gray;
-    }
-    cv::equalizeHist(small, small);
-    const auto to_full = [s](const cv::Rect &r) {
-      return cv::Rect(static_cast<int>(r.x / s), static_cast<int>(r.y / s),
-                      static_cast<int>(r.width / s), static_cast<int>(r.height / s));
-    };
-    const auto min_on_small = [s](int px) {
-      return cv::Size(std::max(16, static_cast<int>(px * s)),
-                      std::max(16, static_cast<int>(px * s)));
-    };
-    std::vector<cv::Rect> hits;
-    const cv::Size max_win(small.cols * 3 / 4, small.rows * 3 / 4);
-    if (have_upper_) {
-      upper_.detectMultiScale(small, hits, std::max(1.25, cfg_.scale_factor), 3,
-                              cv::CASCADE_SCALE_IMAGE, min_on_small(cfg_.min_upper), max_win);
-      if (!hits.empty()) {
-        return finish(box_to_detection(to_full(largest(hits)), "upper_body", 0.22));
-      }
-    }
-    if (have_full_) {
-      hits.clear();
-      full_.detectMultiScale(small, hits, std::max(1.25, cfg_.scale_factor), 3,
-                             cv::CASCADE_SCALE_IMAGE, min_on_small(cfg_.min_full), max_win);
-      if (!hits.empty()) {
-        return finish(box_to_detection(to_full(largest(hits)), "full_body", 0.18));
-      }
-    }
-  }
   return finish(std::nullopt);
 }
 
+// ---------------------------------------------------------------------------
+// Camera internals
+// ---------------------------------------------------------------------------
+
 CameraIntrinsics fallback_intrinsics() {
-  // peripherals/config/camera_info.yaml — USB cam, not a promise about Aurora
-  // resolution_mode_index=2. Prefer live camera_info whenever it exists.
+  // peripherals/config/camera_info.yaml — USB camera numbers, not a promise
+  // about Aurora resolution_mode_index=2. Prefer live camera_info whenever
+  // it exists.
   return CameraIntrinsics{};
 }
 
@@ -576,10 +379,14 @@ Eigen::Vector3d pixel_to_ray(double u, double v, const CameraIntrinsics &K) {
   const double X = (u - K.cx) / fx;
   const double Y = (v - K.cy) / fy;
   // Z = 1 is a virtual plane in front of the lens, not a measured depth.
-  // Normalizing makes this a unit direction so yaw/pitch do not depend on
-  // that arbitrary scale.
+  // Normalizing makes this a unit direction so yaw and pitch do not
+  // depend on that arbitrary scale.
   return Eigen::Vector3d(X, Y, 1.0).normalized();
 }
+
+// ---------------------------------------------------------------------------
+// Yaw and pitch
+// ---------------------------------------------------------------------------
 
 GazeAngles ray_to_yaw_pitch(const Eigen::Vector3d &ray) {
   GazeAngles a;
@@ -592,14 +399,18 @@ GazeAngles ray_to_yaw_pitch(const Eigen::Vector3d &ray) {
 }
 
 Eigen::Quaterniond gaze_quaternion(double yaw, double pitch) {
-  // Eigen multiplies on the left: (q_yaw * q_pitch) * v applies pitch first,
-  // then yaw. That matches "tilt the lens, then pan". Day 3 only logs this;
-  // hardware gets the two scalar angles, not the quaternion.
+  // Eigen multiplies on the left: (q_yaw * q_pitch) * v applies pitch
+  // first, then yaw. That matches "tilt the lens, then pan". Hardware
+  // gets the two scalar angles, not this quaternion; we only log it.
   const Eigen::Quaterniond q =
       Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()) *
       Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY());
   return q;
 }
+
+// ---------------------------------------------------------------------------
+// Servo pulses
+// ---------------------------------------------------------------------------
 
 float clamp_pulse(float value, float lo, float hi) {
   return std::max(lo, std::min(hi, value));
@@ -608,6 +419,18 @@ float clamp_pulse(float value, float lo, float hi) {
 float clamp_delta(float value, float max_abs) {
   const float cap = std::abs(max_abs);
   return std::max(-cap, std::min(cap, value));
+}
+
+GazePulses angles_to_pulses(const GazeAngles &angles, const PulseMapping &map) {
+  GazePulses out;
+  const double ticks = (map.ticks_per_rad > 1.0) ? map.ticks_per_rad : kTicksPerRadian;
+  out.id19 = clamp_pulse(
+      static_cast<float>(map.pan_rest + map.yaw_sign * angles.yaw * ticks),
+      map.pan_min, map.pan_max);
+  out.id22 = clamp_pulse(
+      static_cast<float>(map.tilt_rest + map.pitch_sign * angles.pitch * ticks),
+      map.tilt_min, map.tilt_max);
+  return out;
 }
 
 GazePulses integrate_gaze(const GazePulses &current, const GazeAngles &err,
@@ -633,25 +456,12 @@ GazePulses integrate_gaze(const GazePulses &current, const GazeAngles &err,
   return out;
 }
 
-GazePulses angles_to_pulses(const GazeAngles &angles, const PulseMapping &map) {
-  GazePulses out;
-  const double ticks = (map.ticks_per_rad > 1.0) ? map.ticks_per_rad : kTicksPerRadian;
-  out.id19 = clamp_pulse(
-      static_cast<float>(map.pan_rest + map.yaw_sign * angles.yaw * ticks),
-      map.pan_min, map.pan_max);
-  out.id22 = clamp_pulse(
-      static_cast<float>(map.tilt_rest + map.pitch_sign * angles.pitch * ticks),
-      map.tilt_min, map.tilt_max);
-  return out;
-}
-
 bool near_optical_axis(const GazeAngles &angles, double yaw_tol, double pitch_tol) {
   return std::abs(angles.yaw) <= yaw_tol && std::abs(angles.pitch) <= pitch_tol;
 }
 
-void draw_debug_overlay(cv::Mat &bgr, const std::optional<CardDetection> &det,
-                        const char *phase, const GazeAngles *angles,
-                        const DetectionStats *stats, const char *note) {
+void draw_debug_overlay(cv::Mat &bgr, const std::optional<PersonDetection> &det,
+                        const char *phase, const GazeAngles *angles, const char *note) {
   if (bgr.empty()) {
     return;
   }
@@ -680,7 +490,7 @@ void draw_debug_overlay(cv::Mat &bgr, const std::optional<CardDetection> &det,
 
   put(std::string("phase: ") + (phase ? phase : "?"), 22);
   if (det) {
-    put(std::string(det->label ? det->label : "target") +
+    put(std::string(det->label ? det->label : "person") +
             "  u=" + std::to_string(static_cast<int>(det->center.u)) +
             " v=" + std::to_string(static_cast<int>(det->center.v)),
         44);
@@ -691,9 +501,6 @@ void draw_debug_overlay(cv::Mat &bgr, const std::optional<CardDetection> &det,
     put("yaw=" + std::to_string(angles->yaw * 180.0 / kPi) + " deg  pitch=" +
             std::to_string(angles->pitch * 180.0 / kPi) + " deg",
         66);
-  }
-  if (stats && stats->rejected_border > 0) {
-    put("ignored " + std::to_string(stats->rejected_border) + " border/wall blob(s)", 88);
   }
   if (note && note[0] != '\0') {
     put(note, 110);

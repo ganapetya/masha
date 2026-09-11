@@ -1,25 +1,35 @@
-// follow_the_cat_node — Week 2 on Masha (Jetson Orin NX, ROS 2 Humble).
+// follow_the_cat_node — find a person and look at them, on Masha
+// (Jetson Orin NX, ROS 2 Humble).
 //
-// Detect a person (YOLOv8n COCO, LBP face inside the box) in the Aurora RGB
-// image, pan/tilt the arm-mounted camera onto the head (servos 19 and 22),
-// then optionally walk 0.05 m/s for at most 3 s.
-// Math lives in follow_the_cat.hpp (no rclcpp). This file is the ROS wiring:
-// best-effort image sub, 10 Hz timer, mutex, services, servo + cmd_vel pubs.
+// Pipeline:
 //
-// Threads: image/camera_info callbacks only store shared_ptrs under mutex_.
-// detect_tick runs OpenCV / YOLO. control_tick runs the phase machine, servos,
-// and walk. watchdog_tick halt_legs if cmd_vel goes quiet while walking.
-// Four mutually exclusive callback groups + MultiThreadedExecutor.
+//   image → YOLO person box → aim pixel (torso)
+//        → ray → yaw / pitch
+//        → small servo step on ids 19 (pan) and 22 (tilt)
+//        → optional 3 s walk at 0.05 m/s after 2 s of centre lock
 //
-// Gaze is incremental (integrate_gaze), not rest+angle: commanding rest+yaw
-// every tick hunts, because a centered card would snap the arm back to rest.
-// White walls are dropped (border-touching blobs); they are not a "card".
+// Math lives in follow_the_cat.hpp (no ROS). This file is the wiring:
+// image subscription, 20 Hz detect and control timers, mutex, services,
+// servo and cmd_vel publishers.
 //
-// Safety: enable_walk defaults false. Do NOT publish a zero Twist to
-// /controller/cmd_vel — move_controller still starts CmdVelGenerator at vx=0,
-// which is a forever gait with no translation ("walks in place"). To stop
-// legs, publish Traveling gait=0 (stop_running) then gait=-2 (DEFAULT_POSE).
-// Only arm ids 19–24.
+// Threads. Four mutually exclusive callback groups on a
+// MultiThreadedExecutor, so they can overlap:
+//   1. image / camera_info callbacks only store shared_ptrs under mutex_.
+//      They do not run OpenCV. A slow detector on this thread would stall DDS.
+//   2. detect_tick runs YOLO / LBP and writes the latest box.
+//   3. control_tick runs the phase machine, servos, and walk.
+//   4. watchdog_tick stops the legs if cmd_vel goes quiet while walking.
+//
+// Gaze is incremental (integrate_gaze), not "rest pose plus the current
+// angle". Sending rest+angle every tick makes the arm oscillate: a person
+// at the image centre produces yaw = 0, the arm returns to rest, then the
+// person is off-centre again.
+//
+// Safety. enable_walk defaults to false so first bring-up is gaze only.
+// Do not publish a Twist with linear.x = 0 to /controller/cmd_vel — the
+// gait generator still starts and the robot steps in place. To stop the
+// legs, publish Traveling gait 0 (stop) then gait -2 (stand). Only arm
+// ids 19–24 are commanded.
 
 #include <algorithm>
 #include <chrono>
@@ -28,7 +38,6 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
-#include <stdexcept>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -37,9 +46,9 @@
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <cv_bridge/cv_bridge.h>
-#include <opencv2/imgproc.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <kinematics_msgs/msg/traveling.hpp>
+#include <opencv2/imgproc.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -54,11 +63,23 @@ using namespace std::chrono_literals;
 namespace proud_up {
 namespace {
 
-// IDLE: rest pose, wait for a blob. Never touch cmd_vel here.
-// TRACKING: 10 Hz pan/tilt. Walk is gated on ~2 s of continuous lock near center.
-// MOVING: linear.x = walk_speed on /controller/cmd_vel for at most walk_seconds.
-// DONE: hold gaze; halt legs via Traveling, not a zero Twist.
-// LOST: blob gone; next tick returns to IDLE (aborts a walk if one was running).
+// Phase machine (one control tick at a time):
+//
+//   IDLE ----confirm_frames----> TRACKING --2 s centred + enable_walk--> MOVING
+//     ^                            | miss for lost_timeout                  |
+//     |                            v                                        |
+//     +-------------------------- LOST <----- miss / coast / stale ---------+
+//                                                                           |
+//                                                    walk_seconds elapsed   v
+//                                                                         DONE
+//
+// IDLE:      rest pose, wait for a person. Never publish cmd_vel.
+// TRACKING:  pan / tilt onto the person. Walk is only *allowed* here, not started
+//            until the person has stayed near the image centre for lock_seconds.
+// MOVING:    publish linear.x = walk_speed for at most walk_seconds. Still aim.
+// DONE:      hold gaze. Legs are already stopped. Stays here until ~/start.
+// LOST:      person gone. Next tick returns to IDLE. Aborts a walk if one was
+//            running. Keeps the last pan / tilt (does not return to rest).
 enum class Phase { Idle, Tracking, Moving, Done, Lost };
 
 const char *phase_name(Phase phase) {
@@ -77,11 +98,11 @@ const char *phase_name(Phase phase) {
   return "unknown";
 }
 
-// Latest blob as seen by the timer, plus the ROS stamp of that image.
-// Guarded by the node mutex together with the image / camera_info pointers.
-// The image callback does NOT write this — it only stores the Image pointer
-// (cheap shared_ptr copy). Detection runs on the timer thread after the lock
-// is released, then the result is written back under the lock.
+// Latest person as seen by the control timer, plus the ROS stamp of that
+// image. Guarded by the node mutex together with the image / camera_info
+// pointers. The image callback does not write this — it only stores the
+// Image pointer (a cheap shared_ptr copy). Detection runs on the timer
+// thread after the lock is released, then the result is written back.
 struct TargetState {
   double u{0.0};
   double v{0.0};
@@ -108,7 +129,6 @@ class FollowTheCatNode : public rclcpp::Node {
     image_qos_reliable_ = declare_parameter<bool>("image_qos_reliable", false);
     enable_walk_ = declare_parameter<bool>("enable_walk", false);
     dry_run_ = declare_parameter<bool>("dry_run", false);
-    target_mode_ = declare_parameter<std::string>("target", "human");
 
     human_cfg_.cascade_dir = declare_parameter<std::string>(
         "cascade_dir", "/usr/share/opencv4/haarcascades");
@@ -118,10 +138,6 @@ class FollowTheCatNode : public rclcpp::Node {
     human_cfg_.scale_factor = declare_parameter<double>("human_scale_factor", 1.2);
     human_cfg_.min_neighbors = declare_parameter<int>("human_min_neighbors", 3);
     human_cfg_.min_face = declare_parameter<int>("min_face", 24);
-    human_cfg_.min_upper = declare_parameter<int>("min_upper", 50);
-    human_cfg_.min_full = declare_parameter<int>("min_full", 60);
-    human_cfg_.enable_upper = declare_parameter<bool>("enable_upper_body", false);
-    human_cfg_.enable_full = declare_parameter<bool>("enable_full_body", false);
     human_cfg_.person_conf = declare_parameter<double>("person_conf", 0.45);
     human_cfg_.person_iou = declare_parameter<double>("person_iou", 0.45);
     human_cfg_.person_imgsz = declare_parameter<int>("person_imgsz", 320);
@@ -148,32 +164,17 @@ class FollowTheCatNode : public rclcpp::Node {
       }
     }
     human_ = std::make_unique<HumanDetector>(human_cfg_);
-    if (target_mode_ == "human" && !human_->ok()) {
+    if (!human_->ok()) {
       RCLCPP_ERROR(get_logger(),
                    "no person detector (cascade %s / %s, onnx %s) — gaze will miss",
                    human_cfg_.lbp_dir.c_str(), human_cfg_.cascade_dir.c_str(),
                    human_cfg_.person_onnx.c_str());
-    } else if (target_mode_ == "human") {
+    } else {
       RCLCPP_INFO(get_logger(), "person detector onnx=%s cuda=%s face=%s",
                   human_->person_ok() ? human_cfg_.person_onnx.c_str() : "off",
                   human_->using_cuda() ? "yes" : "no",
                   human_cfg_.cascade_dir.empty() ? "off" : "lbp");
     }
-
-    detect_cfg_.threshold = declare_parameter<int>("threshold", 90);
-    detect_cfg_.loose_threshold = declare_parameter<int>("loose_threshold", 130);
-    detect_cfg_.min_area = declare_parameter<double>("min_area", 800.0);
-    detect_cfg_.max_area = declare_parameter<double>("max_area", 80000.0);
-    detect_cfg_.max_area_frac = declare_parameter<double>("max_area_frac", 0.22);
-    detect_cfg_.min_aspect = declare_parameter<double>("min_aspect", 0.28);
-    detect_cfg_.max_aspect = declare_parameter<double>("max_aspect", 0.85);
-    detect_cfg_.min_solidity = declare_parameter<double>("min_solidity", 0.55);
-    detect_cfg_.blur_ksize = declare_parameter<int>("blur_ksize", 5);
-    detect_cfg_.morph_ksize = declare_parameter<int>("morph_ksize", 5);
-    detect_cfg_.border_margin = declare_parameter<int>("border_margin", 4);
-    detect_cfg_.reject_border = declare_parameter<bool>("reject_border", true);
-    detect_cfg_.require_quad = declare_parameter<bool>("require_quad", true);
-    detect_cfg_.require_portrait = declare_parameter<bool>("require_portrait", true);
 
     pulse_map_.yaw_sign = declare_parameter<double>("yaw_sign", -1.0);
     pulse_map_.pitch_sign = declare_parameter<double>("pitch_sign", 1.0);
@@ -218,7 +219,7 @@ class FollowTheCatNode : public rclcpp::Node {
 
     // Mutually exclusive groups so image store, YOLO, control, and the walk
     // watchdog can overlap on a MultiThreadedExecutor. The default group is
-    // mutually exclusive for the *whole node*, which would serialize them.
+    // mutually exclusive for the *whole node*, which would serialise them.
     image_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     detect_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     control_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -284,25 +285,23 @@ class FollowTheCatNode : public rclcpp::Node {
     phase_started_at_ = started_at_;
 
     RCLCPP_INFO(get_logger(),
-                "follow_the_cat target=%s image=%s info=%s servo=%s cmd_vel=%s "
+                "follow_the_cat image=%s info=%s servo=%s cmd_vel=%s "
                 "enable_walk=%s dry_run=%s yaw_sign=%.1f pitch_sign=%.1f "
                 "(tilt is servo 22, not 23)",
-                target_mode_.c_str(), image_topic_.c_str(), camera_info_topic_.c_str(),
-                servo_topic_.c_str(), cmd_vel_topic_.c_str(),
-                enable_walk_ ? "true" : "false", dry_run_ ? "true" : "false",
-                pulse_map_.yaw_sign, pulse_map_.pitch_sign);
+                image_topic_.c_str(), camera_info_topic_.c_str(), servo_topic_.c_str(),
+                cmd_vel_topic_.c_str(), enable_walk_ ? "true" : "false",
+                dry_run_ ? "true" : "false", pulse_map_.yaw_sign, pulse_map_.pitch_sign);
     if (!enable_walk_) {
       RCLCPP_INFO(get_logger(),
                   "walk is OFF (enable_walk:=false). First bring-up is gaze-only. "
-                  "Flip yaw_sign/pitch_sign on hardware before enabling walk.");
+                  "Confirm pan/tilt signs on hardware before enabling walk.");
     }
   }
 
   ~FollowTheCatNode() override { emergency_stop(); }
 
   // Called from main after spin, and from the destructor / SIGINT path.
-  // Always publishes a zero Twist so the hexapod does not keep the last
-  // 0.05 m/s command if the node dies mid-walk.
+  // Stops the legs with Traveling (gait 0 then -2), not a zero Twist.
   void emergency_stop() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -317,8 +316,8 @@ class FollowTheCatNode : public rclcpp::Node {
  private:
   rclcpp::Time now() { return get_clock()->now(); }
 
-  // Callback thread: store the shared_ptr (refcount++, no pixel copy) and
-  // return. Do not call OpenCV here — a slow findContours would stall DDS.
+  // Store the shared_ptr (refcount++, no pixel copy) and return. Do not
+  // call OpenCV here — a slow detector would stall DDS.
   void on_image(sensor_msgs::msg::Image::ConstSharedPtr msg) {
     std::lock_guard<std::mutex> lock(mutex_);
     latest_image_ = std::move(msg);
@@ -329,87 +328,26 @@ class FollowTheCatNode : public rclcpp::Node {
     latest_info_ = std::move(msg);
   }
 
-  void on_start(std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
-    halt_legs();
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stopping_ = false;
-      target_ = TargetState{};
-      lock_active_ = false;
-      rest_sent_ = false;
-      ema_ready_ = false;
-      coast_det_.reset();
-      latest_det_.reset();
-      last_seen_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-      last_fresh_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-      last_walk_cmd_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-      seen_streak_ = 0;
-      reset_track_pending_ = true;
-      pan_i_ = 0.0;
-      gaze_id19_ = rest_.id19;
-      gaze_id22_ = rest_.id22;
-      set_phase_locked(Phase::Idle);
-    }
-    send_rest_pose(rest_.duration_s);
-    response->success = true;
-    response->message = "idle";
-    RCLCPP_INFO(get_logger(), "start: reset to idle (rest pose, legs halted)");
-  }
-
-  void on_stop(std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stopping_ = true;
-      lock_active_ = false;
-      coast_det_.reset();
-      latest_det_.reset();
-      last_walk_cmd_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-      set_phase_locked(Phase::Done);
-    }
-    halt_legs();
-    send_rest_pose(rest_.duration_s);
-    response->success = true;
-    response->message = "done";
-    RCLCPP_INFO(get_logger(), "stop: rest pose, legs halted, phase=done");
-  }
-
-  void set_phase_locked(Phase next) {
-    if (phase_ == next) {
-      return;
-    }
-    RCLCPP_INFO(get_logger(), "follow_the_cat: %s -> %s", phase_name(phase_), phase_name(next));
-    phase_ = next;
-    phase_started_at_ = now();
-    if (next == Phase::Tracking) {
-      lock_active_ = false;
-    }
-    if (next == Phase::Moving) {
-      walk_started_at_ = now();
-      last_walk_cmd_at_ = walk_started_at_;
-    }
-  }
-
+  // Vision half of the loop. Copy the latest image pointer, drop the lock,
+  // run YOLO, then write the box and yaw/pitch back under the lock.
+  // Control never waits on this; a slow detect only makes the box stale.
   void detect_tick() {
     sensor_msgs::msg::Image::ConstSharedPtr image;
     sensor_msgs::msg::CameraInfo::ConstSharedPtr info;
     bool stopping;
-    DetectionConfig detect_cfg;
     HumanDetectConfig human_cfg;
-    std::string target_mode;
     bool reset_track = false;
     double lost_timeout;
     double aim_u;
     double aim_v;
     Phase overlay_phase = Phase::Idle;
     {
-      // Copy pointers / small values, then drop the lock BEFORE OpenCV.
+      // Copy pointers and small values, then drop the lock BEFORE OpenCV.
       std::lock_guard<std::mutex> lock(mutex_);
       image = latest_image_;
       info = latest_info_;
       stopping = stopping_;
-      detect_cfg = detect_cfg_;
       human_cfg = human_cfg_;
-      target_mode = target_mode_;
       reset_track = reset_track_pending_;
       reset_track_pending_ = false;
       lost_timeout = lost_timeout_seconds_;
@@ -452,8 +390,7 @@ class FollowTheCatNode : public rclcpp::Node {
                   K.width, K.height, K.fx, K.fy);
     }
 
-    std::optional<CardDetection> det;
-    DetectionStats det_stats;
+    std::optional<PersonDetection> det;
     GazeAngles angles;
     cv::Mat annotated;
     rclcpp::Time image_stamp(0, 0, RCL_ROS_TIME);
@@ -469,19 +406,16 @@ class FollowTheCatNode : public rclcpp::Node {
       }
       if (cv_ptr && !cv_ptr->image.empty()) {
         annotated = cv_ptr->image;
-        if (target_mode == "human") {
-          det = human_->detect(annotated);
-          const double ms = human_->last_detect_ms();
-          if (ms > 80.0) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                                 "person detect took %.0f ms — control loop is free", ms);
-          }
-        } else {
-          det = detect_black_rectangle(annotated, detect_cfg, &det_stats);
+        det = human_->detect(annotated);
+        const double ms = human_->last_detect_ms();
+        if (ms > 80.0) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                               "person detect took %.0f ms — control loop is free", ms);
         }
         {
-          // Hold the last box for lost_timeout_seconds so a single YOLO miss
-          // does not snap idle. Coast is gaze-only; walk must not use it.
+          // If YOLO misses for a moment, keep the last box and mark it
+          // "coast" so the camera can hold still. Walking must not use
+          // that remembered box: the person may already have moved.
           std::lock_guard<std::mutex> lock(mutex_);
           if (det) {
             coast_det_ = det;
@@ -521,6 +455,9 @@ class FollowTheCatNode : public rclcpp::Node {
           }
           if (det) {
             det->center = center;
+            // Aim at the image centre (the magenta cross), not the
+            // calibration principal point. aim_u / aim_v are small
+            // pixel offsets if the cross is not where you want it.
             CameraIntrinsics aim = K;
             aim.cx = 0.5 * static_cast<double>(annotated.cols) + aim_u;
             aim.cy = 0.5 * static_cast<double>(annotated.rows) + aim_v;
@@ -564,15 +501,17 @@ class FollowTheCatNode : public rclcpp::Node {
         std::snprintf(err_note, sizeof(err_note), "stand in front of Masha, face the camera");
       }
       draw_debug_overlay(annotated, det, phase_name(overlay_phase), det ? &angles : nullptr,
-                         &det_stats, err_note);
+                         err_note);
       publish_debug_image(annotated, image);
     }
   }
 
+  // Behaviour half of the loop. Copy the latest box, run one phase tick
+  // under the lock, then publish servos / cmd_vel *after* the lock drops.
   void control_tick() {
     maybe_mark_ready();
 
-    std::optional<CardDetection> det;
+    std::optional<PersonDetection> det;
     GazeAngles angles;
     PulseMapping pulse_map;
     bool enable_walk;
@@ -619,8 +558,8 @@ class FollowTheCatNode : public rclcpp::Node {
                                publish_twist, halt_after_unlock);
             break;
           case Phase::Lost:
-            // Hold the last pan/tilt. Do not snap back to rest — that yank is
-            // what "looks around randomly" felt like when YOLO blinked.
+            // Keep the last pan and tilt. Moving the arm back to rest as
+            // soon as YOLO misses one frame looks like random looking-around.
             lock_active_ = false;
             seen_streak_ = 0;
             pan_i_ = 0.0;
@@ -650,8 +589,8 @@ class FollowTheCatNode : public rclcpp::Node {
         servo_pub_->publish(make_arm_command(arm));
       }
     }
-    // Never publish a zero Twist. vx=0 still starts CmdVelGenerator forever
-    // (in-place stepping). Only a real forward command is allowed here.
+    // Never publish a zero Twist. vx = 0 still starts CmdVelGenerator
+    // forever (in-place stepping). Only a real forward command is allowed.
     if (publish_twist && twist.linear.x != 0.0) {
       if (dry_run) {
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
@@ -669,6 +608,176 @@ class FollowTheCatNode : public rclcpp::Node {
     }
   }
 
+  void set_phase_locked(Phase next) {
+    if (phase_ == next) {
+      return;
+    }
+    RCLCPP_INFO(get_logger(), "follow_the_cat: %s -> %s", phase_name(phase_), phase_name(next));
+    phase_ = next;
+    phase_started_at_ = now();
+    if (next == Phase::Tracking) {
+      lock_active_ = false;
+    }
+    if (next == Phase::Moving) {
+      walk_started_at_ = now();
+      last_walk_cmd_at_ = walk_started_at_;
+    }
+  }
+
+  // Rest pose, wait for a person, never walk.
+  //
+  // First tick: send the rest pose once and seed the current pan / tilt
+  // from rest. After that, do nothing until we have seen a person for
+  // confirm_frames consecutive ticks (default 3). A single false
+  // detection would otherwise send a large, sudden arm motion.
+  //
+  // A miss zeros the streak; we stay in Idle. Next phase: Tracking.
+  void tick_idle_locked(const std::optional<PersonDetection> &det, const GazeAngles &angles,
+                        const PulseMapping &pulse_map, ArmPulses &arm, double &servo_dt,
+                        bool &publish_servos) {
+    if (!rest_sent_) {
+      arm = rest_;
+      servo_dt = rest_.duration_s;
+      arm.duration_s = servo_dt;
+      publish_servos = true;
+      rest_sent_ = true;
+      gaze_id19_ = rest_.id19;
+      gaze_id22_ = rest_.id22;
+    }
+    if (!det) {
+      seen_streak_ = 0;
+      return;
+    }
+    ++seen_streak_;
+    if (seen_streak_ >= confirm_frames_) {
+      publish_servos = apply_gaze(arm, servo_dt, angles, pulse_map);
+      set_phase_locked(Phase::Tracking);
+    }
+  }
+
+  // Keep the person on the magenta cross (image centre).
+  //
+  // Miss: hold the last pan / tilt. After lost_timeout_seconds (default 6 s)
+  // with no detection, go to Lost. A coasted box still counts as "seen" for
+  // the phase, so a one-frame YOLO blink does not drop us out — but we do
+  // not drive the servos from a remembered box.
+  //
+  // Hit: apply_gaze on a fresh box. If the person stays near the optical
+  // axis for lock_seconds (default 2 s) *continuously* and enable_walk is
+  // true, go to Moving. Leaving the centre restarts the 2 s timer.
+  //
+  // This function never publishes cmd_vel. enable_walk only decides whether
+  // Tracking may *enter* Moving.
+  void tick_tracking_locked(const std::optional<PersonDetection> &det, const GazeAngles &angles,
+                            const PulseMapping &pulse_map, bool enable_walk, ArmPulses &arm,
+                            double &servo_dt, bool &publish_servos) {
+    if (!det) {
+      seen_streak_ = 0;
+      if (lost_for_too_long()) {
+        set_phase_locked(Phase::Lost);
+      }
+      return;
+    }
+    seen_streak_ = confirm_frames_;
+    const bool coasting = is_coasted_detection(*det);
+    if (!coasting) {
+      publish_servos = apply_gaze(arm, servo_dt, angles, pulse_map);
+    }
+
+    const bool centered = near_optical_axis(angles, center_yaw_tol_, center_pitch_tol_);
+    if (centered) {
+      if (!lock_active_) {
+        lock_active_ = true;
+        lock_started_at_ = now();
+      }
+      const double held = (now() - lock_started_at_).seconds();
+      if (enable_walk && held >= lock_seconds_ && std::abs(angles.yaw) <= center_yaw_tol_) {
+        // Walk is a one-shot ~15 cm step, not a chase. enable_walk
+        // defaults to false so we can verify pan / tilt signs first.
+        set_phase_locked(Phase::Moving);
+      }
+    } else {
+      lock_active_ = false;
+    }
+  }
+
+  // One short forward walk, still aiming.
+  //
+  // Abort immediately (Lost, halt legs) if the box is missing, coasted, or
+  // older than walk_watchdog_seconds (default 0.3 s). Walking on a frozen
+  // YOLO box is unsafe — the person may have stepped aside.
+  //
+  // Otherwise keep applying gaze and publish linear.x = walk_speed
+  // (0.05 m/s). After walk_seconds (default 3 s) halt the legs and go to
+  // Done. Done does not walk again until ~/start.
+  void tick_moving_locked(const std::optional<PersonDetection> &det, const GazeAngles &angles,
+                          const PulseMapping &pulse_map, ArmPulses &arm, double &servo_dt,
+                          bool &publish_servos, geometry_msgs::msg::Twist &twist,
+                          bool &publish_twist, bool &halt_after_unlock) {
+    const bool stale_box =
+        last_fresh_at_.nanoseconds() == 0 ||
+        (now() - last_fresh_at_).seconds() > walk_watchdog_seconds_;
+    if (!walk_detection_valid(det) || stale_box) {
+      halt_after_unlock = true;
+      set_phase_locked(Phase::Lost);
+      return;
+    }
+    publish_servos = apply_gaze(arm, servo_dt, angles, pulse_map);
+
+    if ((now() - walk_started_at_).seconds() >= walk_seconds_) {
+      halt_after_unlock = true;
+      set_phase_locked(Phase::Done);
+      RCLCPP_INFO(get_logger(), "walk complete (%.1f s at %.3f m/s); holding", walk_seconds_,
+                  walk_speed_);
+      return;
+    }
+    // move_controller clamps linear.x to ±0.12 m/s; 0.05 is legal.
+    twist.linear.x = walk_speed_;
+    publish_twist = true;
+    walking_active_ = true;
+  }
+
+  // Convert the current optical error into a small servo step.
+  //
+  // Returns true only if a pulse actually moved by at least 1.5 ticks.
+  // Re-sending the same 80 ms servo packet at 20 Hz makes the arm twitch
+  // even when the person is already inside the deadband.
+  bool apply_gaze(ArmPulses &arm, double &servo_dt, const GazeAngles &angles,
+                  const PulseMapping &pulse_map) {
+    const double dt = 0.05;
+    if (std::abs(angles.yaw) > deadband_rad_) {
+      pan_i_ += angles.yaw * dt;
+    } else {
+      pan_i_ *= 0.85;
+    }
+    pan_i_ = std::max(-0.5, std::min(0.5, pan_i_));
+    GazeAngles err = angles;
+    err.yaw += gaze_ki_ * pan_i_;
+
+    const GazePulses current{gaze_id19_, gaze_id22_};
+    const GazePulses next = integrate_gaze(current, err, pulse_map, gaze_gain_,
+                                           max_step_pulses_, deadband_rad_);
+    const bool moved = std::abs(next.id19 - current.id19) >= 1.5f ||
+                       std::abs(next.id22 - current.id22) >= 1.5f;
+    gaze_id19_ = next.id19;
+    gaze_id22_ = next.id22;
+    arm = rest_;
+    arm.id19 = next.id19;  // pan, joint 1. Clamped 200–800 inside integrate_gaze.
+    arm.id22 = next.id22;  // tilt, wrist pitch / camera parent. NOT id 23.
+    servo_dt = servo_duration_;
+    arm.duration_s = servo_dt;
+    return moved;
+  }
+
+  bool lost_for_too_long() {
+    if (last_seen_at_.nanoseconds() == 0) {
+      return true;
+    }
+    return (now() - last_seen_at_).seconds() > lost_timeout_seconds_;
+  }
+
+  // If cmd_vel goes quiet while walking (detect or control stalled), stop
+  // the legs. Same Traveling halt as a normal abort — never a zero Twist.
   void watchdog_tick() {
     bool should_halt = false;
     double timeout = 0.3;
@@ -695,6 +804,38 @@ class FollowTheCatNode : public rclcpp::Node {
                   "walk watchdog: no cmd_vel for %.2f s; halt_legs (Traveling, not zero Twist)",
                   timeout);
     }
+  }
+
+  void send_rest_pose(double duration_s) {
+    ArmPulses pose = rest_;
+    pose.duration_s = duration_s;
+    if (dry_run_) {
+      RCLCPP_INFO(get_logger(), "dry_run rest pose id19=%.0f id22=%.0f (not sent)", pose.id19,
+                  pose.id22);
+      return;
+    }
+    servo_pub_->publish(make_arm_command(pose));
+  }
+
+  // Stop the gait without sending Twist{}. gait 0 = stop_running; gait -2
+  // = DEFAULT_POSE (stand). A zero cmd_vel would walk in place forever.
+  void halt_legs() {
+    walking_active_ = false;
+    if (dry_run_) {
+      RCLCPP_INFO(get_logger(), "dry_run halt_legs (Traveling gait 0 then -2, not sent)");
+      return;
+    }
+    kinematics_msgs::msg::Traveling stop;
+    stop.gait = 0;
+    stop.time = 1.0f;
+    stop.interrupt = true;
+    traveling_pub_->publish(stop);
+
+    kinematics_msgs::msg::Traveling stand;
+    stand.gait = -2;
+    stand.time = 1.0f;
+    stand.interrupt = true;
+    traveling_pub_->publish(stand);
   }
 
   void maybe_mark_ready() {
@@ -728,160 +869,48 @@ class FollowTheCatNode : public rclcpp::Node {
     }
   }
 
-  void tick_idle_locked(const std::optional<CardDetection> &det, const GazeAngles &angles,
-                        const PulseMapping &pulse_map, ArmPulses &arm, double &servo_dt,
-                        bool &publish_servos) {
-    if (!rest_sent_) {
-      arm = rest_;
-      servo_dt = rest_.duration_s;
-      arm.duration_s = servo_dt;
-      publish_servos = true;
-      rest_sent_ = true;
+  void on_start(std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    halt_legs();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = false;
+      target_ = TargetState{};
+      lock_active_ = false;
+      rest_sent_ = false;
+      ema_ready_ = false;
+      coast_det_.reset();
+      latest_det_.reset();
+      last_seen_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      last_fresh_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      last_walk_cmd_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      seen_streak_ = 0;
+      reset_track_pending_ = true;
+      pan_i_ = 0.0;
       gaze_id19_ = rest_.id19;
       gaze_id22_ = rest_.id22;
+      set_phase_locked(Phase::Idle);
     }
-    if (!det) {
-      seen_streak_ = 0;
-      return;
-    }
-    ++seen_streak_;
-    // Wait a few consistent frames before the first servo step so a single
-    // wall-glint cannot yank the arm.
-    if (seen_streak_ >= confirm_frames_) {
-      publish_servos = apply_gaze(arm, servo_dt, angles, pulse_map);
-      set_phase_locked(Phase::Tracking);
-    }
+    send_rest_pose(rest_.duration_s);
+    response->success = true;
+    response->message = "idle";
+    RCLCPP_INFO(get_logger(), "start: reset to idle (rest pose, legs halted)");
   }
 
-  void tick_tracking_locked(const std::optional<CardDetection> &det, const GazeAngles &angles,
-                            const PulseMapping &pulse_map, bool enable_walk, ArmPulses &arm,
-                            double &servo_dt, bool &publish_servos) {
-    if (!det) {
-      seen_streak_ = 0;
-      if (lost_for_too_long()) {
-        set_phase_locked(Phase::Lost);
-      }
-      return;
-    }
-    seen_streak_ = confirm_frames_;
-    const bool coasting = is_coasted_detection(*det);
-    if (!coasting) {
-      publish_servos = apply_gaze(arm, servo_dt, angles, pulse_map);
-    }
-
-    const bool centered = near_optical_axis(angles, center_yaw_tol_, center_pitch_tol_);
-    if (centered) {
-      if (!lock_active_) {
-        lock_active_ = true;
-        lock_started_at_ = now();
-      }
-      const double held = (now() - lock_started_at_).seconds();
-      if (enable_walk && held >= lock_seconds_ && std::abs(angles.yaw) <= center_yaw_tol_) {
-        // Walk is a one-shot 15 cm-class step, not a chase. enable_walk defaults
-        // false so Day 5 can verify pan/tilt signs with the card held still.
-        set_phase_locked(Phase::Moving);
-      }
-    } else {
+  void on_stop(std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
       lock_active_ = false;
-    }
-  }
-
-  void tick_moving_locked(const std::optional<CardDetection> &det, const GazeAngles &angles,
-                          const PulseMapping &pulse_map, ArmPulses &arm, double &servo_dt,
-                          bool &publish_servos, geometry_msgs::msg::Twist &twist,
-                          bool &publish_twist, bool &halt_after_unlock) {
-    const bool stale_box =
-        last_fresh_at_.nanoseconds() == 0 ||
-        (now() - last_fresh_at_).seconds() > walk_watchdog_seconds_;
-    if (!walk_detection_valid(det) || stale_box) {
-      // Abort immediately on miss, coast, or a stale box (detect_tick stuck).
-      // Coast is gaze-only; walk requires a fresh detection.
-      halt_after_unlock = true;
-      set_phase_locked(Phase::Lost);
-      return;
-    }
-    publish_servos = apply_gaze(arm, servo_dt, angles, pulse_map);
-
-    if ((now() - walk_started_at_).seconds() >= walk_seconds_) {
-      halt_after_unlock = true;
+      coast_det_.reset();
+      latest_det_.reset();
+      last_walk_cmd_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
       set_phase_locked(Phase::Done);
-      RCLCPP_INFO(get_logger(), "walk complete (%.1f s at %.3f m/s); holding", walk_seconds_,
-                  walk_speed_);
-      return;
     }
-    // move_controller clamps linear.x to ±0.12 m/s; 0.05 is legal.
-    twist.linear.x = walk_speed_;
-    publish_twist = true;
-    walking_active_ = true;
-  }
-
-  // Returns true if the commanded pulses actually moved. Re-sending the same
-  // 80 ms servo packet at 20 Hz makes the arm twitch even when the error is
-  // inside the deadband.
-  bool apply_gaze(ArmPulses &arm, double &servo_dt, const GazeAngles &angles,
-                  const PulseMapping &pulse_map) {
-    const double dt = 0.05;
-    if (std::abs(angles.yaw) > deadband_rad_) {
-      pan_i_ += angles.yaw * dt;
-    } else {
-      pan_i_ *= 0.85;
-    }
-    pan_i_ = std::max(-0.5, std::min(0.5, pan_i_));
-    GazeAngles err = angles;
-    err.yaw += gaze_ki_ * pan_i_;
-
-    const GazePulses current{gaze_id19_, gaze_id22_};
-    const GazePulses next = integrate_gaze(current, err, pulse_map, gaze_gain_,
-                                           max_step_pulses_, deadband_rad_);
-    const bool moved = std::abs(next.id19 - current.id19) >= 1.5f ||
-                       std::abs(next.id22 - current.id22) >= 1.5f;
-    gaze_id19_ = next.id19;
-    gaze_id22_ = next.id22;
-    arm = rest_;
-    arm.id19 = next.id19;  // pan, joint1. Clamped 200–800 inside integrate_gaze.
-    arm.id22 = next.id22;  // tilt, wrist pitch / camera parent. NOT id 23.
-    servo_dt = servo_duration_;
-    arm.duration_s = servo_dt;
-    return moved;
-  }
-
-  bool lost_for_too_long() {
-    if (last_seen_at_.nanoseconds() == 0) {
-      return true;
-    }
-    return (now() - last_seen_at_).seconds() > lost_timeout_seconds_;
-  }
-
-  void send_rest_pose(double duration_s) {
-    ArmPulses pose = rest_;
-    pose.duration_s = duration_s;
-    if (dry_run_) {
-      RCLCPP_INFO(get_logger(), "dry_run rest pose id19=%.0f id22=%.0f (not sent)", pose.id19,
-                  pose.id22);
-      return;
-    }
-    servo_pub_->publish(make_arm_command(pose));
-  }
-
-  // Stop the gait without sending Twist{}. gait 0 = stop_running; gait -2 =
-  // DEFAULT_POSE (stand). A zero cmd_vel would walk in place forever.
-  void halt_legs() {
-    walking_active_ = false;
-    if (dry_run_) {
-      RCLCPP_INFO(get_logger(), "dry_run halt_legs (Traveling gait 0 then -2, not sent)");
-      return;
-    }
-    kinematics_msgs::msg::Traveling stop;
-    stop.gait = 0;
-    stop.time = 1.0f;
-    stop.interrupt = true;
-    traveling_pub_->publish(stop);
-
-    kinematics_msgs::msg::Traveling stand;
-    stand.gait = -2;
-    stand.time = 1.0f;
-    stand.interrupt = true;
-    traveling_pub_->publish(stand);
+    halt_legs();
+    send_rest_pose(rest_.duration_s);
+    response->success = true;
+    response->message = "done";
+    RCLCPP_INFO(get_logger(), "stop: rest pose, legs halted, phase=done");
   }
 
   rcl_interfaces::msg::SetParametersResult on_set_parameters(
@@ -897,9 +926,8 @@ class FollowTheCatNode : public rclcpp::Node {
     for (const auto &p : params) {
       const std::string &name = p.get_name();
       if (name == "person_onnx" || name == "cascade_dir" || name == "lbp_dir" ||
-          name == "dnn_cuda" || name == "person_imgsz" || name == "enable_upper_body" ||
-          name == "enable_full_body" || name == "image_topic" || name == "camera_info_topic" ||
-          name == "servo_topic" || name == "cmd_vel_topic") {
+          name == "dnn_cuda" || name == "person_imgsz" || name == "image_topic" ||
+          name == "camera_info_topic" || name == "servo_topic" || name == "cmd_vel_topic") {
         reject(name + " cannot be changed at runtime");
         return result;
       }
@@ -955,8 +983,6 @@ class FollowTheCatNode : public rclcpp::Node {
         enable_walk_ = p.as_bool();
       } else if (name == "dry_run") {
         dry_run_ = p.as_bool();
-      } else if (name == "target") {
-        target_mode_ = p.as_string();
       } else if (name == "yaw_sign") {
         pulse_map_.yaw_sign = p.as_double();
       } else if (name == "pitch_sign") {
@@ -1005,34 +1031,6 @@ class FollowTheCatNode : public rclcpp::Node {
         confirm_frames_ = static_cast<int>(p.as_int());
       } else if (name == "debug_max_width") {
         debug_max_width_ = static_cast<int>(p.as_int());
-      } else if (name == "threshold") {
-        detect_cfg_.threshold = static_cast<int>(p.as_int());
-      } else if (name == "loose_threshold") {
-        detect_cfg_.loose_threshold = static_cast<int>(p.as_int());
-      } else if (name == "min_area") {
-        detect_cfg_.min_area = p.as_double();
-      } else if (name == "max_area") {
-        detect_cfg_.max_area = p.as_double();
-      } else if (name == "max_area_frac") {
-        detect_cfg_.max_area_frac = p.as_double();
-      } else if (name == "min_aspect") {
-        detect_cfg_.min_aspect = p.as_double();
-      } else if (name == "max_aspect") {
-        detect_cfg_.max_aspect = p.as_double();
-      } else if (name == "min_solidity") {
-        detect_cfg_.min_solidity = p.as_double();
-      } else if (name == "blur_ksize") {
-        detect_cfg_.blur_ksize = static_cast<int>(p.as_int());
-      } else if (name == "morph_ksize") {
-        detect_cfg_.morph_ksize = static_cast<int>(p.as_int());
-      } else if (name == "border_margin") {
-        detect_cfg_.border_margin = static_cast<int>(p.as_int());
-      } else if (name == "reject_border") {
-        detect_cfg_.reject_border = p.as_bool();
-      } else if (name == "require_quad") {
-        detect_cfg_.require_quad = p.as_bool();
-      } else if (name == "require_portrait") {
-        detect_cfg_.require_portrait = p.as_bool();
       } else if (name == "person_conf") {
         human_cfg_.person_conf = p.as_double();
       } else if (name == "person_iou") {
@@ -1055,10 +1053,6 @@ class FollowTheCatNode : public rclcpp::Node {
         human_cfg_.min_neighbors = static_cast<int>(p.as_int());
       } else if (name == "min_face") {
         human_cfg_.min_face = static_cast<int>(p.as_int());
-      } else if (name == "min_upper") {
-        human_cfg_.min_upper = static_cast<int>(p.as_int());
-      } else if (name == "min_full") {
-        human_cfg_.min_full = static_cast<int>(p.as_int());
       }
     }
     return result;
@@ -1098,12 +1092,10 @@ class FollowTheCatNode : public rclcpp::Node {
   bool logged_intrinsics_{false};
   bool logged_fallback_intrinsics_{false};
 
-  DetectionConfig detect_cfg_;
   HumanDetectConfig human_cfg_;
+  std::unique_ptr<HumanDetector> human_;
   PulseMapping pulse_map_;
   ArmPulses rest_;
-  std::string target_mode_{"human"};
-  std::unique_ptr<HumanDetector> human_;
 
   double lock_seconds_{2.0};
   double lost_timeout_seconds_{6.0};
@@ -1157,14 +1149,14 @@ class FollowTheCatNode : public rclcpp::Node {
   TargetState target_;
   sensor_msgs::msg::Image::ConstSharedPtr latest_image_;
   sensor_msgs::msg::CameraInfo::ConstSharedPtr latest_info_;
-  std::optional<CardDetection> latest_det_;
+  std::optional<PersonDetection> latest_det_;
   GazeAngles latest_angles_;
   rclcpp::Time started_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time phase_started_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_seen_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_fresh_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_walk_cmd_at_{0, 0, RCL_ROS_TIME};
-  std::optional<CardDetection> coast_det_;
+  std::optional<PersonDetection> coast_det_;
   rclcpp::Time lock_started_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time walk_started_at_{0, 0, RCL_ROS_TIME};
   bool lock_active_{false};
@@ -1187,11 +1179,13 @@ int main(int argc, char **argv) {
   });
 
   // MultiThreadedExecutor: image, detect, control, and watchdog groups can run
-  // at the same time. The mutex in the node is what makes that safe.
+  // on different threads. A single-threaded executor would serialise YOLO
+  // behind servo commands and make the walk watchdog late.
   rclcpp::executors::MultiThreadedExecutor exec;
   exec.add_node(node);
   exec.spin();
   node->emergency_stop();
+  node.reset();
   rclcpp::shutdown();
   return 0;
 }

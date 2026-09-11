@@ -1,14 +1,23 @@
 #pragma once
 
-// Week 2 library: black portrait-rectangle detection + optical geometry + pulses.
+// Follow-the-cat library: find a person in a camera image and turn that
+// pixel into pan/tilt servo pulses.
 //
-// This header has NO rclcpp. The ROS node (follow_the_cat_node.cpp) calls these
-// functions from a 10 Hz timer after it has copied the latest image pointer.
-// Tests call the same functions with synthetic pixels / Mats — no Jetson needed.
+// This header has no ROS. The node (follow_the_cat_node.cpp) calls these
+// functions from a timer after it has copied the latest image pointer.
+// Tests call the same functions with fake images — no robot required.
+//
+// Pipeline a learner can follow top to bottom:
+//
+//   image  →  YOLO person box  →  aim pixel (torso, not the top of the box)
+//         →  ray through the camera lens
+//         →  yaw / pitch (how far the person is from the image centre)
+//         →  a small step on arm servos 19 (pan) and 22 (tilt)
 //
 // Optical frame (ROS camera convention, not the robot base):
 //   X right, Y down, Z forward (out of the lens).
-// A pixel (u, v) is not a 3D point; it is a ray. Depth is unknown this week.
+// A pixel (u, v) is not a 3D point in the room. It is a direction. This
+// week we have no depth, so we never compute "metres to the person".
 
 #include <cmath>
 #include <cstring>
@@ -25,94 +34,65 @@
 namespace proud_up {
 
 // ---------------------------------------------------------------------------
-// Day 1 — image plane
+// 1. Image plane — where the person appears in the picture
 // ---------------------------------------------------------------------------
 
-// Pixel coordinates in the Aurora RGB image. Origin is the top-left of the
-// frame, u to the right, v down. Units: pixels (not metres).
+// Pixel coordinates in the Aurora RGB image. The origin is the top-left
+// corner of the frame. u grows to the right, v grows downward. Units are
+// pixels, not metres.
 struct Pixel {
   double u{0.0};
   double v{0.0};
 };
 
-// Target: a switched-off phone — a *black* rectangle taller than it is wide,
-// held in front of Masha's white wall. Color alone is not enough (a dark
-// doorway is also dark); we also require a 4-corner portrait box.
+// One detection the rest of the node can use. Both YOLO (a person) and LBP
+// (a face) fill this same struct. After detection, the control loop does
+// not care which detector produced the box — it only needs a pixel to look
+// at, a rectangle to draw, and a short label.
 //
-// `threshold` is a *darkness* cut: pixels darker than it become the mask
-// (THRESH_BINARY_INV). Raise it if the phone looks grey under Aurora's dim
-// exposure; lower it if furniture is being picked up. Week 5 is LAB color.
-struct DetectionConfig {
-  int threshold{90};          // gray < this counts as "black"
-  int loose_threshold{130};   // second pass if the first is too strict
-  double min_area{800.0};     // reject specks (px^2)
-  double max_area{80000.0};   // hard cap; also limited by max_area_frac * pixels
-  double max_area_frac{0.22}; // a wall filling the frame is not a phone
-  double min_aspect{0.28};    // bounding-box width/height (phone ~0.45–0.55)
-  double max_aspect{0.85};    // must stay portrait: height > width
-  double min_solidity{0.55};  // contour area / bounding-box area
-  int blur_ksize{5};          // Gaussian kernel; must be odd, or blur is skipped
-  int morph_ksize{5};         // opening kernel; 0 disables
-  int min_vertices{4};        // approxPolyDP window for a rectangle
-  int max_vertices{6};        // phones have slightly rounded corners
-  double poly_eps_frac{0.04}; // approxPolyDP epsilon as a fraction of perimeter
-  int border_margin{4};       // px; wall-sized blobs touch the frame edge
-  bool reject_border{true};   // drop contours that touch the image border
-  bool require_quad{true};    // 4–6 vertices (a wall is not a small quad)
-  bool require_portrait{true};  // bounding box must be taller than wide
+// std::optional<PersonDetection> is the "did we see anyone?" result:
+//   has a value  →  there is a box this frame (or a remembered coast box)
+//   empty        →  a miss: Idle waits, Tracking may go Lost, Moving aborts
+struct PersonDetection {
+  Pixel center;                       // the pixel we aim the camera at
+  std::vector<cv::Point> contour;     // rectangle corners, for the debug image
+  std::vector<cv::Point> approx;      // same as contour for a YOLO / face box
+  double area{0.0};                   // box width * height, in px^2
+  double aspect{0.0};                 // width / height; a standing person is < 1
+  const char *label{"person"};        // "person", "face", or "coast"
 };
 
-// Result of detect_black_rectangle. `contour` / `approx` are in image
-// coordinates so the node can draw them on ~/image_result.
-struct CardDetection {
-  Pixel center;
-  std::vector<cv::Point> contour;
-  std::vector<cv::Point> approx;
-  double area{0.0};
-  double aspect{0.0};  // width / height; < 1 means portrait
-  const char *label{"target"};  // "face", "upper_body", "full_body", "phone"
-};
+// ---------------------------------------------------------------------------
+// 2. Finding a person — YOLOv8n, with an optional face inside the box
+// ---------------------------------------------------------------------------
 
-// White walls are *bright*, so they never enter the inverted mask. A black
-// portrait phone does. Empty / no-phone images return nullopt — a miss.
-// Counts of rejected blobs (for ~/image_result) go in `stats` if non-null.
-struct DetectionStats {
-  int contours{0};
-  int rejected_border{0};
-  int rejected_area{0};
-  int rejected_shape{0};
-  bool used_loose_pass{false};
-};
-
-std::optional<CardDetection> detect_black_rectangle(const cv::Mat &bgr,
-                                                    const DetectionConfig &cfg = {},
-                                                    DetectionStats *stats = nullptr);
-
-// Person gaze. YOLOv8n (COCO class 0) finds a person from any viewpoint —
-// sitting, back to the camera, across the room. LBP face is a refinement
-// inside that box when you actually look at the lens. Haar body cascades
-// stay off: they were seconds-slow here and still missed a seated person.
+// YOLOv8n (COCO class 0 = person) finds a person from many viewpoints:
+// standing, sitting, facing away, across the room. The LBP face cascade is
+// a second, cheaper pass. It only helps when someone is looking at the
+// lens; it is optional and off by default because it can lock onto a
+// window or a curtain instead of a face.
+//
+// person_head_frac chooses the aim pixel inside the YOLO box. 0.0 is the
+// top edge, 0.5 is the middle, 1.0 is the bottom. 0.45 aims at the torso.
+// Aiming too high (for example 0.12) sends the camera up toward the
+// ceiling and it stays there.
 struct HumanDetectConfig {
   std::string cascade_dir{"/usr/share/opencv4/haarcascades"};
   std::string lbp_dir{"/usr/share/opencv4/lbpcascades"};
-  std::string person_onnx;  // empty = skip YOLO (tests / face-only)
-  double image_scale{0.45};  // LBP face runs on a small gray crop
+  std::string person_onnx;  // empty = skip YOLO (tests, or face-only)
+  double image_scale{0.45};  // LBP face runs on a smaller grey image
   double scale_factor{1.2};
   int min_neighbors{3};
-  int min_face{24};   // px in the *original* image
-  int min_upper{50};
-  int min_full{60};
-  bool enable_upper{false};
-  bool enable_full{false};
+  int min_face{24};  // pixels in the original image, not the scaled copy
   double person_conf{0.45};
   double person_iou{0.45};
   int person_imgsz{320};
   bool dnn_cuda{true};
-  bool enable_face_refine{false};  // LBP inside the box jumps to curtains/windows
-  double person_head_frac{0.45};   // torso, not the top of the box
-  double max_box_frac{0.40};       // a curtain filling the frame is not a person
-  double max_aspect{1.05};         // person is taller than wide
-  double track_gate_frac{0.22};    // stay on the same person; do not hop
+  bool enable_face_refine{false};
+  double person_head_frac{0.45};
+  double max_box_frac{0.40};     // a box that fills the frame is a wall, not a person
+  double max_aspect{1.05};       // a person is taller than they are wide
+  double track_gate_frac{0.22};  // stay on the same person; do not jump to a neighbour
 };
 
 class HumanDetector {
@@ -124,13 +104,13 @@ class HumanDetector {
   bool using_cuda() const { return using_cuda_; }
   double last_detect_ms() const { return last_detect_ms_; }
   void reset_track();
-  // Copy runtime scalars (thresholds, gates). Does not reload ONNX / cascades.
+  // Copy runtime scalars (thresholds, gates). Does not reload ONNX or cascades.
   void apply_runtime_cfg(const HumanDetectConfig &cfg);
-  std::optional<CardDetection> detect(const cv::Mat &bgr);
+  std::optional<PersonDetection> detect(const cv::Mat &bgr);
 
  private:
   std::optional<cv::Rect> detect_person_box(const cv::Mat &bgr);
-  std::optional<CardDetection> detect_face_in(const cv::Mat &bgr, const cv::Rect &roi);
+  std::optional<PersonDetection> detect_face_in(const cv::Mat &bgr, const cv::Rect &roi);
   void warmup_person_net();
   static bool looks_like_person(const cv::Rect &r, int width, int height,
                                 const HumanDetectConfig &cfg);
@@ -138,32 +118,33 @@ class HumanDetector {
   struct PersonNet;
   HumanDetectConfig cfg_;
   cv::CascadeClassifier face_;
-  cv::CascadeClassifier upper_;
-  cv::CascadeClassifier full_;
   std::unique_ptr<PersonNet> person_;
   cv::Rect last_person_;
   bool have_last_person_{false};
   bool ok_{false};
   bool person_ok_{false};
   bool using_cuda_{false};
-  bool have_upper_{false};
-  bool have_full_{false};
   double last_detect_ms_{0.0};
 };
 
 // ---------------------------------------------------------------------------
-// Day 2 — camera intrinsics and the pixel → ray map
+// 3. Camera internals — turning a pixel into a 3D direction
 // ---------------------------------------------------------------------------
 
-// Pinhole model. K is the 3×3 camera matrix:
+// Pinhole camera. K is the 3×3 camera matrix:
+//
 //   [ fx  0  cx ]
 //   [  0 fy  cy ]
 //   [  0  0   1 ]
 //
-// Do NOT hardcode 640×480 / fx=fy=525 as "the" Aurora size. Live values come
-// from /depth_cam/rgb/camera_info (msg.width, msg.height, msg.k). The numbers
-// below are the USB-cam yaml fallback (peripherals/config/camera_info.yaml)
-// used only when camera_info has not arrived yet.
+// fx, fy are focal lengths in pixels. (cx, cy) is the principal point —
+// the pixel that looks straight along the lens axis.
+//
+// Do not hard-code 640×480 or fx = fy = 525 as "the" Aurora size. Live
+// values come from /depth_cam/rgb/camera_info (width, height, k). The
+// numbers below are the USB-camera yaml fallback
+// (peripherals/config/camera_info.yaml), used only when camera_info has
+// not arrived yet.
 struct CameraIntrinsics {
   double fx{521.889};
   double fy{525.09003};
@@ -179,26 +160,35 @@ struct CameraIntrinsics {
 CameraIntrinsics fallback_intrinsics();
 
 // Build K from a row-major 3×3 (sensor_msgs/CameraInfo::k has 9 doubles).
-// Returns a default-unusable struct if fx/fy are ~0 (some drivers publish that
-// before the first real calibration).
+// Returns an unusable struct if fx/fy are near zero — some drivers publish
+// that before the first real calibration.
 CameraIntrinsics from_k_matrix(int width, int height, const double k[9]);
 
 // Pixel (u, v) → unit direction in the optical frame:
+//
 //   X = (u - cx) / fx
 //   Y = (v - cy) / fy
 //   ray = (X, Y, 1).normalized()
-// A center pixel (cx, cy) must give approximately (0, 0, 1) — the optical axis.
+//
+// A centre pixel (cx, cy) must give approximately (0, 0, 1) — straight
+// out of the lens. Normalizing makes yaw and pitch independent of the
+// arbitrary scale Z = 1. That Z is a virtual plane, not measured depth.
 Eigen::Vector3d pixel_to_ray(double u, double v, const CameraIntrinsics &K);
 
 // ---------------------------------------------------------------------------
-// Day 3 — yaw / pitch in the optical frame, quaternion check, pulses
+// 4. Yaw and pitch — how far the person is from the image centre
 // ---------------------------------------------------------------------------
 
 // Angles that rotate the camera's +Z onto the target ray.
-// Optical: X right, Y down, Z forward.
-//   yaw   = atan2(X, Z)              // heading in the XZ plane; right pixel → yaw > 0
-//   pitch = atan2(-Y, hypot(X, Z))   // minus flips Y-down so below-center → pitch < 0
-// Units: radians. This is NOT arm IK and NOT camera-from-base extrinsics.
+// Optical frame: X right, Y down, Z forward.
+//
+//   yaw   = atan2(X, Z)               // heading in the XZ plane
+//   pitch = atan2(-Y, hypot(X, Z))    // the minus flips Y-down
+//
+// A pixel to the right of centre has X > 0, so yaw > 0.
+// A pixel below centre has Y > 0, so pitch < 0.
+// Units: radians. This is not arm inverse kinematics, and it is not the
+// camera-from-base transform. It is only "how is this pixel off-centre?"
 struct GazeAngles {
   double yaw{0.0};
   double pitch{0.0};
@@ -207,30 +197,39 @@ struct GazeAngles {
 GazeAngles ray_to_yaw_pitch(const Eigen::Vector3d &ray);
 
 // q = AngleAxis(yaw, UnitZ()) * AngleAxis(pitch, UnitY()).
-// A center pixel (yaw=pitch=0) is identity. Logged by the node; never sent
-// to a servo. Norm must stay ~1 (unit quaternion).
+// A centre pixel (yaw = pitch = 0) is the identity quaternion. The node
+// logs this as a sanity check; it is never sent to a servo. The product
+// must stay a unit quaternion (norm ≈ 1).
 Eigen::Quaterniond gaze_quaternion(double yaw, double pitch);
 
-// Bus-servo travel on this robot: 240 deg mapped onto pulse ticks 0..1000.
+// ---------------------------------------------------------------------------
+// 5. Servo pulses — turning angles into bus-servo ticks
+// ---------------------------------------------------------------------------
+
+// Bus-servo travel on this robot: 240 degrees mapped onto pulse ticks 0..1000.
+//
 //   ticks_per_rad = 1000 / (240 * pi/180) = 750/pi ≈ 238.732
+//
 // Same constant as servo_controller/joint_position_controller.py
-// (ENCODER_TICKS_PER_RADIAN). Ids 19 and 22 are NOT flipped in that driver.
+// (ENCODER_TICKS_PER_RADIAN). Ids 19 and 22 are not flipped in that driver.
 inline constexpr double kPi = 3.14159265358979323846;
 inline constexpr double kTicksPerRadian = 1000.0 / (240.0 * (kPi / 180.0));
 
 // Rest pulses match proud_up / ActionGroups init_horizontal:
-//   19=500 (joint1 yaw), 22=150 (wrist pitch, camera parent).
-// There is no neck. Id 23 is joint5 wrist *yaw*, not tilt — never command 23
-// for pitch. Color_track holds 23 and 24 at 500 and pans with 19; we do the
-// same and put pitch on 22.
+//   19 = 500  (joint 1, pan / yaw)
+//   22 = 150  (wrist pitch; this joint is the camera's parent)
+//
+// There is no neck. Id 23 is joint 5, wrist *yaw*, not tilt. Never command
+// 23 for pitch. Vendor color_track holds 23 and 24 at 500 and pans with 19;
+// we do the same and put pitch on 22.
 struct PulseMapping {
   float pan_rest{500.0f};    // servo 19 at zero yaw
   float tilt_rest{150.0f};   // servo 22 at zero pitch
-  float pan_min{200.0f};     // color_track clamp
+  float pan_min{200.0f};
   float pan_max{800.0f};
-  float tilt_min{80.0f};     // tight band around 150 so the arm does not fold
+  float tilt_min{80.0f};     // a tight band around 150 so the arm does not fold
   float tilt_max{250.0f};
-  double yaw_sign{1.0};      // optical: +yaw = target to the right. Hardware: node yaml is -1
+  double yaw_sign{1.0};      // optical: +yaw = person to the right. Hardware yaml is -1
   double pitch_sign{1.0};
   double ticks_per_rad{kTicksPerRadian};
 };
@@ -241,20 +240,30 @@ struct GazePulses {
 };
 
 // Absolute map, as if the camera were still at the rest pose:
+//
 //   pulse_19 = pan_rest  + yaw_sign   * yaw   * ticks_per_rad
 //   pulse_22 = tilt_rest + pitch_sign * pitch * ticks_per_rad
-// Clamped at the command site. This is the Week 2 formula and the gtest
-// target. Do NOT command it every 10 Hz on a moving camera: when the card
-// reaches the image center, yaw=0 so this snaps back to rest, then the card
-// is off-center again — that is the hunting / "chaotic neck" loop.
+//
+// Clamped at the command site. This is the simple formula, and the unit
+// tests use it. Do not command it every control cycle on a moving camera.
+//
+// Why: this formula pretends the camera is still at rest. If we sent it
+// every tick, a person who reached the image centre would produce yaw = 0,
+// so the arm would immediately return to rest. Then the person would be
+// off-centre again, and the arm would chase them forever. That oscillation
+// is why the node uses integrate_gaze instead.
 GazePulses angles_to_pulses(const GazeAngles &angles, const PulseMapping &map);
 
-// Incremental gaze (what the node actually publishes).
-// yaw/pitch are the *current* optical error. We add a fraction of that error
-// onto the *current* pulses and hold when the error is inside `deadband_rad`:
+// Incremental gaze — what the node actually publishes.
+// yaw / pitch are the *current* optical error (how far the person is from
+// the image centre *right now*). We add a fraction of that error onto the
+// pulses we already have, and we hold still when the error is inside
+// deadband_rad:
+//
 //   id19 += clamp(yaw_sign * yaw * ticks * gain, ±max_step)
-// After the camera moves, the error shrinks and the pulses stay put. That is
-// the same idea as color_track's `y_dis += pid.output`.
+//
+// After the camera moves, the error shrinks and the pulses stay where they
+// are. That is the same idea as color_track's `y_dis += pid.output`.
 GazePulses integrate_gaze(const GazePulses &current, const GazeAngles &err,
                           const PulseMapping &map, double gain, double max_step,
                           double deadband_rad);
@@ -262,25 +271,31 @@ GazePulses integrate_gaze(const GazePulses &current, const GazeAngles &err,
 float clamp_pulse(float value, float lo, float hi);
 float clamp_delta(float value, float max_abs);
 
-// True when the blob is close enough to the optical axis to count as "locked
-// on center" (the 2 s walk gate). Plan requires |yaw| small; pitch is included
-// so a card held a bit high/low still qualifies.
+// True when the person is close enough to the optical axis to count as
+// "locked on centre" (the 2 s walk gate). The plan requires |yaw| small;
+// pitch is included so a person standing a little high or low still
+// qualifies. Default tolerances: yaw 0.08 rad ≈ 4.6°, pitch 0.20 rad ≈ 11.5°.
 bool near_optical_axis(const GazeAngles &angles, double yaw_tol, double pitch_tol);
 
-// Debug overlay for ~/image_result: contour, centroid, phase string.
-// Mutates `bgr` in place (the node already owns a copy from toCvCopy).
-void draw_debug_overlay(cv::Mat &bgr, const std::optional<CardDetection> &det,
-                        const char *phase, const GazeAngles *angles = nullptr,
-                        const DetectionStats *stats = nullptr,
-                        const char *note = nullptr);
+// ---------------------------------------------------------------------------
+// 6. Coast, walk gate, debug overlay
+// ---------------------------------------------------------------------------
 
-// Coast fills a dropped YOLO box for gaze hold. Walk must not use that box.
-inline bool is_coasted_detection(const CardDetection &det) {
+// If YOLO misses for a moment, the node keeps the last box and marks it
+// "coast" so the camera can hold still. Walking must not use that
+// remembered box: the person may already have moved.
+inline bool is_coasted_detection(const PersonDetection &det) {
   return det.label != nullptr && std::strcmp(det.label, "coast") == 0;
 }
 
-inline bool walk_detection_valid(const std::optional<CardDetection> &det) {
+inline bool walk_detection_valid(const std::optional<PersonDetection> &det) {
   return det.has_value() && !is_coasted_detection(*det);
 }
+
+// Debug overlay for ~/image_result: box, aim pixel, phase string.
+// Writes onto `bgr` in place (the node already owns a copy from toCvCopy).
+void draw_debug_overlay(cv::Mat &bgr, const std::optional<PersonDetection> &det,
+                        const char *phase, const GazeAngles *angles = nullptr,
+                        const char *note = nullptr);
 
 }  // namespace proud_up

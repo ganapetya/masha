@@ -8,13 +8,14 @@ follow_the_cat_node:
     init_pose_ready_service: /init_pose/init_finish
     wait_for_ready: true
     image_qos_reliable: false
-    # First live bring-up is gaze-only. Turn on after pan/tilt signs are verified.
+    # First live bring-up is gaze-only. Turn walk on after pan/tilt signs
+    # are verified on the robot (person to the right should decrease pulse 19).
     enable_walk: false
     dry_run: false
 
-    # Gaze target. "human" = YOLOv8n person (any viewpoint), LBP face if
-    # you look at the lens. "phone" = black portrait rectangle.
-    target: human
+    # YOLOv8n finds a person from any viewpoint. LBP face is optional and
+    # off: it only helps when someone looks at the lens, and it can lock
+    # onto a window instead.
     cascade_dir: /usr/share/opencv4/haarcascades
     lbp_dir: /usr/share/opencv4/lbpcascades
     person_onnx: ""   # empty → share/proud_up/models/yolov8n.onnx
@@ -23,7 +24,7 @@ follow_the_cat_node:
     person_imgsz: 320
     dnn_cuda: true
     enable_face_refine: false
-    person_head_frac: 0.45
+    person_head_frac: 0.45   # aim at the torso, not the top of the YOLO box
     max_box_frac: 0.40
     person_max_aspect: 1.05
     track_gate_frac: 0.22
@@ -31,30 +32,10 @@ follow_the_cat_node:
     human_scale_factor: 1.2
     human_min_neighbors: 3
     min_face: 24
-    min_upper: 50
-    min_full: 60
-    enable_upper_body: false
-    enable_full_body: false
     debug_max_width: 640
 
-    # Black portrait rectangle = switched-off phone (only if target:=phone).
-    threshold: 90
-    loose_threshold: 130
-    min_area: 800.0
-    max_area: 80000.0
-    max_area_frac: 0.22
-    min_aspect: 0.28
-    max_aspect: 0.85
-    min_solidity: 0.55
-    blur_ksize: 5
-    morph_ksize: 5
-    border_margin: 4
-    reject_border: true
-    require_quad: true
-    require_portrait: true
-
-    # Pan sign from live hardware + vendor color_track: target to the right of
-    # the image → decrease pulse 19. If she pans the wrong way, flip to +1.
+    # Pan sign from live hardware + vendor color_track: person to the right
+    # of the image → decrease pulse 19. If she pans the wrong way, flip to +1.
     yaw_sign: -1.0
     pitch_sign: 1.0
     pan_min: 200.0
@@ -62,7 +43,7 @@ follow_the_cat_node:
     tilt_min: 80.0
     tilt_max: 250.0
 
-    # Camera-forward rest (proud_up / init_horizontal). Tilt this week is id 22,
+    # Camera-forward rest (proud_up / init_horizontal). Tilt is id 22,
     # not 23 (23 is wrist yaw). Never command leg ids 1–18.
     arm_duration: 1.0
     arm_id19: 500.0
@@ -79,12 +60,12 @@ follow_the_cat_node:
     # If cmd_vel goes quiet while walking (detect/control stall), halt via
     # Traveling gait 0 then -2. Never publish a zero Twist (in-place gait).
     walk_watchdog_seconds: 0.3
-    center_yaw_tol: 0.08
-    center_pitch_tol: 0.20
+    center_yaw_tol: 0.08    # ≈ 4.6 deg
+    center_pitch_tol: 0.20  # ≈ 11.5 deg
     servo_duration: 0.08
     ready_timeout_seconds: 30.0
-    # Incremental gaze onto the *image centre* (magenta cross in Foxglove).
-    # Soft steps + a 3.4 deg deadband: once you are in the picture, hold.
+    # Incremental gaze onto the image centre (magenta cross in Foxglove).
+    # Small steps + a 3.4 deg deadband: once the person is in the picture, hold.
     gaze_gain: 0.10
     gaze_ki: 0.0
     max_step_pulses: 8.0
