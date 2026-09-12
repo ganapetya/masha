@@ -18,7 +18,9 @@ Masha has **three** motion machines. Only the first two are *gaits*.
 | **Body pose** | All six feet stay planted; the body translates/tilts over them | `/controller/pose_transform_euler`, `/controller/set_pose_euler`, built-in poses | All six on the ground |
 | **Action group** | Open-loop pulse sequence from a `.d6a` SQLite file | `/controller/run_actionset` or `ActionGroupController.run_action` | Whatever the file recorded (dance, init, pick) |
 
-Sprint 3’s *dance* is an **action group**, not a gait. Sprint 3’s *safety halt* must stop the **gait** (`gait=-2`) before the dance starts. If a gait generator is still ticking, it will fight the `.d6a` for `/servo_controller`.
+Sprint 3 Step 1’s *dance* is an **action group**, not a gait. Sprint 3’s *safety halt* must stop the **gait** (`gait=-2`) before the dance starts. If a gait generator is still ticking, it will fight the `.d6a` for `/servo_controller`.
+
+Sprint 3 Step 2 (after the dance finishes) **is** a gait: a new generator (`gait=5`) that we write, using existing IK. It must wait for `/action_complete` and must **not** call `kinematics.set_step_mode(..., 5)` — the `.so` does not know that number. See `~/steps/quarter-01-sprint-03-plan.md` Step 2.
 
 Voice “go forward” uses a **gait**. Voice “dance” uses **`twist.d6a`**. They never share a generator.
 
