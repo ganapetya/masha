@@ -178,9 +178,9 @@ Services (Masha app pattern, optional): `~/init_finish` (`std_srvs/Trigger`). No
 
 Keep Gemini’s 1 hr/day shape; change the artifacts.
 
-### Day 1 — hexapod stability
+### Day 1 — Masha’s gait architecture (not a textbook table)
 
-Support polygon vs CoM projection. Tripod (gait=2, three-foot triangle, smaller, faster) vs ripple (gait=1, 4–5 feet, slower, larger polygon). Grounded sets: typically LF/RM/LR vs RF/LM/RR (map Guru’s “1,3,5” onto named legs, do not invent numeric IDs). Eigen: point-in-triangle. No new node yet.
+Read **[`MASHA_GAITS.md`](MASHA_GAITS.md)** (same folder; copy also at `ros2_ws/info/MASHA_GAITS.md`). That is the Day 1 text: how Traveling vs `cmd_vel` vs `.d6a` actually run, the 20 ms loop, leg ids LF…RF, halt `gait=-2`. Then: support polygon vs CoM; tripod (1,3,5)=(LF,LR,RM) vs (2,4,6)=(LM,RR,RF). Eigen: point-in-triangle. No new node yet.
 
 ### Day 2 — FK / TF + ZMP formula
 
