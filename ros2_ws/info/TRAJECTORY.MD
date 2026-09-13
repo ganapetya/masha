@@ -8,31 +8,41 @@ Nothing here is an implementation task.
 
 Sampled on this Jetson against `kinematics.so`. Formulas below are measured, not guessed from comments.
 
+Notation in this file is plain Markdown (backticks + `text` fences), not LaTeX. Book names:
+
+| Here | Book | Meaning |
+|---|---|---|
+| `theta(s)` | joint-space path | Geometry of joint angles vs a parameter `s` in `[0, 1]`. No clock. |
+| `X(s)` | task-space path | Geometry of a pose / foot tip vs `s`. No clock. |
+| `s(t)` | time scaling | The clock: time `t` in `[0, T]` maps onto `s`. Cubic / quintic live here. |
+| `theta(s(t))` | trajectory | Path composed with a clock. |
+| `s-dot`, `s-dot-dot` | ds/dt, d²s/dt² | First / second time derivatives of the scaling. |
+
 ---
 
 ## 0. Chapter 9 vocabulary (keep these three words apart)
 
 | Term | Book | On Masha |
 |---|---|---|
-| **Path** \(\theta(s)\) or \(X(s)\) | Pure geometry. \(s\in[0,1]\). No clock. | Exists only in the gait / body-pose stack: six foot tips in millimetres, body frame. |
-| **Time scaling** \(s(t)\) | Monotonic map \(t\in[0,T]\to s\in[0,1]\). This is where cubic / quintic / S-curve live. | **Linear** in the 20 ms tick. No \(\dot s(0)=\dot s(T)=0\). No quintic. |
-| **Trajectory** \(\theta(s(t))\) | Path composed with a clock. | IK of that path every tick, then pulse targets to the bus. |
+| **Path** `theta(s)` or `X(s)` | Pure geometry. `s` in `[0, 1]`. No clock. | Exists only in the gait / body-pose stack: six foot tips in millimetres, body frame. |
+| **Time scaling** `s(t)` | Monotonic map from time `t` in `[0, T]` onto `s` in `[0, 1]`. This is where cubic / quintic / S-curve live. | **Linear** in the 20 ms tick. No `s-dot(0) = s-dot(T) = 0`. No quintic. |
+| **Trajectory** `theta(s(t))` | Path composed with a clock. | IK of that path every tick, then pulse targets to the bus. |
 
 Spatial path types in the book:
 
 | Book path | On Masha |
 |---|---|
-| **Joint-space straight line** | Action groups, and the servo `duration` field. Pulse \(0\ldots1000\), not radians. |
-| **Task-space straight line / screw \(X(s)\in SE(3)\)** | Body pose uses **linear Euler + translation**, then IK of planted feet. Not matrix exponential. |
+| **Joint-space straight line** | Action groups, and the servo `duration` field. Pulse `0..1000`, not radians. |
+| **Task-space straight line / screw `X(s)` in `SE(3)`** | Body pose uses **linear Euler + translation**, then IK of planted feet. Not matrix exponential. |
 
 Time-scaling profiles in the book — **none of them run on the walk or the dance**:
 
 | Profile | Book intent | On Masha |
 |---|---|---|
-| Linear \(s=t/T\) | Constant parameter speed; acceleration steps | **This is what she does** |
-| Cubic (3rd) | \(\dot s(0)=\dot s(T)=0\); jerk spikes | Not present |
-| Quintic (5th) | Also \(\ddot s=0\) at ends; finite jerk | Not present |
-| Septic / S-curve | Also \(\dddot s=0\); less gear chatter | Not present |
+| Linear `s = t / T` | Constant parameter speed; acceleration steps | **This is what she does** |
+| Cubic (3rd) | `s-dot = 0` at start and goal; jerk spikes | Not present |
+| Quintic (5th) | Also `s-dot-dot = 0` at ends; finite jerk | Not present |
+| Septic / S-curve | Also zero jerk at ends; less gear chatter | Not present |
 | Via-point polynomials | Smooth across keyframes | Action groups are via-points **without** the polynomial |
 
 ---
@@ -43,7 +53,7 @@ Masha has **three** motion machines. Only the first two have a Chapter 9 *path*.
 
 | Machine | Chapter 9 object | Typical trigger | Feet |
 |---|---|---|---|
-| **Gait** | Task-space foot path \(X(s)\) + linear \(s(t)\) + IK | `/controller/traveling`, `/controller/cmd_vel` | Some swing, some stance |
+| **Gait** | Task-space foot path `X(s)` + linear `s(t)` + IK | `/controller/traveling`, `/controller/cmd_vel` | Some swing, some stance |
 | **Body pose** | Task-space body motion; Euler-linear, not a screw | `/controller/pose_transform_euler`, `/controller/set_pose_euler`, built-in poses | All six planted |
 | **Action group** | Joint-space via-points in pulse units | `/controller/run_actionset` or `ActionGroupController.run_action` | Whatever the `.d6a` recorded |
 
@@ -79,11 +89,11 @@ That is Chapter 9 **via-point joint-space**: send target pulses plus a time, sle
 
 The Jetson does **not** spline the keyframes. It publishes `duration` on `/servo_controller`.
 
-1. `ServoManager.set_position` (`servo_controller/servo_controller.py`) clamps duration to \([0.02, 30]\) s and pulse to \([0, 1000]\).
+1. `ServoManager.set_position` (`servo_controller/servo_controller.py`) clamps duration to `[0.02, 30]` s and pulse to `[0, 1000]`.
 2. `ros_robot_controller` packs STM32 bus-servo command **`0x01`** (Hiwonder / LewanSoul *move-time write*): duration in milliseconds + `(id, pulse)` pairs. See `ros_robot_controller_sdk.py` `bus_servo_set_position`.
 3. The servo (or the STM32 forwarding that command) interpolates **pulse vs time** from the current tick to the new target. Protocol is the linear move-time command, not a cubic.
 
-So the path is a polyline in 24-D pulse space (18 leg servos + 6 arm). Time scaling on each segment is **linear** \(s(t)=t/T_i\). At a keyframe, velocity jumps (infinite jerk). That is the “simple, mechanical shock” case in the book, not quintic.
+So the path is a polyline in 24-D pulse space (18 leg servos + 6 arm). Time scaling on each segment is **linear** `s(t) = t / T_i`. At a keyframe, velocity jumps (infinite jerk). That is the “simple, mechanical shock” case in the book, not quintic.
 
 Boot stand is the same machine: bringup plays action group `init` (`controller/launch/init_pose.launch.py`, `action_name:=init`).
 
@@ -142,51 +152,50 @@ ps = kinematics.set_step_mode(
 
 The `.so` returns samples per leg; Python reshapes to `[slice][leg][xyz]`.
 
-**Measured swing** (RMSE 0 against this formula, including cases with `height ≠ stride/2`):
+**Measured swing** (RMSE 0 against this formula, including cases with `height != stride/2`):
 
-\[
-x(s) = x_{\mathrm{mid}} - \frac{\mathrm{stride}}{2}\cos(\pi s),
-\qquad
-z(s) = z_{\mathrm{ground}} + \mathrm{height}\,\sin(\pi s),
-\quad s\in[0,1]
-\]
+```text
+x(s) = x_mid  - (stride / 2) * cos(pi * s)
+z(s) = z_gnd  +  height      * sin(pi * s)
+s in [0, 1]
+```
 
 That is a **half-ellipse in the sagittal plane**, uniform in the angle parameter.
 
 | It is not | Why we know |
 |---|---|
 | Bézier | Closed form matches ellipse with RMSE 0 |
-| Cycloid | Cycloid has \(z \propto 1-\cos(2\pi s)\) and \(\dot z=0\) at the ends. This sine-\(z\) does **not** |
-| Quintic \(s(t)\) | \(s = k/N\), equal time per sample |
+| Cycloid | Cycloid has `z ~ 1 - cos(2 * pi * s)` and `z-dot = 0` at the ends. This sine-`z` does **not** |
+| Quintic `s(t)` | `s = k / N`, equal time per sample |
 
 Consequences vs the book:
 
-- Vertical speed is **max** at lift-off / touchdown (\(\dot z \propto \cos(\pi s)\), nonzero at \(s=0,1\)).
-- Horizontal swing speed **is** zero at the ends (\(\dot x \propto \sin(\pi s)\)).
-- Stance is retraction at \(z=\mathrm{ground}\). Approximately linear in \(x\), not a perfect line (small residual).
+- Vertical speed is **max** at lift-off / touchdown (`z-dot` goes with `cos(pi * s)`, nonzero at `s = 0` and `s = 1`).
+- Horizontal swing speed **is** zero at the ends (`x-dot` goes with `sin(pi * s)`).
+- Stance is retraction at `z = z_gnd`. Approximately linear in `x`, not a perfect line (small residual).
 
 `gait=1` ripple, `gait=2` tripod. `3` / `4` exist in the `.so` (“quadruped, front feet up” / “middle feet up”) but ROS traveling does not use them.
 
-Ripple-only preamble (`gait==1`): if `direction ≥ π`, lift leg 1 (LF) by `height` before the cycle; otherwise lift leg 4 (RR). Comment: a ripple foot may be mid-descend; starting from a full stand would jack the body up. Tripod skips this.
+Ripple-only preamble (`gait==1`): if `direction >= pi`, lift leg 1 (LF) by `height` before the cycle; otherwise lift leg 4 (RR). Comment: a ripple foot may be mid-descend; starting from a full stand would jack the body up. Tripod skips this.
 
-Time scaling: **linear** \(s=k/N\). No trapezoid, no quintic.
+Time scaling: **linear** `s = k / N`. No trapezoid, no quintic.
 
 ### 3.2 `CmdVelGenerator` — `/controller/cmd_vel`
 
 Same file, different algorithm: AEP / PEP (anterior / posterior extreme positions).
 
-1. `kinematics.cmd_vel_basic_data(vx_mm, vy_mm, wz, period)` → offsets and \(\sin/\cos\) of half the yaw increment.
+1. `kinematics.cmd_vel_basic_data(vx_mm, vy_mm, wz, period)` → offsets and `sin` / `cos` of half the yaw increment.
 2. `kinematics.cmd_vel_aep_pep(cur_pose, …)` → per-leg AEP and PEP.
-3. For phase \(\phi\in[0,2\pi)\) sampled at `period/0.02` points: `kinematics.cmd_vel_new_point(gait, height, phase, aep, pep)`.
+3. For phase `phi` in `[0, 2*pi)`, sampled at `period / 0.02` points: `kinematics.cmd_vel_new_point(gait, height, phase, aep, pep)`.
 
 **Measured swing:**
 
 - **XY: exactly linear** PEP → AEP (RMSE 0).
-- **Z: parabola** \(z = z_g + 4s(1-s)\,h\) (RMSE ~0.02 mm on a 20 mm lift).
+- **Z: parabola** `z = z_gnd + 4 * s * (1 - s) * h` (RMSE ~0.02 mm on a 20 mm lift).
 
 Stance is linear AEP → PEP at ground.
 
-Duty from a 50-sample sweep of the `.so` (lift threshold \(z > -69\,\mathrm{mm}\)):
+Duty from a 50-sample sweep of the `.so` (lift threshold `z > -69 mm`):
 
 | `.so` `gait` | Swing fraction | Meaning |
 |---|---|---|
@@ -203,9 +212,9 @@ gait = 2 if params.gait == 1 else 1
 
 So Traveling `gait=2` is tripod, but `cmd_vel` with `cmd_gait=2` is **ripple** inside Rust. Joystick analog vs D-pad hits this trap. Details: `MASHA_GAITS.md` §8.
 
-Time scaling: uniform phase, i.e. linear \(s(t)\) on the gait oscillator. After a new Twist the generator picks a phase close to the current feet (`total_dist_sq`) so a foot does not teleport. Catch-up can stretch one slice to 50 ms (`slow == 'cmd_true'`).
+Time scaling: uniform phase, i.e. linear `s(t)` on the gait oscillator. After a new Twist the generator picks a phase close to the current feet (`total_dist_sq`) so a foot does not teleport. Catch-up can stretch one slice to 50 ms (`slow == 'cmd_true'`).
 
-Example: `cmd_vel_basic_data(80 mm/s, 0, 0, period=1)` returns AEP offset 40 mm, so AEP − PEP = 80 mm = \(v_x T\). That is the book’s “path length from a speed and a period,” not a polynomial \(s(t)\).
+Example: `cmd_vel_basic_data(80 mm/s, 0, 0, period=1)` returns AEP offset 40 mm, so AEP − PEP = 80 mm = `vx * T`. That is the book’s “path length from a speed and a period,” not a polynomial `s(t)`.
 
 ### 3.3 The 20 ms loop is the clock
 
@@ -221,7 +230,7 @@ Each tick, in this order:
 
 A started step is finished before the generator is swapped (`last_part`). Halt can take up to one step period. That is why a dance must wait after `gait=-2`.
 
-When the loop sends `duration=0.02` every 20 ms, the servo barely interpolates: it is almost a new target every tick. Path smoothness is entirely from the 50 Hz IK samples, not from cubic \(s(t)\).
+When the loop sends `duration=0.02` every 20 ms, the servo barely interpolates: it is almost a new target every tick. Path smoothness is entirely from the 50 Hz IK samples, not from cubic `s(t)`.
 
 ---
 
@@ -229,14 +238,14 @@ When the loop sends `duration=0.02` every 20 ms, the servo barely interpolates: 
 
 Not a gait. All six feet stay down; the body moves over them.
 
-`PoseTransformer` (`controller/pose_transformer.py`) slices `duration` into `ceil(T/0.02)` ticks and **adds** \(\Delta x,\Delta y,\Delta z\) and \(\Delta\)RPY linearly. The comment in code is explicit: translation and Euler are linear. Then:
+`PoseTransformer` (`controller/pose_transformer.py`) slices `duration` into `ceil(T / 0.02)` ticks and **adds** `dx, dy, dz` and `d(RPY)` linearly. The comment in code is explicit: translation and Euler are linear. Then:
 
 ```text
 kinematics_calculate.transform_euler(org_pose, (nx,ny,nz), 'xyz', (nu,nv,nw))
     → kinematics.transform_pose(leg, foot, translate, quat)   for leg 1..6
 ```
 
-That is task-space body motion, **not** a screw interpolation on \(SE(3)\). Linear Euler is not a geodesic on \(SO(3)\). Small angles, so it is approximately OK; it is not Chapter 9’s matrix exponential.
+That is task-space body motion, **not** a screw interpolation on `SE(3)`. Linear Euler is not a geodesic on `SO(3)`. Small angles, so it is approximately OK; it is not Chapter 9’s matrix exponential.
 
 Built-in snapshots (`build_in_pose.py`: `DEFAULT_POSE`, `SLAM_POSE`, …) are six foot-tip coordinates in millimetres. Halt `gait=-2` goes to `DEFAULT_POSE` as a pose-setter with the Traveling `time` as servo duration (one shot, linear pulse interpolation), not as a gait.
 
@@ -298,10 +307,10 @@ TF (`end_LF`, …) is a **side effect** of `/controller_manager` publishing `/jo
 | Path | Role vs Chapter 9 |
 |---|---|
 | `/leg_controller/follow_joint_trajectory` (also arm, gripper) | MoveIt-style action. Sends each waypoint’s **positions** with segment duration. **Ignores** velocities and accelerations in the `JointTrajectory` message. Same linear pulse move as a `.d6a`. Hosted by `controller_manager.py`. |
-| `/arm_kinematics/set_pose_target` | 5-DOF arm IK, separate package. Pick/place uses this, not hexapod `kinematics.so`. Some demos `np.linspace` a Cartesian path and send pulses with equal `step_duration` — linear \(s(t)\) in task space for the arm. |
+| `/arm_kinematics/set_pose_target` | 5-DOF arm IK, separate package. Pick/place uses this, not hexapod `kinematics.so`. Some demos `np.linspace` a Cartesian path and send pulses with equal `step_duration` — linear `s(t)` in task space for the arm. |
 | `perform_actions` | Scripted mix of pose-transform, traveling, and arm IK. |
 
-Halt codes (not a time-scaling): `gait=0` finish current step then freeze; `gait=-1` `SLAM_POSE`; `gait=-2` `DEFAULT_POSE` (what voice stop uses). A zero Twist is **not** that halt — it starts a `CmdVelGenerator` with \(v=0\).
+Halt codes (not a time-scaling): `gait=0` finish current step then freeze; `gait=-1` `SLAM_POSE`; `gait=-2` `DEFAULT_POSE` (what voice stop uses). A zero Twist is **not** that halt — it starts a `CmdVelGenerator` with `v = 0`.
 
 ---
 
@@ -331,8 +340,8 @@ Related: [`MASHA_GAITS.md`](MASHA_GAITS.md) (who walks how), [`nodes-topics.md`]
 
 1. **Path vs trajectory.** A `.d6a` is already a trajectory in joint pulse space (geometry and timing glued in each row). A gait **does** split them: Cartesian foot path in the `.so`, time = uniform 20 ms samples.
 2. **Joint-space vs task-space.** Dance = joint-space pulses. Walk = task-space feet + IK. Body tilt = task-space body, Euler-linear, planted feet.
-3. **Why cubics exist in the book.** Masha’s action-group and servo `duration` are the thing those polynomials are meant to replace: constant-velocity segments, acceleration steps, jerk spikes. The gait ellipse / parabola is a **spatial** smoother, not a **time-scaling** smoother. Touchdown \(\dot z \neq 0\) on both generators.
-4. **50 Hz is the clock.** A quintic \(s(t)\) would live *inside* that loop as a scalar on \(s\), then the same IK. It is not there today.
+3. **Why cubics exist in the book.** Masha’s action-group and servo `duration` are the thing those polynomials are meant to replace: constant-velocity segments, acceleration steps, jerk spikes. The gait ellipse / parabola is a **spatial** smoother, not a **time-scaling** smoother. Touchdown `z-dot != 0` on both generators.
+4. **50 Hz is the clock.** A quintic `s(t)` would live *inside* that loop as a scalar on `s`, then the same IK. It is not there today.
 5. **Do not mix machines.** Putting a quintic on `cmd_vel` does not smooth a `.d6a`. Playing a dance does not give you a support polygon.
 
 ---
@@ -341,6 +350,6 @@ Related: [`MASHA_GAITS.md`](MASHA_GAITS.md) (who walks how), [`nodes-topics.md`]
 
 **Action sets.** Pre-programmed keyframes are `.d6a` rows of 24 pulses plus a millisecond duration. Python does not interpolate (linear, cubic, or quintic) between poses. It sends raw target pulses to the servo board with that duration and sleeps. The board/servo linearly interpolates pulse vs time (command `0x01`). Boot `init` is the same player.
 
-**Gait.** The leg controller generates **task-space** 3D foot curves and solves IK at every 20 ms tick. Not a joint-space table. Traveling swing is a **half-ellipse** (uniform angle). `cmd_vel` swing is **linear XY + parabolic Z**. Time scaling in the 50 Hz loop is **linear** (equal \(\Delta s\) or equal \(\Delta\phi\)), not trapezoidal, not quintic.
+**Gait.** The leg controller generates **task-space** 3D foot curves and solves IK at every 20 ms tick. Not a joint-space table. Traveling swing is a **half-ellipse** (uniform angle). `cmd_vel` swing is **linear XY + parabolic Z**. Time scaling in the 50 Hz loop is **linear** (equal `ds` or equal `d(phi)`), not trapezoidal, not quintic.
 
 **Cascade.** High-level command → `MoveController` → `StepController` 20 ms loop → (optional) body-pose generator or foot-trajectory generator → `kinematics.so` IK → pulse conversion → `/servo_controller` → `controller_manager` → STM32 bus → servos. Action groups skip everything above `/servo_controller`.
