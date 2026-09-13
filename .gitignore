@@ -23,6 +23,7 @@
 !/LEARNING_BOTS_SHARING_PULL.md
 !/CURRENT_PLAN.md
 !/.stop_ros.sh
+!/.stop.sh
 
 # Do copy: ROS 2 workspace, desktop tools, wifi manager
 !/ros2_ws/
