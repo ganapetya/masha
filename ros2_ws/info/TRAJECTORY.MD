@@ -8,6 +8,36 @@ Nothing here is an implementation task.
 
 Sampled on this Jetson against `kinematics.so`. Formulas below are measured, not guessed from comments.
 
+---
+
+## The difference, in prose
+
+The book and Masha are answering different questions.
+
+The book asks: how do you go from here to there so the metal barely notices the start and the stop? It splits the problem in two. First you draw a curve — only *where*. Then you invent a clock that walks along that curve — *when*. Almost all of Chapter 9’s cleverness is in the clock. Leave slowly. Arrive slowly. Do not crack a gearbox with a shove.
+
+Masha mostly does not own that clock.
+
+When she **walks**, she does have a “where.” Each foot draws an arch in the air, plants, then drags back under the body. That arch is a picture in millimetres, redrawn many times a second, then turned into joint angles. That part would make the book nod. The clock that walks along the arch, though, is a metronome. Every twenty milliseconds she takes the next equally spaced bead on the string. She does not ease in or ease out. The foot speeds up and slows down because of the *shape* of the arch, not because someone wrote a gentle law for time. At the moment the foot should kiss the floor, it still has speed straight down. It arrives like a small stomp, not like a cat.
+
+When she is given a **speed command**, the picture changes: the foot flies a straight line between two extreme points and pops up on a hump, like a thrown stone. Still a picture in space. Still a metronome.
+
+When she **dances**, there is no picture in space at all. Someone once posed her with sliders and saved a row of servo ticks plus “take this many milliseconds.” Playback is a cassette: dump the next pose at the board, wait, dump the next. The board crawls each servo from here to there at constant tick speed. Place is continuous. Speed is not. Every keyframe is a shove. The book invented cubics and quintics exactly so you would not do this. Masha does this because that is how the action editor works, and because the servo protocol is “be at this tick in this much time.”
+
+**Leaning** the body is a third thing. All six feet stay down and the torso slides and tilts over them. The code eases that by adding a little to the three translations and a little to roll, pitch, and yaw on each tick — six knobs, turned in lockstep. The book would rather spin the whole pose around one screw in space, a true rigid twist. Masha turns the knobs. For small leans it looks fine. It is not the same idea.
+
+So the real difference is not that she “lacks a formula.” The book is one pipeline for an arm. Masha is three appliances that share the last wire to the motors.
+
+- Walk thinks in feet.
+- Lean thinks in a tilted body over planted feet.
+- Dance thinks in recorded servo ticks.
+
+All three finish as “go to these pulses in this much time.” None of them owns a clock that starts and stops softly. The ROS action that *looks* like a textbook trajectory (`FollowJointTrajectory`) throws away the velocity and acceleration the book would have sent. It is the costume of Chapter 9 on the body of the same duration field.
+
+If you later write C++ from the book, the missing piece is that clock — a gentle time law inside the twenty-millisecond loop — not a new kind of foot shape, and not a rewrite of the dance files. Those files will never be Chapter 9 trajectories until duration stops being the whole timing law.
+
+---
+
 Notation in this file is plain Markdown (backticks + `text` fences), not LaTeX. Book names:
 
 | Here | Book | Meaning |
