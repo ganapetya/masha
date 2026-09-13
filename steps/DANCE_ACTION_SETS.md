@@ -97,6 +97,27 @@ ros2 topic pub --once /controller/traveling kinematics_msgs/msg/Traveling \
 ```
 
 3. Slim ROS may stay up. The editor, on start, publishes `/ros_robot_controller/enable_reception false` so the ROS serial node **stops parsing** `/dev/ttyACM0`, then the Qt process talks to the STM32 itself. On **Quit** it turns reception back on.
+
+   That pause is why Foxglove **voltage** (`/ros_robot_controller/battery`) and IMU go blank while the editor is open. `info/monitor.sh` (`foxglove_bridge`) is still fine; the board node is just not publishing. Do **not** publish `enable_reception true` until you Quit the editor — that would fight for the serial bus. After Quit, millivolts return on their own. If they do not:
+
+   ```bash
+   ros2 topic pub --once /ros_robot_controller/enable_reception std_msgs/Bool "{data: true}"
+   ros2 topic echo /ros_robot_controller/battery --once
+   ```
+
+   **No ROS/Foxglove voltage meter during the action-set session.** What exists instead:
+
+   | Source | Pack voltage? | Use while editor is open? |
+   |---|---|---|
+   | `/ros_robot_controller/battery` + Foxglove | Yes (mV) | **No** — paused |
+   | `info/battery.sh` | Same topic | **No** |
+   | ActionSet editor window | SDK can read it; **UI does not show it** | Not today |
+   | `servo_tool` “Current voltage” | One **servo VIN**, not the pack gauge | **No** — second serial owner |
+   | Jetson INA3221 (`VDD_IN` ~5.1 V) | **No** — module rails | Ignore |
+   | OLED | SSID/IP at boot, not live volts | No |
+   | Hand multimeter on the pack | Yes | **Yes** — only independent meter |
+
+   Practical rule: note the last Foxglove millivolt **before** opening the editor. If servos go weak or the board beeps/browns out, stop and charge. Do not open `servo_tool` next to the editor. A live mV label *inside* the ActionSet UI is possible later (same `Board.get_battery()` the editor already owns); it is not wired today.
 4. Do **not** run Nav2, `perform_actions`, or another `.d6a` player at the same time as the editor.
 5. Do **not** click **Manual** until you are supporting the body. Manual unloads **all 24** servos. She will collapse.
 6. **Reset servo** sends every ID to pulse 500 in 1 s. That is not a stand pose. Avoid it.
@@ -106,15 +127,41 @@ ros2 topic pub --once /controller/traveling kinematics_msgs/msg/Traveling \
 
 ## 5. Launch the UI
 
-Desktop icon **ROSpider**, or:
+This is a **PyQt5 X11** app (`xcb` plugin). It needs Masha’s GNOME desktop, not an SSH TTY.
+
+Boot starts GDM → autologin `ubuntu` → GNOME on **X11 display `:0`** (HDMI dummy plug). NoMachine (`:4000`) is the remote view of that desktop. SSH has empty `DISPLAY`; that is why a bare `zsh …/actionset_editor.sh` dies with `could not connect to display` / `Could not load the Qt platform plugin "xcb"`.
+
+**Use `xcb`.** Do **not** set `QT_QPA_PLATFORM` to `offscreen` (no window), `linuxfb` / `eglfs` (steal the framebuffer from GNOME), or Qt’s `vnc` plugin (we already have NoMachine).
+
+### Way that always has a display (preferred)
+
+On the **GNOME / NoMachine desktop**, double-click **ROSpider**. That session already has `DISPLAY=:0`. Then click **English**.
+
+### From SSH (window still appears on `:0`, visible in NoMachine)
 
 ```bash
+export DISPLAY=:0
+export XAUTHORITY=/run/user/1000/gdm/Xauthority
+# optional: confirm X is up
+# xdpyinfo >/dev/null && echo display-ok
+
 zsh ~/software/actionset_editor/actionset_editor.sh
 ```
 
-That is `python3 ~/software/actionset_editor/main.py`. Click **English** (radio). Chinese labels are listed below only so a leftover 中文 button is still findable.
+Leave those two `export`s in that SSH shell. The script itself is only `source ~/.zshrc` + `python3 …/main.py`; it does not set `DISPLAY`.
 
-Code: `~/software/actionset_editor/main.py`, layout `Ui.py`. Action files directory is hardcoded next to the script: `…/actionset_editor/ActionGroups/`.
+If NoMachine is connected to the physical session, the window shows there. If you are not looking at `:0`, you will not see it even though it started.
+
+### What not to do
+
+| Attempt | Result |
+|---|---|
+| SSH with no `DISPLAY` | The error you hit |
+| `QT_QPA_PLATFORM=offscreen` | Process starts, no UI, cannot pose legs |
+| `QT_QPA_PLATFORM=linuxfb` or `eglfs` | Fights GNOME on the dummy HDMI |
+| Reinstall Qt because of this message | Wrong fix; the plugin is already installed |
+
+Code: `~/software/actionset_editor/main.py`, layout `Ui.py`. Action files directory is hardcoded next to the script: `…/actionset_editor/ActionGroups/`. Chinese labels below are only so a leftover 中文 button is still findable.
 
 ---
 
