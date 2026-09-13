@@ -3,7 +3,8 @@
 **Status:** plan only. Do **not** implement the node until Peter asks.  
 **Syllabus (Gemini):** [`quarter-01-sprint-03-guru-source.md`](quarter-01-sprint-03-guru-source.md)  
 **This memo:** how that syllabus maps onto Masha as she actually runs (Jetson Orin NX, ROS 2 Humble, `proud_up`, sherpa-onnx, bus servos).  
-**Start date:** 2026-09-12
+**Start date:** 2026-09-12  
+**Day order (Peter, 2026-09-13):** Step 1 **Day 3 and Day 4 are swapped.** Today is the ActionSet dance (`master_dance.d6a`), not ASR. Voice wiring + `master_response.wav` move to Day 4. Gemini’s syllabus file is unchanged; this memo is the calendar we run.
 
 ## Goal
 
@@ -220,21 +221,23 @@ Jacobian / \(\det(J)\) is a notebook check, not a live servo loop this week.
 
 Start `zmp.cpp`: cart-table, hull, point-in-polygon, gtest with synthetic feet.
 
-### Day 3 — ASR wiring
+### Day 3 — ActionSet dance (was Day 4)
+
+Read **[`DANCE_ACTION_SETS.md`](DANCE_ACTION_SETS.md)** (same folder). That is the Day 3 text: Qt editor, `.d6a` schema, bus IDs, Manual + Read angle, safety.
+
+Peter authors an **energetic** `master_dance.d6a` in Qt `~/software/actionset_editor` (Desktop **ROSpider**). Save under `ActionGroups/`. Do **not** overwrite `twist` / `init`. grok-build coaches the UI (Manual + Read angle vs sliders + Add action) and inspects the SQLite after save.
+
+Do not reimplement IK in C++; vendor `kinematics.so` already feeds gait. Action groups are pulse sequences for the bus servos. No wav, no ASR, no C++ node on this day.
+
+### Day 4 — ASR wiring (was Day 3)
 
 Confirm existing voice: `ros2 launch xf_mic_asr_offline startup_test.launch.py` (or boot with `BRINGUP_VOICE=true`). Debug: `/tmp/masha-asr.log`.
 
 Edit `asr_node.py` `extract_command` / `COMMAND_PHRASES` so the master query publishes `who is your master`.
 
-Scaffold `masha_interaction_node` in `proud_up` that only subscribes to `/asr_node/voice_words` and logs.
+Scaffold `masha_interaction_node` in `proud_up` that only subscribes to `/asr_node/voice_words` and logs. Record `master_response.wav` on this day (not on Day 3). Optional dry-run `RunActionSet` publisher.
 
 Do not change `ASR_MODE` / `MIC_TYPE` in `.typerc`.
-
-### Day 4 — ActionSet + wav
-
-Peter: Qt `~/software/actionset_editor`, save **energetic** `master_dance.d6a` under `ActionGroups/`. grok-build: `RunActionSet` publisher (dry-run log first if needed). Record `master_response.wav`.
-
-Do not reimplement IK in C++; vendor `kinematics.so` already feeds gait. Action groups are pulse sequences for the bus servos.
 
 ### Day 5 — state machine
 
@@ -301,9 +304,42 @@ We write that map. We do **not** call `kinematics.set_step_mode(..., gait=5, ...
 
 **Support constraint (the actual “special” contract):** at every \(\varphi\), at least three feet are down and their triangle contains the CoM projection (static) / ZMP (Step 1 estimator, still running). That is how a gait stays a gait instead of becoming another dance.
 
-**Default character (Peter can retune):** a **follow bounce** — tripod grouping (swing A = LF, LR, RM; swing B = LM, RR, RF) with extra stance compression and a higher lift than voice walk (`height` start 25–30 mm, `period` ~0.8 s, `vx` cap 0.05 m/s). It should look different from `gait=2` at a glance (body bob) and still be omnidirectional enough to turn toward the person (`wz` from YOLO yaw error). If Peter wants crab, wave, or high-step instead, change the map, not the ROS wiring.
+**Default character (Peter can retune):** a **follow bounce** — tripod grouping (swing A = LF, LR, RM; swing B = LM, RR, RF) with extra stance compression and a higher lift than voice walk (`height` start 25–30 mm, `period` start ~0.6–0.8 s, `vx` cap 0.05 m/s). It should look different from `gait=2` at a glance (body bob) and still be omnidirectional enough to turn toward the person (`wz` from YOLO yaw error). If Peter wants crab, wave, or high-step instead, change the map, not the ROS wiring.
+
+**Quintic on the swing, not on the whole cycle (Peter, 2026-09-13; corrected same day):** Chapter 9 rest-to-rest quintic (`s-dot = 0` at both ends of the **whole** step) is the right clock for “go there and stop.” It is the **wrong** clock for walking. Repeating it is slow–fast–slow–**stop**, then again: a lurch, not a gait. The body never rests between steps in a natural walk; only the **foot in the air** should leave and land gently.
+
+Two clocks, two jobs:
+
+| Clock | What it times | Law | Why |
+|---|---|---|---|
+| **Cycle** (the walk) | Phase around the whole tripod period | Keep rolling. Nearly constant phase rate. Does **not** go to zero at wrap. | Body and stance feet keep sliding. Cadence can be short; motion stays continuous. |
+| **Swing** (one foot’s air time) | Progress along that foot’s arch, `sigma` in `[0, 1]` | Quintic: leave and land with zero speed and zero acceleration of `sigma`. | Kiss the floor. No stomp. No yank when the foot becomes stance. |
+
+```text
+sigma(tau) = 10*tau^3 - 15*tau^4 + 6*tau^5     # tau = t_swing / T_swing
+# only while that foot is in the air
+# stance feet: body-frame retraction at roughly steady speed (no rest)
+```
+
+Beads analogy: the **necklace keeps turning** at a steady rate. We only re-space beads **on the flying stretch** of each foot — packed at lift-off and touchdown, spread at the top of the arch. We do **not** pack beads at the join between two walking cycles; that join must not be a stop.
+
+Chassis jerk is fixed by that landing (and by matching swing speed into stance speed), not by pausing the body. Do **not** apply this quintic to `.d6a` playback. Do **not** ease by sleeping extra in the 20 ms loop. Do **not** zero the cycle clock at wrap.
 
 C++ math lives in `proud_up` like ZMP: `include/proud_up/follow_gait.hpp` + `src/follow_gait.cpp` (no rclcpp) + `test/test_follow_gait.cpp`. Python generator copies the same formulas; comments in `move.py` point at the header. Do not invent a second IK.
+
+### What we skip in `kinematics.so` (and what we keep)
+
+The `.so` is two tools in one blob. Sprint 3 Step 2 **skips the gait engine**, not the whole library.
+
+| Call | What it is | Step 2 |
+|---|---|---|
+| `set_step_mode` / `cmd_vel_new_point` / AEP-PEP | Vendor **gait sampler** (ellipse / parabola, linear clock) | **Skip.** `gait=5` must never enter these. Closed-source; cannot add a mode. |
+| `set_leg_position(leg, xyz)` | Vendor **one-leg IK** (foot in mm → 3 joint radians) | **Keep.** Our generator emits six foot tips; `StepController.set_pose_base` already calls this every tick. |
+| `transform_pose` | Planted-foot body lean | Not the follow gait. Leave it alone. |
+
+Yes: Masha allows our own gait. The 20 ms loop does not require the vendor curve. It only requires a tuple of six foot positions, then IK, then pulses. That is the injection point above (`FollowGaitGenerator`).
+
+No: do **not** skip the whole `.so` this sprint. Replacing IK means a second 18-servo solver, calibration, and servo-id map — out of scope (Day 3 already: do not reimplement IK). Do **not** drive legs from C++ via `/controller/set_leg_absolute`. Do **not** rebuild `kinematics.so`.
 
 ### Vision (reuse, do not relaunch)
 
@@ -327,20 +363,22 @@ Keep the Step 1 estimator running in `FOLLOW`. Abort: `gait=-2` if `zmp_inside` 
 
 ### Step 2 days (1 hr/day, only after Day 7)
 
-#### Day 8 — gait map on paper + gtest
+#### Day 8 — gait map + swing quintic on paper + gtest
 
-Write `follow_gait.hpp`: phase, stride, height, vx, wz → six feet. Invariants in `test_follow_gait.cpp`:
+Write `follow_gait.hpp`: (1) spatial map: phase, stride, height, vx, wz → six feet; (2) quintic `sigma(t)` on **swing only**; cycle phase keeps rolling. Invariants in `test_follow_gait.cpp`:
 
 - At \(\varphi = 0\) and \(\varphi = \pi\), the stance triangle is the tripod group that is supposed to be down.
 - CoM projection (equal masses ok in the unit test) is inside that triangle.
 - `vx > 0` moves swing feet toward \(+X\); `wz > 0` rotates the AEP/PEP the correct way.
 - No foot \(z\) above the contact band while marked stance.
+- Swing quintic: at lift-off and touchdown, that foot’s `z-dot` and `sigma-dot` are ~0. Beads on the arch cluster at the ground ends, not at cycle wrap.
+- Two cycles concatenated: **body / stance speed at the join is not ~0** (no rest-to-rest walk). A test that wants zero cycle-end `s-dot` is the wrong test.
 
-No robot motion yet.
+No robot motion yet. Reading: `ros2_ws/info/TRAJECTORY.MD` (vendor metronome vs this clock).
 
 #### Day 9 — generator hook
 
-`FollowGaitGenerator` in `move.py`. `StepController.set_step_mode_base`: `gait == 5` → that generator, **never** `kinematics.set_step_mode`. `cmd_vel` with `cmd_gait == 5` uses it. Dry-run: `ros2 topic pub` Traveling `gait: 5` in place (`stride: 0`) and confirm legs cycle without translating, then halt `-2`.
+`FollowGaitGenerator` in `move.py`. `StepController.set_step_mode_base`: `gait == 5` → that generator, **never** `kinematics.set_step_mode`. `cmd_vel` with `cmd_gait == 5` uses it. Precompute one cycle’s beads: even in **phase**, quintic along each **swing**. Yield one bead per 20 ms. Dry-run: `ros2 topic pub` Traveling `gait: 5` in place (`stride: 0`) — legs cycle, no translation, landings look soft, the body does **not** pause at wrap — then halt `-2`.
 
 #### Day 10 — ASK / WAIT_YES
 
@@ -369,9 +407,9 @@ Wire Sprint 2 detector into the interaction node. Yes → `gait=5` + `cmd_vel` f
 
 **Edit:** `proud_up/CMakeLists.txt` (executable, `zmp` lib, Step 2 `follow_gait` lib, gtest, `tf2_ros`, `tf2_geometry_msgs`, `kinematics_msgs`, `interfaces`, `std_msgs`), `proud_up/package.xml`.
 
-**Voice:** `xf_mic_asr_offline/scripts/asr_node.py` (master-query aliases on Day 3; `yes`/`no` aliases on Day 10); wavs `feedback_voice/english/master_response.wav` and (Step 2) `follow_offer.wav`.
+**Voice:** `xf_mic_asr_offline/scripts/asr_node.py` (master-query aliases on **Day 4**; `yes`/`no` aliases on Day 10); wavs `feedback_voice/english/master_response.wav` (Day 4) and (Step 2) `follow_offer.wav`.
 
-**Dance:** `software/actionset_editor/ActionGroups/master_dance.d6a` (Peter).
+**Dance:** `software/actionset_editor/ActionGroups/master_dance.d6a` (Peter, **Day 3**).
 
 **Gait hook (Step 2 only):** `driver/controller/controller/move.py` (`FollowGaitGenerator`), `step_controller.py` (branch `gait == 5` / `cmd_gait == 5`). Do not rebuild `kinematics.so`. Do not pass `gait=5` into `set_step_mode`.
 
@@ -390,6 +428,9 @@ Do not edit vendor `app/`, `peripherals` Python, or bringup unless a launch incl
 - Full multi-body ZMP with measured ground-reaction (cart-table + TF feet is this week)
 - Training a new YOLO / cat detector (Step 2 **reuses** Sprint 2 person YOLO; it does not train)
 - A third gait inside `kinematics.so`
+- Replacing `kinematics.set_leg_position` (vendor IK) this sprint
+- Quintic time scaling of `.d6a` rows or extra sleeps in the 20 ms loop
+- Rest-to-rest quintic on the **whole** step cycle (that is point-to-point motion, not a gait)
 - Driving six legs from C++ via `/controller/set_leg_absolute` as the follow loop
 - Launching `follow_the_cat_node` next to `masha_interaction_node`
 - Starting Step 2 before Step 1 Day-7 DoD is green
@@ -411,6 +452,9 @@ Do not edit vendor `app/`, `peripherals` Python, or bringup unless a launch incl
 | She starts following during the dance | Gait generator started before `/action_complete` | ASK only after Bool true; halt `-2` is already done before DANCE |
 | “Yes” walks her anytime after Hello | `yes` accepted outside `WAIT_YES`, or `voice_control_move` unmatched / `come here` | Ignore list; interaction node phase-gates `yes` |
 | Follow looks like ordinary tripod | `gait=5` fell through to `set_step_mode` | Branch in `set_step_mode_base`; never call the `.so` with 5 |
+| Chassis jerks at each new step | Vendor-style even beads on the swing (stomp), or rest-to-rest quintic on the whole cycle (lurch-pause) | Quintic on swing only; cycle phase keeps rolling |
+| Walk looks like stop-and-go | Quintic applied to the **whole** period (`s-dot=0` at wrap) | Zero the swing clock at the ground, never the cycle clock |
+| Follow IK wrong / legs fold | Reimplemented IK or skipped `set_leg_position` | Keep vendor IK; only skip `set_step_mode` |
 | Two robots in one body | `follow_the_cat_node` also publishing `cmd_vel` | One node. Reuse the header, do not launch the Sprint 2 executable |
 
 ## After the week
@@ -441,8 +485,10 @@ Do not write `quarter-01-week-03-result.md` under the old week-3 (camera extrins
 - [ ] After /action_complete true, spoken “Do you want I follow you?”
 - [ ] “Yes” starts follow; “No” / timeout / “stop” halt to gait=-2
 - [ ] Follow uses gait=5 generator (not twist.d6a, not kinematics.set_step_mode(..., 5))
+- [ ] Quintic on **swing only**; gtest shows soft lift-off/touchdown and **no** rest between cycles
 - [ ] YOLO person (Sprint 2 lib, same node) steers cmd_vel; lost track halts
 - [ ] gtest test_follow_gait: stance triangle contains CoM at φ=0 and φ=π
+- [ ] Live: landings do not stomp; wrap does not pause the body (not a lurch-pause-lurch walk)
 - [ ] ZMP stayed inside during follow
 
 ## Tests
