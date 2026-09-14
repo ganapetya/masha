@@ -1,3 +1,11 @@
+# Launch the stage manager only. Do not start a second asr_node from here —
+# that would steal the USB microphone. Voice (ASR + walk / twist) is already
+# up after a normal boot, or from xf_mic_asr_offline/startup_test.launch.py.
+#
+# A launch file is a recipe: "run this executable, with this YAML, under
+# this name". ROS 2 Humble reads generate_launch_description() and builds
+# a LaunchDescription from the list we return.
+
 import os
 
 from ament_index_python.packages import get_package_share_directory
@@ -8,6 +16,8 @@ from launch_ros.actions import Node
 
 
 def _launch_setup(context, *args, **kwargs):
+    # OpaqueFunction runs after substitutions are resolved, so params_file
+    # is a real path here rather than a LaunchConfiguration object.
     params_file = LaunchConfiguration('params_file').perform(context)
     node = Node(
         package='proud_up',

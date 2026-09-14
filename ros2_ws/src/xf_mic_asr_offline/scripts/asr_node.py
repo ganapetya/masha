@@ -454,6 +454,8 @@ class ASRNode(Node):
         # The master sequence speaks a line then dances with music (~20 s).
         # The USB mic hears that speaker; a short ignore window would let
         # sherpa hallucinate "go forward" from the track and steal the legs.
+        # Hardcoded seconds, not a ROS parameter. The clock starts when
+        # this command is accepted, not when the dance music later stops.
         if cmd == 'stop':
             ignore = 0.8
         elif cmd == MASTER_COMMAND:

@@ -1,14 +1,21 @@
+# Parameters for masha_interaction_node. Launch loads this file as-is.
+# Keys must match declare_parameter() in masha_interaction_node.cpp.
 masha_interaction_node:
   ros__parameters:
     asr_topic: /asr_node/voice_words
     traveling_topic: /controller/traveling
     cmd_vel_topic: /controller/cmd_vel
     run_actionset_topic: /controller/run_actionset
-    # ActionGroupController publishes on the controller node's relative
-    # "action_complete" → /controller/action_complete. /action_complete
-    # (absolute) is a different topic and stays quiet for .d6a playback.
-    action_complete_topic: /controller/action_complete
 
+    # ActionGroupController writes false-then-true through MoveController's
+    # publisher create_publisher(Bool, 'action_complete', 1).
+    # In ROS 2 a name without ~ is relative to the *namespace* (here "/"),
+    # not the node name. Live topic: /action_complete.
+    # ~/run_actionset (with tilde) is the private form → /controller/run_actionset.
+    # /controller/action_complete is a different street and stays empty.
+    action_complete_topic: /action_complete
+
+    # Basename of the .d6a, no folder, no ".d6a". Not dance_1 / stop.
     action_name: master_dance
     master_response_mp3: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/master_response.mp3
     music_mp3: /home/ubuntu/ros2_ws/src/proud_up/sounds/master_dance.mp3
@@ -16,5 +23,5 @@ masha_interaction_node:
 
     halt_wait_s: 0.4
     speak_timeout_s: 8.0
-    # master_dance.d6a is 13.5 s; margin covers a slow first row.
+    # master_dance.d6a is 25 rows, 14.3 s. This is a backstop, not a sleep.
     dance_timeout_s: 16.5

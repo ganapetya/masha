@@ -1,3 +1,11 @@
+// gtest for interaction_phrases.hpp. No ROS node is spun: the header is
+// plain C++, so we can check the ear in isolation.
+//
+// Run from the workspace after a build:
+//   colcon test --packages-select proud_up --event-handlers console_direct+
+// or the binary:
+//   ./build/proud_up/test_interaction_phrases
+
 #include <gtest/gtest.h>
 
 #include "proud_up/interaction_phrases.hpp"

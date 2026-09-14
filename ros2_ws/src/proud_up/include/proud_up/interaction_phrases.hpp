@@ -3,11 +3,14 @@
 // Phrase matching for masha_interaction_node. No rclcpp — gtest includes
 // this header and checks the aliases without spinning a node.
 //
-// ASR (asr_node.py extract_command) already maps many spellings onto the
-// canonical string "who is your master" and publishes that on
-// /asr_node/voice_words. This matcher still accepts the raw-ish forms in
-// case a future path publishes the transcript instead of the canonical
-// command. Keep the alias list in sync with COMMAND_PHRASES in asr_node.py.
+// Think of this as a small ear that only knows two things: the master
+// question, and the word "stop". The real ear is asr_node.py. That node
+// already maps many spellings onto the canonical string
+// "who is your master" and publishes that on /asr_node/voice_words.
+// We still accept the raw-ish forms here in case a future path publishes
+// the transcript instead of the canonical command.
+//
+// Keep kMasterAliases in sync with COMMAND_PHRASES in asr_node.py.
 
 #include <cctype>
 #include <string>
@@ -18,10 +21,13 @@ namespace proud_up {
 inline constexpr const char *kMasterQueryCanonical = "who is your master";
 inline constexpr const char *kStopCanonical = "stop";
 
-// Same normalisation as asr_node.extract_command: lower case, every
-// non-alphanumeric byte becomes a space, runs of spaces collapse. Apostrophes
-// disappear, so "who's" → "who s". That is why kMasterAliases includes
-// "who s your master".
+// Same washing as asr_node.extract_command: lower case, every
+// non-letter-or-digit byte becomes a space, runs of spaces collapse.
+// Apostrophes disappear, so "who's" becomes "who s". That is why
+// kMasterAliases includes "who s your master".
+//
+// string_view is a window onto someone else's string. We do not copy
+// the incoming text until we build `out`.
 inline std::string normalize_speech(std::string_view raw) {
   std::string out;
   out.reserve(raw.size());
@@ -49,10 +55,11 @@ inline bool is_master_query(std::string_view raw) {
   if (n.empty()) {
     return false;
   }
-  // Substring, not token-equality: "masha who is your master" must match.
-  // Longer / more specific aliases are listed first only for readability;
-  // find() does not care about order as long as no alias is a substring of
-  // an unrelated command (none of these appear in "go forward" / "dance").
+  // Substring, not whole-string equality: "masha who is your master"
+  // must match. The leading name is address, not a new wake word.
+  // find() does not care about list order as long as no alias is a
+  // substring of an unrelated command (none of these appear in
+  // "go forward" / "dance").
   static constexpr const char *kMasterAliases[] = {
       "who is your master", "who is ur master", "whose your master",
       "who s your master",  "who your master",
@@ -73,8 +80,8 @@ inline bool is_stop_command(std::string_view raw) {
   if (n == kStopCanonical) {
     return true;
   }
-  // Word-boundary "stop" so "unstoppable" would not fire. ASR publishes the
-  // canonical "stop"; this only helps if a raw transcript leaks through.
+  // Word-boundary "stop" so "unstoppable" would not fire. ASR publishes
+  // the canonical "stop"; this only helps if a raw transcript leaks through.
   if (n.size() >= 4 && n.compare(0, 5, "stop ") == 0) {
     return true;
   }

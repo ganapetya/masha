@@ -76,6 +76,9 @@ target_link_libraries(proud_up_node
   ${OpenCV_LIBS}
 )
 
+# Stage manager: "who is your master" → spoken line → master_dance.d6a.
+# Header-only phrases live in include/proud_up/interaction_phrases.hpp
+# (no extra library; the node and the gtest both include it).
 add_executable(masha_interaction_node src/masha_interaction_node.cpp)
 target_include_directories(masha_interaction_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

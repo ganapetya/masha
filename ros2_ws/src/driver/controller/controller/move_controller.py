@@ -39,6 +39,14 @@ class MoveController(Node):
 
         # 控制器初始化
         self.step_controller = step_controller.StepController()
+        # ROS 2 name lesson (this is the mailbox the C++ dance node waits on):
+        #   'action_complete'  →  /action_complete
+        #       no tilde, namespace is "/", so the node name is *not* in the path
+        #   '~/run_actionset'  →  /controller/run_actionset
+        #       tilde means private: namespace + node name + topic
+        # ActionGroupController publishes false (running) then true (finished)
+        # on this publisher. masha_interaction_node must subscribe here, not
+        # to /controller/action_complete (that street is empty).
         self.status_pub = self.create_publisher(Bool, 'action_complete', 1)
         self.agc = ActionGroupController(self.create_publisher(ServosPosition, 'servo_controller', 1), '/home/ubuntu/software/actionset_editor/ActionGroups',self.status_pub)
 
@@ -68,7 +76,9 @@ class MoveController(Node):
         self.create_subscription(Traveling, '~/traveling', self.set_traveling_callback, 1)
          # 通过线速度、角速度控制机器人的移动，其他参数由上一次执行的 gait大于0的traveling来指定
         self.create_subscription(Twist, '~/cmd_vel', self.cmd_vel_callback, 1)  
-        # 机器人动作组运行服务
+        # Action-group cue. This is a *topic* (postcard), not a service.
+        # Type: interfaces/msg/RunActionSet (action_path, interrupt).
+        # ~/run_actionset → /controller/run_actionset because of the tilde.
         self.create_subscription(RunActionSet, '~/run_actionset', self.run_actionset_callback, 1)
         # 机器人姿态设置服务
         self.create_service(SetPose1, '~/set_pose_1', self.set_pose1_callback, callback_group=timer_cb_group)
@@ -156,6 +166,10 @@ class MoveController(Node):
                     relative_height=msg.relative_height)
 
             else:
+                # gait > 0 walks. gait 0 stops the stepping loop.
+                # gait -2 is the stand (DEFAULT_POSE) — this is the halt
+                # masha_interaction_node and voice already use. A zero Twist
+                # on cmd_vel is *not* a stand; it starts a generator at speed 0.
                 if msg.gait == 0:     
                           
                     self.step_controller.stop_running(
@@ -197,6 +211,13 @@ class MoveController(Node):
         return response
 
     def run_actionset_callback(self, msg: RunActionSet):
+        # action_path is the basename of a .d6a under
+        # /home/ubuntu/software/actionset_editor/ActionGroups
+        # (no folder, no ".d6a"). Three reserved names are not files:
+        #   stop     — halt the current group, then play init_pose
+        #   dance_1 / dance_2 / dance_3 — forwarded to perform_actions
+        # Everything else, including master_dance, starts a thread that
+        # reads the SQLite piano-roll and publishes servo pulses.
         file_path = msg.action_path 
         
         msg = RunActionSet()

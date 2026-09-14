@@ -8,6 +8,13 @@ from std_msgs.msg import Bool
 from servo_controller_msgs.msg import ServosPosition, ServoPosition
 
 class ActionGroupController:
+    """Play a .d6a action group: a SQLite piano-roll of servo pulses.
+
+    MoveController hands us status_pub (topic /action_complete). We write
+    false when the roll starts and true when the cursor runs off the end.
+    masha_interaction_node waits for that false-then-true before it kills
+    the dance music. This is not a gait and not IK — just pulses in time.
+    """
     running_action = False
     stop_running = False
     def __init__(self, pub, action_path, status_pub=None):

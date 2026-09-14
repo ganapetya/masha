@@ -35,7 +35,7 @@ def play(voice, volume=80, language='Chinese'):
                     ['aplay', '-q', '-D', device, path],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    timeout=3,
+                    timeout=3,  # clips anything longer; the C++ node does not use this
                     check=False,
                 )
                 if result.returncode == 0:

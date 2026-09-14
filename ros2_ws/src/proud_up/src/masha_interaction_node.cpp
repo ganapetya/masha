@@ -1,29 +1,71 @@
-// masha_interaction_node — Sprint 3 slice: master query → spoken line → dance.
+// masha_interaction_node — one conversation, then a dance.
 //
-// Live sequence (wake is still Hello/Hi/Shalom Masha in asr_node):
+// Imagine a small theatre. Someone in the dark says "who is your master".
+// Masha answers with a recorded line, then a piano-roll of servo pulses
+// (the action group master_dance.d6a) turns her body while music fills
+// the room. When the roll ends, the music stops and she waits again.
+//
+// This file is the stage manager. It does not hear the microphone
+// (that is asr_node.py). It does not walk (that is voice_control_move.py).
+// It does not move servos (that is MoveController + ActionGroupController).
+// It only listens for the right sentence, then cues halt, speech, dance,
+// and music in that order.
+//
+// The live path, as the code actually does it:
 //
 //   /asr_node/voice_words  "who is your master"
-//        → Traveling gait=-2  (DEFAULT_POSE; this is the halt, not a zero Twist)
-//        → play master_response.mp3
-//        → /controller/run_actionset  master_dance  +  dance music
-//        → wait /controller/action_complete true
-//        → stop music, back to Idle
+//        → Idle is listening. A match is logged as IDENTIFY, then we
+//          enter Halt. IDENTIFY is a log line, not its own phase.
+//        → Halt: zero /controller/cmd_vel, then Traveling gait=0,
+//          then Traveling gait=-2 (DEFAULT_POSE, the real stand).
+//          Wait halt_wait_s (0.4 s) so the stand can begin.
+//        → Speak: play master_response.mp3 on a worker thread.
+//          No spoken file → no dance. We go back to Idle.
+//        → Dance: postcard on /controller/run_actionset
+//          (action_path=master_dance, interrupt=true) and start music
+//          in the same breath.
+//        → Wait until /action_complete has gone false (the roll is
+//          running) and then true (the roll finished) — or until
+//          dance_timeout_s, or until someone says "stop".
+//        → Stop the music, back to Idle.
 //
-// /controller/run_actionset is a *topic* (interfaces/msg/RunActionSet), not a
-// service. Gemini’s syllabus named yahboomcar_msgs::srv::RunActionSet; that
-// package does not exist on this robot.
+// A ROS *topic* is a postcard: you publish and whoever is listening may
+// pick it up. A *service* is a registered letter: you wait for a reply.
+// /controller/run_actionset is a postcard (interfaces/msg/RunActionSet).
+// There is no RunActionSet service on this robot. An older syllabus
+// named yahboomcar_msgs::srv::RunActionSet; that package is not here.
 //
-// Threads. Two mutually exclusive callback groups on a MultiThreadedExecutor:
-//   1. Speech / action_complete callbacks only store under mutex_ and return.
-//      aplay on this thread would stall DDS the way it used to freeze ASR.
-//   2. tick() runs the phase machine, publishes halt / RunActionSet, and
-//      starts/stops the audio worker.
-// Audio is a dedicated std::thread that posix_spawn's aplay (or ffplay).
-// We do not fork() — this process is multithreaded; fork would duplicate
-// only one thread and can deadlock on libc locks.
+// Why the completion postcard is /action_complete, not
+// /controller/action_complete:
+//   MoveController is a node named "controller". In ROS 2 a name with a
+//   leading ~ (tilde) is private: ~/run_actionset becomes
+//   /controller/run_actionset. A name *without* the tilde is only
+//   relative to the namespace, which here is "/". So the publisher
+//     create_publisher(Bool, 'action_complete', 1)
+//   lands on /action_complete. That is the mailbox ActionGroupController
+//   writes false (running) then true (finished) into. Live
+//   `ros2 topic list` on Masha shows /action_complete and does not show
+//   /controller/action_complete. We used to listen on the empty street.
 //
-// ASK / WAIT_YES / FOLLOW / ZMP are later Sprint 3 phases. The enum is
-// shaped so they can be added; they are not wired here.
+// Threads — two rooms, one key, and a musician in the hall.
+//   A MultiThreadedExecutor can run more than one callback at once.
+//   We give speech and the 50 ms clock two separate "rooms"
+//   (callback groups) that do not let two of their own callbacks in
+//   together.
+//     1. The speech room only writes a note (phase, abort, flags)
+//        under mutex_ and leaves. Playing a sound here would freeze
+//        the house the way aplay on the listen thread used to freeze
+//        the microphone.
+//     2. The clock room (tick) reads the note, then publishes halt
+//        or the dance, and starts or stops the player.
+//   The musician is a std::thread that posix_spawn's aplay (or ffplay).
+//   We do not fork(). This process already has several threads; fork
+//   would copy only the one that called it, and the others might be
+//   holding locks. The copy would wait forever for a key that lives
+//   in a room that was not copied.
+//
+// ASK / WAIT_YES / FOLLOW / ZMP are later Sprint 3 figures. The enum
+// has a place to hang them; they are not wired here.
 
 #include <atomic>
 #include <chrono>
@@ -49,19 +91,25 @@
 
 #include "proud_up/interaction_phrases.hpp"
 
+// The environment pointer the OS already keeps for this process.
+// posix_spawn needs it so aplay inherits PATH, Pulse, and the rest.
 extern char **environ;
 
+// Lets us write 50ms, 80ms instead of std::chrono::milliseconds(50).
 using namespace std::chrono_literals;
 
 namespace proud_up {
 namespace {
 
-// posix_spawn, not fork: see the file header. SETPGROUP so stop() can
-// killpg() aplay and any helper it started (ffplay sometimes has children).
+// Start a helper program (ffmpeg, aplay, ffplay) as its own process.
+// SETPGROUP puts it in a new process group so stop() can kill the
+// whole family with one signal — ffplay sometimes has children.
 pid_t spawn_argv(const std::vector<std::string> &args) {
   if (args.empty()) {
     return -1;
   }
+  // posix_spawn wants a C array of char* ending in nullptr.
+  // c_str() is the bytes inside each std::string; we do not copy them.
   std::vector<char *> argv;
   argv.reserve(args.size() + 1);
   for (const auto &a : args) {
@@ -91,7 +139,8 @@ void kill_group(pid_t pid) {
   if (pid <= 0) {
     return;
   }
-  // Negative pid: the process group we set in posix_spawnattr_setpgroup.
+  // Negative pid to killpg: "the group we made in posix_spawnattr_setpgroup".
+  // Ask politely first (SIGTERM), then if the child is still there, SIGKILL.
   if (killpg(pid, SIGTERM) != 0) {
     kill(pid, SIGTERM);
   }
@@ -102,6 +151,9 @@ void kill_group(pid_t pid) {
   }
 }
 
+// Sit with a child until it exits, or we are told to stop, or time runs out.
+// WNOHANG means "peek, do not sleep in waitpid" — we sleep 20 ms ourselves
+// so we can notice stop_ in between peeks.
 bool wait_pid_until(pid_t pid, std::atomic<bool> *stop, double timeout_s) {
   const auto start = std::chrono::steady_clock::now();
   while (true) {
@@ -150,8 +202,11 @@ std::string wav_cache_path(const std::string &mp3) {
   return mp3.substr(0, dot) + ".wav";
 }
 
-// aplay cannot decode mp3. ffmpeg writes a wav next to the mp3; that wav
-// is a cache (sounds/.gitignore). Reconvert if the mp3 is newer.
+// aplay is a simple piano: it plays wav, not mp3. ffmpeg transcribes the
+// mp3 into a wav next to it the first time we need it, and again if the
+// mp3 is newer. The wav is a cache (sounds/.gitignore). We do this on
+// first play, inside the worker thread — not at node start, and not on
+// the ROS callback.
 bool ensure_wav_cache(const std::string &mp3, std::string *wav_out) {
   if (!file_exists(mp3)) {
     return false;
@@ -176,9 +231,15 @@ bool ensure_wav_cache(const std::string &mp3, std::string *wav_out) {
   return true;
 }
 
-// Worker-thread player. voice_play.py hard-timeouts aplay at 3 s — that
-// clips the spoken line and cannot run a 13.5 s dance track. This player
-// takes an explicit timeout (speak) or none (music, killed from the node).
+// The musician in the hall. voice_play.py kills aplay after 3 s — that
+// clips the spoken line and cannot run a ~14 s dance track. This player
+// takes an explicit timeout for speech, or none for music (the node
+// kills the child when the dance ends).
+//
+// atomic flags (stop_, running_, finished_, pid_) are notes the ROS
+// thread and this thread can both read without taking mutex_. A mutex
+// is a key to a drawer; an atomic is a single light switch that the
+// hardware lets two people flip safely.
 class AudioPlayer {
  public:
   ~AudioPlayer() { stop(); }
@@ -222,8 +283,10 @@ class AudioPlayer {
     const bool have_wav = ensure_wav_cache(mp3_, &wav);
     auto spawn_play = [&]() -> pid_t {
       if (have_wav) {
-        // Same device order as voice_play.py. pulse first: after reboot,
-        // plughw on the USB speaker can stall in the kernel.
+        // pulse only. After reboot, a raw USB device name can stall in
+        // the kernel. voice_play.py also tries "default" and a plughw
+        // card; this player does not. If pulse fails, we fall through
+        // to ffplay on the mp3 itself.
         return spawn_argv({"/usr/bin/aplay", "-q", "-D", "pulse", wav});
       }
       return spawn_argv({"/usr/bin/ffplay", "-nodisp", "-autoexit",
@@ -280,8 +343,14 @@ class AudioPlayer {
 
 }  // namespace
 
+// enum class: a typed list of names. Idle is not the number 0 in
+// disguise; you cannot accidentally add it to an int. The four
+// values below are the only figures this slice performs.
+// LISTEN in the memo is Idle. IDENTIFY is a log inside on_speech,
+// then we walk straight into Halt. There is no separate IDENTIFY
+// state, and Idle after the dance is the same Idle as before it.
 enum class Phase {
-  Idle,   // LISTEN
+  Idle,  // waiting for the master question, or for "stop"
   Halt,
   Speak,
   Dance,
@@ -305,6 +374,8 @@ const char *phase_cstr(Phase p) {
 class MashaInteractionNode : public rclcpp::Node {
  public:
   MashaInteractionNode() : Node("masha_interaction_node") {
+    // declare_parameter: if the launch YAML names the key, use that;
+    // otherwise use the default written here. Both should agree.
     asr_topic_ = declare_parameter<std::string>("asr_topic", "/asr_node/voice_words");
     traveling_topic_ =
         declare_parameter<std::string>("traveling_topic", "/controller/traveling");
@@ -312,7 +383,7 @@ class MashaInteractionNode : public rclcpp::Node {
     run_actionset_topic_ =
         declare_parameter<std::string>("run_actionset_topic", "/controller/run_actionset");
     action_complete_topic_ = declare_parameter<std::string>(
-        "action_complete_topic", "/controller/action_complete");
+        "action_complete_topic", "/action_complete");
     action_name_ = declare_parameter<std::string>("action_name", "master_dance");
     master_response_mp3_ = declare_parameter<std::string>(
         "master_response_mp3",
@@ -323,6 +394,8 @@ class MashaInteractionNode : public rclcpp::Node {
     music_loop_ = declare_parameter<bool>("music_loop", true);
     halt_wait_s_ = declare_parameter<double>("halt_wait_s", 0.4);
     speak_timeout_s_ = declare_parameter<double>("speak_timeout_s", 8.0);
+    // master_dance.d6a is 25 rows, 14.3 s. 16.5 s is a backstop, not
+    // a sleep that "is" the dance.
     dance_timeout_s_ = declare_parameter<double>("dance_timeout_s", 16.5);
 
     speech_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -334,6 +407,9 @@ class MashaInteractionNode : public rclcpp::Node {
     run_actionset_pub_ =
         create_publisher<interfaces::msg::RunActionSet>(run_actionset_topic_, 1);
 
+    // [this] on a lambda: when the postcard arrives, call a method on
+    // *this* node. ROS keeps the subscription alive because we store
+    // the SharedPtr (asr_sub_, complete_sub_) as a member.
     rclcpp::SubscriptionOptions speech_opts;
     speech_opts.callback_group = speech_cb_group_;
     asr_sub_ = create_subscription<std_msgs::msg::String>(
@@ -345,6 +421,9 @@ class MashaInteractionNode : public rclcpp::Node {
         [this](const std_msgs::msg::Bool::SharedPtr msg) { on_action_complete(msg); },
         speech_opts);
 
+    // Same "are you up?" doorbell the other proud_up nodes offer.
+    // ~/init_finish becomes /masha_interaction_node/init_finish.
+    // The reply's message field is the current phase name.
     init_finish_srv_ = create_service<std_srvs::srv::Trigger>(
         "~/init_finish",
         [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
@@ -386,7 +465,9 @@ class MashaInteractionNode : public rclcpp::Node {
   }
 
   void on_speech(const std_msgs::msg::String::SharedPtr msg) {
-    // Store and return. Matching is cheap; aplay is not done here.
+    // Store and return. Matching a string is cheap; aplay is not done here.
+    // lock_guard is RAII: the key (the mutex) is taken when lock is built
+    // and given back when we leave this function, even on an early return.
     const std::string &text = msg->data;
     std::lock_guard<std::mutex> lock(mutex_);
     if (is_stop_command(text) && (phase_ == Phase::Speak || phase_ == Phase::Dance ||
@@ -401,8 +482,9 @@ class MashaInteractionNode : public rclcpp::Node {
     if (!is_master_query(text)) {
       return;
     }
-    // IDENTIFY. Canonical from ASR is "who is your master"; aliases still
-    // match if a raw transcript ever arrives.
+    // IDENTIFY lives here, not as a Phase. ASR usually already published
+    // the canonical "who is your master"; aliases still match if a raw
+    // transcript ever arrives. Then we step into Halt.
     RCLCPP_INFO(get_logger(), "IDENTIFY %s (raw=%s)", kMasterQueryCanonical, text.c_str());
     phase_ = Phase::Halt;
     halt_sent_ = false;
@@ -417,13 +499,16 @@ class MashaInteractionNode : public rclcpp::Node {
     action_complete_ = msg->data;
     if (!msg->data) {
       // false = the .d6a thread is running. We must see this before we
-      // treat a later true as "this dance finished", otherwise a stale
-      // true from the previous group would end DANCE on the first tick.
+      // treat a later true as "this dance finished". Otherwise a leftover
+      // true from the previous group would end Dance on the first tick —
+      // clapping for a bow that already happened.
       saw_action_running_ = true;
     }
   }
 
   void tick() {
+    // Copy the note, drop the key, then act. Publishing while holding
+    // mutex_ would invite a deadlock if a callback needed the same key.
     Phase phase;
     bool abort;
     bool halt_sent;
@@ -504,6 +589,9 @@ class MashaInteractionNode : public rclcpp::Node {
   }
 
   void start_dance() {
+    // Postcard, not a letter. action_path is the basename of the .d6a
+    // (no ".d6a", no folder). Do not call this dance_1 / dance_2 /
+    // dance_3 / stop — MoveController treats those as other plays.
     interfaces::msg::RunActionSet msg;
     msg.action_path = action_name_;
     msg.interrupt = true;
@@ -537,8 +625,10 @@ class MashaInteractionNode : public rclcpp::Node {
     }
     player_.stop();
     if (abort) {
-      // action_path "stop" is special-cased in move_controller: halt the
-      // group then play init_pose. Do not name our dance stop / dance_1.
+      // action_path "stop" is a special word in MoveController:
+      // halt the group, then play init_pose. Speak-abort does not
+      // send this (the dance has not started). Halt-abort only
+      // returns to Idle.
       interfaces::msg::RunActionSet msg;
       msg.action_path = "stop";
       msg.interrupt = true;
@@ -549,7 +639,7 @@ class MashaInteractionNode : public rclcpp::Node {
     }
     if (elapsed_s() >= dance_timeout_s_ && !(saw_running && action_complete)) {
       RCLCPP_WARN(get_logger(),
-                  "dance timeout %.1f s (no /controller/action_complete true) — stopping music",
+                  "dance timeout %.1f s (no /action_complete true) — stopping music",
                   dance_timeout_s_);
     } else {
       RCLCPP_INFO(get_logger(), "dance complete — music stopped");
@@ -567,11 +657,17 @@ class MashaInteractionNode : public rclcpp::Node {
     phase_started_ = now();
   }
 
-  // gait=-2 snaps to DEFAULT_POSE and is the halt voice already uses.
-  // Zero Twist first so a leftover cmd_vel does not keep a generator;
-  // gait=-2 last so the stand wins if both arrive in one tick. A *lone*
-  // zero Twist would start CmdVelGenerator at vx=0 (in-place stepping) —
-  // that is why follow_the_cat refuses a zero Twist without Traveling.
+  // Standing still is not the same as walking at speed zero.
+  // /controller/cmd_vel always starts a gait generator, even when every
+  // number in the Twist is 0 — she would march in place. follow_the_cat
+  // therefore never sends a lone zero Twist. We still send one first, so
+  // a leftover walk from voice_control_move does not keep that generator
+  // alive, then we send the real halt:
+  //   gait 0  = stop the stepping loop
+  //   gait -2 = snap to DEFAULT_POSE (the stand voice already uses)
+  // gait=-2 last, so the stand wins if both postcards arrive in one tick.
+  // Traveling.msg also has steps, stride, and friends; we leave them at
+  // their zeros. interrupt=true means "drop what you were doing".
   void halt_legs() {
     geometry_msgs::msg::Twist zero;
     cmd_vel_pub_->publish(zero);
@@ -630,6 +726,9 @@ class MashaInteractionNode : public rclcpp::Node {
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<proud_up::MashaInteractionNode>();
+  // weak_ptr: a polite glance at the node without keeping it alive.
+  // If shutdown races with destruction, lock() returns empty and we
+  // do not call a dead object.
   std::weak_ptr<proud_up::MashaInteractionNode> weak = node;
   rclcpp::on_shutdown([weak]() {
     if (auto n = weak.lock()) {
@@ -637,6 +736,8 @@ int main(int argc, char **argv) {
     }
   });
 
+  // MultiThreadedExecutor: more than one callback may run at once,
+  // which is why the two rooms (callback groups) and the mutex exist.
   rclcpp::executors::MultiThreadedExecutor exec;
   exec.add_node(node);
   exec.spin();
