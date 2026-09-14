@@ -31,6 +31,8 @@ RECORD_DEVICES = (
     'plughw:CARD=XFMDPV0018,DEV=0',
     'hw:CARD=XFMDPV0018,DEV=0',
 )
+MASTER_COMMAND = 'who is your master'
+
 COMMAND_PHRASES = (
     ('go forwards', 'go forward'),
     ('go forward', 'go forward'),
@@ -59,6 +61,14 @@ COMMAND_PHRASES = (
     ('move right', 'move right'),
     ('come here', 'come here'),
     ('come over', 'come here'),
+    # Sprint 3 master query. Longer phrases first. Canonical string is what
+    # masha_interaction_node matches. Punctuation is stripped before this
+    # table runs, so "who's" becomes "who s".
+    ('who is your master', 'who is your master'),
+    ('who is ur master', 'who is your master'),
+    ('whose your master', 'who is your master'),
+    ('who s your master', 'who is your master'),
+    ('who your master', 'who is your master'),
     ('跳个舞吧', 'dance'),
     ("dan's", 'dance'),
     ('dancing', 'dance'),
@@ -228,6 +238,20 @@ class ASRNode(Node):
         self.last_activity = time.time()
         self.session_deadline = time.time() + seconds
 
+    def _in_command_session(self):
+        if self.awake_flag:
+            return True
+        return bool(self.last_activity and (time.time() - self.last_activity) < LISTEN_SECONDS)
+
+    def _should_take_command(self, cmd):
+        # Walk/dance/stop still need Hello Masha (or a live 120 s session).
+        # The master query is the spoken protocol itself, so take it from idle.
+        if not cmd:
+            return False
+        if cmd == MASTER_COMMAND:
+            return True
+        return self._in_command_session()
+
     def _text_is_wake(self, text):
         if identity.is_wake_phrase(text):
             return True
@@ -363,9 +387,7 @@ class ASRNode(Node):
                     self._trigger_wake(text)
                     continue
                 cmd = extract_command(text)
-                recently = self.awake_flag or (
-                    self.last_activity and (time.time() - self.last_activity) < LISTEN_SECONDS)
-                if cmd and recently:
+                if self._should_take_command(cmd):
                     if not self.awake_flag:
                         self.get_logger().info('still in session, taking %s' % cmd)
                     self._accept_command(cmd)
@@ -391,7 +413,7 @@ class ASRNode(Node):
                         self._trigger_wake(clip_text)
                         continue
                     clip_cmd = extract_command(clip_text)
-                    if clip_cmd and recently:
+                    if self._should_take_command(clip_cmd):
                         if not self.awake_flag:
                             self.get_logger().info('still in session, taking %s' % clip_cmd)
                         self._accept_command(clip_cmd)
@@ -428,8 +450,17 @@ class ASRNode(Node):
         self._keep_awake()
         self._publish_words(cmd)
         self.get_logger().info('\033[1;32mok %s (still listening)\033[0m' % cmd)
-        # Stop finishes quickly; other commands talk over the prompt wav.
-        self.ignore_until = time.time() + (0.8 if cmd == 'stop' else 1.6)
+        # Stop finishes quickly. Other walk prompts talk over a short wav.
+        # The master sequence speaks a line then dances with music (~20 s).
+        # The USB mic hears that speaker; a short ignore window would let
+        # sherpa hallucinate "go forward" from the track and steal the legs.
+        if cmd == 'stop':
+            ignore = 0.8
+        elif cmd == MASTER_COMMAND:
+            ignore = 20.0
+        else:
+            ignore = 1.6
+        self.ignore_until = time.time() + ignore
         self.cmd_chunks = []
         self._reset_stream()
 

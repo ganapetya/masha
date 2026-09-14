@@ -13,6 +13,8 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(kinematics_msgs REQUIRED)
+find_package(interfaces REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(servo_controller_msgs REQUIRED)
@@ -74,6 +76,19 @@ target_link_libraries(proud_up_node
   ${OpenCV_LIBS}
 )
 
+add_executable(masha_interaction_node src/masha_interaction_node.cpp)
+target_include_directories(masha_interaction_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+ament_target_dependencies(masha_interaction_node
+  rclcpp
+  geometry_msgs
+  kinematics_msgs
+  interfaces
+  std_msgs
+  std_srvs
+)
+
 add_executable(follow_the_cat_node src/follow_the_cat_node.cpp)
 target_include_directories(follow_the_cat_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -96,7 +111,7 @@ target_link_libraries(follow_the_cat_node
   ${OpenCV_LIBS}
 )
 
-install(TARGETS proud_up_node follow_the_cat_node
+install(TARGETS proud_up_node follow_the_cat_node masha_interaction_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -104,7 +119,7 @@ install(DIRECTORY include/
   DESTINATION include
 )
 
-install(DIRECTORY launch config models
+install(DIRECTORY launch config models sounds
   DESTINATION share/${PROJECT_NAME}
 )
 
@@ -125,6 +140,11 @@ if(BUILD_TESTING)
     ${Eigen3_INCLUDE_DIRS}
   )
   target_link_libraries(test_follow_the_cat follow_the_cat ${OpenCV_LIBS})
+
+  ament_add_gtest(test_interaction_phrases test/test_interaction_phrases.cpp)
+  target_include_directories(test_interaction_phrases PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
 endif()
 
 ament_package()

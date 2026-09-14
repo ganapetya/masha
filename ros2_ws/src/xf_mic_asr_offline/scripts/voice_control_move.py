@@ -32,6 +32,14 @@ SPECIAL_WORDS = {
     '失败10次(Fail-10-times',
 }
 
+# Canonical strings consumed by masha_interaction_node, not by this walker.
+# ASR still publishes them (so the C++ node hears them). We skip them here
+# so they do not log as unmatched and so a later "yes" can be ignored the
+# same way when Step 2 is wired.
+INTERACTION_IGNORED = {
+    'who is your master',
+}
+
 # Longer phrases first so "go forward" wins over "forward".
 COMMAND_ALIASES = (
     ('go forwards', 'go forward'),
@@ -168,6 +176,9 @@ class VoiceControMovelNode(Node):
                 words = self.words
                 self.words = None
                 if words in SPECIAL_WORDS:
+                    continue
+                if words in INTERACTION_IGNORED:
+                    self.get_logger().info('ignored (interaction node): %s' % words)
                     continue
                 twist = Twist()
                 matched = True
