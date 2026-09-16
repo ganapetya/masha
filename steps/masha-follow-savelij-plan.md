@@ -5,7 +5,8 @@
 **This memo:** feasibility against Masha as she actually runs (Jetson Orin NX, ROS 2 Humble, `ROS_DOMAIN_ID=27`, `proud_up`, Aurora 930, LD19, bus servos).  
 **Name:** the other robot is **Saveli** in the trio docs; the clipboard used **Savelij**. Same machine. This file uses **Saveli**.  
 **Revision (2026-09-16, later same day):** custom gait is **in scope**. Map pick: **variant 3 — omnidirectional tripod.**  
-**Revision (2026-09-16, hunter):** Saveli is the **first plug**, not the product. End goal is a spider **hunter**: deep stand, slow head scan, recognize, **call the target by name**, follow ≤ **60 s** or until lost, then scan again. Node: **`masha_hunter_node`**. Next plug: **cat**. Filename kept for the GitHub URL.
+**Revision (2026-09-16, hunter):** Saveli is the **first plug**, not the product. End goal is a spider **hunter**: deep stand, slow head scan, recognize, **call the target by name**, follow ≤ **60 s** or until lost, then scan again. Node: **`masha_hunter_node`**. Next plug: **cat**. Filename kept for the GitHub URL.  
+**Revision (2026-09-16, wander):** No SLAM / Nav2. Optional HUNT rule: go into open space, halt at an obstacle, rotate, look again. Default **off**.
 
 Related reading (do not re-derive):
 
@@ -587,7 +588,8 @@ enabled_targets yaml:  [saveli]           later: [saveli, cat]
                            ▼
 masha_hunter_node   (NEW, package proud_up)
   IDLE:   halt, hunter_pose, wait ~/start
-  HUNT:   halt, slow pan id 19 (optional tilt 22), any enabled plug
+  HUNT:   halt + slow pan id 19; optional wander (open → walk, wall → halt+turn)
+          no map / no Nav2; any enabled plug can fire
   NAME:   halt, hold gaze, aplay spoken_wav once (worker thread)
   FOLLOW: gait 15 + PD Twist, gentle gaze, sticky id, ≤ 60 s
           LiDAR latch / lost / timeout → halt → HUNT (sticky search)
@@ -699,7 +701,7 @@ Start values (all discussed as **base_link** range to the obstacle, not “lidar
 
 `r_target` must sit **above** `d_go`, otherwise the PID drives her into the latch. Clipboard 0.60 / 0.50 / 0.55 violates that once halt delay is included.
 
-Lost target: `halt_legs()`, enter **HUNT** (slow pan), sticky to the last id until `search_timeout_s`. Do **not** search by walking `ωz` in place (that is a gait, not a head sweep).
+Lost target: `halt_legs()`, enter **HUNT**, sticky to the last id until `search_timeout_s`. Default HUNT is **stand + pan** (head sweep, not a walking spin). Optional **wander** (below) may then walk into open space; still no SLAM.
 
 Depth sanity (optional, after H2): sample `/depth_cam/depth/image_raw` at the tag/box centre. If `|z_depth - z_pnp|` is large, trust lidar for range and the plug for bearing, or halt.
 
@@ -713,7 +715,7 @@ Depth sanity (optional, after H2): sample `/depth_cam/depth/image_raw` at the ta
 
 Split:
 
-- `include/proud_up/hunter.hpp` + `src/hunter.cpp` — no rclcpp: PD, deadband, lidar hysteresis, crab gate, 60 s cap, phase helpers. Fake poses in gtest.
+- `include/proud_up/hunter.hpp` + `src/hunter.cpp` — no rclcpp: PD, deadband, lidar hysteresis, crab gate, 60 s cap, wander (open / stop / rotate), phase helpers. Fake poses and fake scans in gtest.
 - `include/proud_up/target_source.hpp` — `TargetHit` + virtual `TargetSource`.
 - `src/target_saveli.cpp` — AprilTag array + TF → `TargetHit` (`id = saveli`).
 - `src/target_cat.cpp` — YOLO class 15 + pixel ray / depth → `TargetHit` (`id = cat`). Reuse Sprint 2 ONNX load path; do not copy-paste a second net if one net can filter two classes.
@@ -729,16 +731,76 @@ Split:
 | Phase | Legs | Head (arm) | What happens |
 |---|---|---|---|
 | **IDLE** | `halt_legs()` | `hunter_pose` centre (19=500, …) | Wait `~/start`. No sweep. |
-| **HUNT** | Halt. Deep stand (`DEFAULT_POSE` unless yaml `hunter_pose`). | Slow pan id 19, optional tilt 22, ~8–12 s period, ~200–800. | Any **enabled** plug can fire. Spider in the room. |
+| **HUNT** | Default: halt. If `enable_wander`: walk into open, halt at `d_stop`, then rotate (see wander rule). Deep stand `DEFAULT_POSE` unless yaml `hunter_pose`. | Slow pan id 19 first, optional tilt 22, ~8–12 s period, ~200–800. Chassis yaw only after pan window or a wall. | Any **enabled** plug can fire. No map. |
 | **NAME** | Halt. | Hold the pose that sees the hit. | `aplay` `spoken_wav` **once**, worker thread, Sprint 3 pattern. Skip re-name if re-lock within `search_timeout_s`. |
 | **FOLLOW** | Traveling `gait: 15` then Twist. Sticky `id`. | Gentle `integrate_gaze` (no wide scan). | ≤ **`follow_max_s = 60`**. LiDAR latch → `STOPPED`. Lost / timeout → halt → **HUNT**. |
 | **STOPPED** | Halt. | Hold gaze. | `d_min > d_go` and time left → FOLLOW; else HUNT. |
 
 On entering `FOLLOW` the first time (and after a halt that cleared `cmd_gait`): publish Traveling `gait: 15`.
 
-Services: `~/start`, `~/stop` (`std_srvs/Trigger`). `enable_walk` **default false**. `enabled_targets: [saveli]` first. Gait dry-run does not use this node.
+Services: `~/start`, `~/stop` (`std_srvs/Trigger`). `enable_walk` **default false**. `enable_wander` **default false**. `enabled_targets: [saveli]` first. Gait dry-run does not use this node.
 
-Debug: overlay `~/image_result` (box, id, `r`, `θ`, `d_min`, phase, follow time left). No `cv2.imshow`.
+Debug: overlay `~/image_result` (box, id, `r`, `θ`, `d_min`, phase, follow time left, wander action). No `cv2.imshow`.
+
+---
+
+## Optional wander rule (HUNT, no SLAM)
+
+Peter: no mapped room required. A simpler search is enough: **go into the open, stop before an obstacle, rotate, look again.**
+
+This is **not** Nav2, AMCL, or an occupancy grid. The plan already forbids launching Nav2 (it would fight `/controller/cmd_vel`). LD19 `/scan` in `base_link` is the whole world model.
+
+**Default `enable_wander: false`.** H0–H2 stay stationary HUNT (halt + pan). Turn wander on only after Test H0 (pan) and Test G2 (our gait under `cmd_vel`) are boring.
+
+### What it does
+
+Only while phase **HUNT** (and after `~/start`). FOLLOW still uses the target PD + LiDAR latch. IDLE / NAME / STOPPED do not wander.
+
+```text
+# each hunter timer tick, HUNT, enable_wander, enable_walk
+# d_min = min finite range in the front sector, in base_link (same as the follow latch)
+
+1. Arm pan always runs (cheap look). Plug hit → NAME immediately (halt).
+
+2. If d_min < d_stop:
+      halt_legs()                         # not Twist{}
+      if arm pan has not finished this sweep: keep panning, vx = ωz = 0
+      else: ωz = ±wander_wz               # turn toward the more-open half of /scan
+      # after heading changes enough that d_min > d_go: go to 3
+
+3. If d_min > d_go:
+      ωz = 0
+      vx = wander_vx                      # walk into the open, cap start 0.03 m/s
+      # still panning
+
+4. Else (between d_stop and d_go): hold last action (hysteresis, no chatter)
+```
+
+**Pan first, body yaw second.** Id 19 already covers a wide cone. Do not start a walking spin while the camera can still look. Chassis `ωz` is for “wall ahead and the arm has finished a sweep” or “target was last seen off to the side outside the pan window.”
+
+**Halt, then turn.** Streaming `Twist{}` marches in place. Same `halt_legs()` as everywhere else, then a non-zero `ωz` on gait 15 if we actually need to yaw the body.
+
+**Open heading:** on a wall hit, pick the scan half (left vs right of +X) with the larger median finite range; `ωz` sign toward that half. No map of “I have been here.” She can loop a table. Fine for a living-room demo.
+
+### What it does not do
+
+| Tempting extra | Why not |
+|---|---|
+| SLAM / Nav2 / “go to kitchen” | Different project. Two `cmd_vel` sources. |
+| Walk in a circle to search | Head pan already does that cheaper; walking spin is a gait and a trip hazard. |
+| Zero Twist as “pause at the wall” | Walks in place. |
+| Wander during FOLLOW | FOLLOW is sticky tracking; LiDAR there is a **stop**, not a detour. |
+
+### Parameters (start)
+
+| Name | Start | Role |
+|---|---|---|
+| `enable_wander` | **false** | yaml; HUNT only |
+| `wander_vx` | 0.03 m/s | into open space (`d_min > d_go`) |
+| `wander_wz` | 0.25 rad/s | after halt at `d_stop`, toward open half |
+| `wander_sector` | 90° | same front sector as follow LiDAR unless yaml splits them |
+
+gtest (no robot): fake scan all-clear → `vx`; fake wall ahead → halt then `ωz` toward the open side; `enable_wander false` → never `vx` in HUNT; never emit `Twist{}` as the wall action.
 
 ---
 
@@ -769,6 +831,9 @@ Yaml:
 enabled_targets: [saveli]     # first bring-up; later [saveli, cat]
 follow_max_s: 60.0
 search_timeout_s: 20.0
+enable_wander: false          # optional HUNT: open → walk, wall → halt+turn
+wander_vx: 0.03
+wander_wz: 0.25
 ```
 
 Two plugs in one tick: prefer **sticky** id, else yaml order.
@@ -859,6 +924,16 @@ gtest: body heading, deadband, lidar hysteresis, crab gate, “zero Twist is not
 
 Height, period, optional bounce. Do **not** switch to a second map. Do **not** add a second servo node. Do **not** pass `5` into `kinematics.set_step_mode`.
 
+### Phase H3 — optional wander (after H0 + G2, not a gate)
+
+`enable_wander:=true`, `enable_walk:=true`, no target required. Floor with one clear path and one wall/chair.
+
+1. Open ahead → slow `vx`, arm still panning. No map.
+2. Obstacle at `d_stop` → **stand**, then rotate toward the more-open side. Not a march.
+3. Plug fires mid-wander → halt, NAME, FOLLOW. Wander does not resume until HUNT.
+
+Skip H3 until stationary HUNT and gait `cmd_vel` are trusted. Still **no Nav2**.
+
 ### Phase C0 — cat plug, no walk
 
 `enabled_targets: [cat]` (or `[saveli, cat]` only after sticky-id gtest). `enable_walk:=false`. COCO class 15. Overlay + `cat.wav`. Bench stand-in: a printed cat photo is allowed for C0.
@@ -883,9 +958,11 @@ Joystick / pad on Masha unplugged. No Saveli required.
 
 ### Hunter (no walk)
 
-**Test H0 — sweep.** `~/start`. Id 19 moves slowly. Legs `DEFAULT_POSE`. No Twist. `~/stop` centres pan.
+**Test H0 — sweep.** `~/start`. `enable_wander:=false`. Id 19 moves slowly. Legs `DEFAULT_POSE`. No Twist. `~/stop` centres pan.
 
 **Test NAME.** One `saveli.wav` per lock. Cover and uncover within 20 s → no second wav.
+
+**Test H3 — wander (optional).** `enable_wander:=true`. Open floor → she walks slowly. Chair in front → stand, then turn, not march-in-place. Tag appears → NAME, wander stops. No Nav2, no map file.
 
 ### Follow (clipboard Phase 5, corrected)
 
@@ -929,7 +1006,7 @@ Tape-measure the real standoff once. If 0.80 m feels far on this floor, lower `r
 - `src/masha_hunter_node.cpp`
 - `test/test_hunter.cpp`
 - `launch/masha_hunter.launch.py`
-- `config/masha_hunter.yaml` (`enabled_targets: [saveli]`, tag size, `r_target`, `d_stop`, `d_go`, gains, `enable_walk: false`, `enable_crab: false`, `follow_max_s: 60`, `search_timeout_s: 20`, `hunter_pose`, pan window, wav paths, `follow_gait: 5` / select `15`)
+- `config/masha_hunter.yaml` (`enabled_targets: [saveli]`, tag size, `r_target`, `d_stop`, `d_go`, gains, `enable_walk: false`, `enable_crab: false`, `enable_wander: false`, `wander_vx`, `wander_wz`, `follow_max_s: 60`, `search_timeout_s: 20`, `hunter_pose`, pan window, wav paths, `follow_gait: 5` / select `15`)
 - `config/apriltag_36h11_savelij.yaml` (Saveli plug; measured size / id / image remaps)
 
 **Wavs:** `xf_mic_asr_offline/feedback_voice/english/saveli.wav`, `cat.wav`.
