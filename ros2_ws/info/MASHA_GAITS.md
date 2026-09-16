@@ -129,6 +129,8 @@ each 20 ms:
 
 Generators are created on the ROS callback thread, primed with `.send(None)`, stored as `new_moving_generator` under `self.lock`. The loop thread consumes them. Same pattern for pose transformers.
 
+The teacher walk-through of that walk job (two generators, table-of-xyz, finish-the-step, same grain as the lean write-up) is [`DANCE_ACTION_SETS_DETAILS.md`](DANCE_ACTION_SETS_DETAILS.md) §8.
+
 ---
 
 ## 6. Public API on `/controller`

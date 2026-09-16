@@ -1,6 +1,6 @@
 # How posing works on Masha
 
-This page is a teacher’s walk-through of **one stand and one dance** on this robot. Voice is out. Treat the C++ node as already having decided “now we pose.” How she heard the sentence is in [`MASTER_DIALOG_DANCE.md`](MASTER_DIALOG_DANCE.md). How a `.d6a` file is recorded is in [`DANCE_ACTION_SETS.md`](DANCE_ACTION_SETS.md). How walking works is in [`MASHA_GAITS.md`](MASHA_GAITS.md).
+This page is a teacher’s walk-through of **one stand and one dance** on this robot. Voice is out. Treat the C++ node as already having decided “now we pose.” How she heard the sentence is in [`MASTER_DIALOG_DANCE.md`](MASTER_DIALOG_DANCE.md). How a `.d6a` file is recorded is in [`DANCE_ACTION_SETS.md`](DANCE_ACTION_SETS.md). How walking is catalogued (who sends which gait, units traps) is in [`MASHA_GAITS.md`](MASHA_GAITS.md). Job C on the 20 ms tick — the walk generator itself — is §8 of this page.
 
 Worked example: the pose sequence cued by `ros2_ws/src/proud_up/src/masha_interaction_node.cpp`.
 
@@ -54,7 +54,7 @@ A Python class, not its own ROS node. File: `ros2_ws/src/driver/servo_controller
 
 The pianist opens a SQLite file (`*.d6a`), reads rows, and publishes raw servo pulses. It does not think about feet or balance. It is a cursor over a piano roll.
 
-**It does not know coordinates.** A pulse is not an xyz of a foot. It is the motor’s own position number (0–1000) for one physical servo. Those numbers were **recorded earlier**, usually in the Qt ActionSet editor, by reading the servos after a human posed the legs, or by dragging sliders. The pianist only **plays the recording back**. How that recording is made, and why no IK is needed, is §9.
+**It does not know coordinates.** A pulse is not an xyz of a foot. It is the motor’s own position number (0–1000) for one physical servo. Those numbers were **recorded earlier**, usually in the Qt ActionSet editor, by reading the servos after a human posed the legs, or by dragging sliders. The pianist only **plays the recording back**. How that recording is made, and why no IK is needed, is §10.
 
 ### 1.5 The translator — `JointControl`
 
@@ -100,6 +100,8 @@ Masha has no single pose API. Three programs share the last stretch of cable to 
 
 The dance we built is **(1) then (3)**: stand with IK, then play `master_dance.d6a`.
 
+Walking is none of those three. It is **job C** on the 20 ms tick (§8): some feet lift, some stay, the body advances. The dance never queues it. Halt exists to make sure a leftover walk is dead before the pianist starts.
+
 ---
 
 ## 3. The whole path, as a map
@@ -109,7 +111,7 @@ This box is only a map of who talks to whom. Meanings are under it.
 ```
 director   masha_interaction_node     (50 ms tick; does not move servos)
               |
-              |  three postcards, explained in §5 and §8
+              |  three postcards, explained in §5 and §9
               v
 receptionist   /controller            MoveController
               |                    \
@@ -336,9 +338,9 @@ Each tick always tries four jobs, **in this order**. For halt, only job A does w
 
 ```
 20 ms tick
-  A. If a named pose is queued          → IK once, publish, clear everything else
-  B. If a body-lean generator is queued → one lean frame
-  C. If a walk generator is queued      → one gait frame
+  A. If a named pose is queued          → IK once, publish, clear everything else   (§6.1)
+  B. If a body-lean generator is queued → one lean frame                            (§7)
+  C. If a walk generator is queued      → one gait frame                            (§8)
   D. If A/B/C produced a new 6-foot pose object → publish it
   then sleep 0.02 s
 ```
@@ -402,7 +404,9 @@ pub.publish(msg)   # topic servo_controller
 
 ### 6.2 Jobs B, C, D during halt and during the dance
 
-After job A, the stand has cleared the generators. Jobs B and C see nothing. Job D checks `if pose is not self.pose` — identity of the Python object. After job A, `self.pose` already *is* that pose, so job D does not publish again.
+After job A, the stand has cleared the generators. Jobs B and C see nothing. The full story of B is §7; of C is §8. This subsection is only “they are idle during halt and during the dance.”
+
+Job D checks `if pose is not self.pose` — identity of the Python object. After job A, `self.pose` already *is* that pose, so job D does not publish again.
 
 Then:
 
@@ -463,7 +467,276 @@ yield final_pose, final_transform, True
 
 ---
 
-## 8. Cueing the dance file
+## 8. Walk (job C — the gait generator)
+
+**“Walk” and “gait” are teaching names.** The code has two Python generators that share one inbox (`new_moving_generator` / `cur_moving_generator`):
+
+| Code name | Started by | What you asked for |
+|---|---|---|
+| `MovingGenerator` | `kinematics_msgs/Traveling` with `gait` 1 or 2 | “take this many steps, this long, this far, this heading” |
+| `CmdVelGenerator` | `geometry_msgs/Twist` on `/controller/cmd_vel` | “keep stepping at this body speed” |
+
+The dance never starts either of them. Halt’s first postcard (Twist 0) *would* start a `CmdVelGenerator` at speed 0 if it were left alone — that is why halt immediately follows it with `gait = 0`. This section is here so job C is not a mystery, the same way §7 is here for the lean.
+
+Picture a table again. Job A puts all six feet to a stored xyz (the stand). Job B leans the tabletop; the feet stay planted. **Job C lifts some feet and plants them further along.** That is a gait: cyclic stepping. Inverse kinematics still turns each snapshot of six xyz into joint angles, but the *intent* is “step,” not “hold” or “tilt.”
+
+Live examples on this robot (not the dance): classroom tripod (`example/body_control/include/tripod_gait.py`: `gait=2` for 5 s, then `gait=0`), classroom ripple (`ripple_gait.py`: `gait=1`), sidestep (`left_and_right.py`: `direction = radians(90)` / `270`), joystick analog stick (`peripherals/joystick_control.py`: Traveling 11/12 to pick the gait, then Twist), Nav2 / apps on `/controller/cmd_vel`. How walking is catalogued (who sends which gait, units traps) is [`MASHA_GAITS.md`](MASHA_GAITS.md). This page is only: **what job C does on each 20 ms tick.**
+
+### 8.1 Two postcards, two generators
+
+**Who commands a walk.** Anyone who publishes one of:
+
+```
+(1) Traveling { gait: 1 or 2, stride, height, direction, rotation, time, steps }
+        →  /controller/traveling
+(2) Twist    { linear.x, linear.y, angular.z }
+        →  /controller/cmd_vel
+```
+
+Negative and zero `gait` values are **not** walks. They are halt / stand, already in §5.
+
+| `Traveling.gait` | Meaning |
+|---|---|
+| **1** | Ripple. Start a `MovingGenerator`. |
+| **2** | Tripod. Same path, different number handed to the kinematics library. |
+| **11, 12, 13** | Not a walk. Store `cmd_gait = gait − 10`, plus height and period, for the *next* Twist. Joystick does this, then publishes `cmd_vel`. |
+| **0 / −1 / −2** | Stop / `SLAM_POSE` / `DEFAULT_POSE` (§5). |
+
+**Ripple vs tripod, in one picture.** Tripod is two triangles of three legs. While group A is in the air, group B is a stool. Using the leg numbers in §12: group A is LF+LR+RM (1, 3, 5), group B is LM+RR+RF (2, 4, 6). Ripple is a wave: fewer feet in the air at once. Python never sees which legs are up. That grouping lives inside `kinematics.so` (compiled Rust). Job C only receives six xyz.
+
+**What the Traveling fields mean.** File: `ros2_ws/src/driver/kinematics_msgs/msg/Traveling.msg`.
+
+| Field | Unit | Role |
+|---|---|---|
+| `stride` | millimetres | How far the body should advance in one step |
+| `height` | millimetres (or percent if `relative_height`) | How high a swinging foot lifts |
+| `direction` | radians in the body frame | 0 = toward the head (+X). Classroom sidestep uses `math.radians(90)` = robot’s left |
+| `rotation` | radians per step | Yaw change each step |
+| `time` | seconds | How long one step should last (`period` inside the generator) |
+| `steps` | count | How many steps. `0` means forever |
+| `interrupt` | bool | Accepted, then **ignored**. A step that has started is always finished before a new generator is swapped in |
+
+**What a Twist means.** Linear x/y are metres per second, angular z is radians per second. The receptionist clamps them (`±0.12`, `±0.10`, `±0.6`) then the worker converts linear speeds to millimetres per second.
+
+### 8.2 Who queues the generator
+
+**Who receives Traveling.** The receptionist, `set_traveling_callback`. For `gait > 0` it calls `StepController.set_step_mode`, which (unless the gait is 11/12/13) builds a `MovingGenerator` and writes the worker’s walk inbox:
+
+```python
+# ros2_ws/src/driver/controller/controller/move_controller.py:155-170
+if msg.gait > 0:
+    self.step_controller.set_step_mode(
+        msg.gait, msg.stride, msg.height, msg.direction, msg.rotation,
+        msg.time, msg.steps, interrupt=msg.interrupt,
+        relative_height=msg.relative_height)
+```
+
+```python
+# ros2_ws/src/driver/controller/controller/step_controller.py:521-537
+generator = MovingGenerator(MovingParams(
+    gait=gait, stride=amplitude, height=height,
+    direction=direction, rotation=rotation,
+    period=duration,          # Traveling.time
+    repeat=repeat,            # Traveling.steps
+    forever=True if repeat == 0 else False,
+    relative_h=relative_height))
+generator.send(None)          # prime
+self.new_moving_generator = generator
+```
+
+**Who receives Twist.** The receptionist, `cmd_vel_callback`, always (even at speed 0). That is the trap in halt postcard 1.
+
+```python
+# ros2_ws/src/driver/controller/controller/move_controller.py:194-201
+msg.linear.x = max(min(msg.linear.x, 0.12), -0.12)
+# ... y ±0.10, wz ±0.6 ...
+self.step_controller.cmd_vel(msg)
+```
+
+```python
+# ros2_ws/src/driver/controller/controller/step_controller.py:443-463
+linear_x = twist.linear.x * 1000   # m/s → mm/s
+linear_y = twist.linear.y * 1000
+generator = CmdVelGenerator(CmdVelParams(
+    gait=self.cmd_gait,            # default 2; last Traveling 11/12/13 overwrites
+    velocity_x=linear_x, velocity_y=linear_y, angular_z=angular_z,
+    height=self.cmd_height, period=self.cmd_period, ...))
+generator.send(None)
+self.new_moving_generator = generator
+```
+
+Both generators occupy the **same** slot. A Twist arriving while a Traveling walk is in flight does not abort the current step. It waits in `new_moving_generator` until job C sees `last_part` (a step/cycle boundary), then swaps. That is the comment at `step_controller.py:175-177`: finish the step that started, then change.
+
+`generator.send(None)` is the same prime as the lean in §7. It runs the generator up to the first `yield None`, so the next `send((pose, status))` from the 20 ms thread is the first real snapshot.
+
+### 8.3 Job C on the 20 ms tick
+
+After jobs A and B, the worker looks at the walk inbox:
+
+```python
+# ros2_ws/src/driver/controller/controller/step_controller.py:181-187
+if self.cur_moving_generator is None:
+    if self.new_moving_generator is not None:
+        self.cur_moving_generator = self.new_moving_generator
+
+if self.cur_moving_generator is not None:
+    moving_pose, last_part, params, slow = \
+        self.cur_moving_generator.send((pose, send_status))
+```
+
+**What those four returned values are.**
+
+| Name | Meaning |
+|---|---|
+| `moving_pose` | This tick’s six foot xyz (millimetres). A snapshot, same shape as `DEFAULT_POSE`. |
+| `last_part` | `True` if this snapshot closed a full step (Moving) or a full cycle slice (CmdVel). The only moment a swap is allowed. |
+| `params` | The `MovingParams` / `CmdVelParams` object. CmdVel uses it this tick to integrate a crude odom. |
+| `slow` | A tag, not a speed. `'move'` = discrete-step generator; `'cmd_false'` / `'cmd_true'` = velocity generator (the `_true` one asks for a 50 ms blend). |
+
+If the generator is exhausted (`StopIteration`: `repeat` used up), job C sets `cur_moving_generator = None` and later ticks see an empty inbox.
+
+**The finish-the-step rule**, when `last_part` is True:
+
+- `slow == 'move'`: if a replacement is waiting, install it now; if the replacement is `None` (halt `gait = 0` cleared the inbox), the walk ends after this snapshot.
+- otherwise (cmd_vel): do not swap mid-cycle. Tell the current generator `status='finish'` so it can park the feet, stash the last pose for the next generator, then promote the queued one.
+
+That is why halt postcard 2 can **block** for up to one step (Traveling) or one cycle plus a wind-down (cmd_vel). Job A then overwrites whatever the feet were doing with `DEFAULT_POSE`.
+
+### 8.4 Discrete-step walk (`MovingGenerator`)
+
+File: `ros2_ws/src/driver/controller/controller/move.py`. This is the Traveling path.
+
+**What the generator does.** A **step** here is one walking cycle — all legs through their lift/place pattern once, the body advanced about one stride. It is not “one foot lifting.” It is closer to one bar of music.
+
+On the first tick of a walk (and again if the stance pose *object* changes) it **builds a table** of foot xyz for one whole step. Later ticks only **index** that table. If `repeat` is 3, the same table is played three times. Opposite of the lean: the lean computes xyz *now* (lerp). The walk plans the step once.
+
+One step is hard-split into **6 parts** (`for i in range(6)`). That 6 is the kinematics library’s idea of one gait cycle, not “six legs lifting one by one.” Each part is split into `sub_action_num` snapshots so the step lasts about `period` seconds at 20 ms per snapshot:
+
+```python
+# ros2_ws/src/driver/controller/controller/move.py:76-78
+sub_action_num = params.period / 6.0 / 0.02
+sub_action_num = math.ceil(round(max(sub_action_num, 1), 3))
+```
+
+**Numeric example.** Command: “tripod, period = 1.0 s, stride = 40 mm, height = 15 mm, 3 steps” (classroom `tripod_gait.py` is the same walk with `steps=0` / forever, then a 5 s sleep, then `gait=0`).
+
+- `1.0 / 6 / 0.02 = 8.333` → `ceil` → **9 snapshots per part**
+- **6 × 9 = 54 snapshots in one step** (about 1.08 s because of `ceil`)
+- **3 steps** = play that 54-row table three times, unless the stored stance pose *object* changes (then the table is rebuilt)
+
+**Ripple-only preamble** (`gait == 1`). Before computing the six parts, one foot is pre-lifted by `height`: heading `≥ π` → leg 1 (LF), otherwise leg 4 (RR). Comment in `move.py:95-98`: in ripple, depending on heading, one leg is already on its down-stroke; from a stand that would jack the body up. Tripod skips this and starts from the current pose as-is.
+
+Then the table:
+
+```python
+# ros2_ws/src/driver/controller/controller/move.py:114-133
+for i in range(6):
+    ps = kinematics.set_step_mode(
+        sub_action_num, i, start_pose,
+        params.gait,          # 1 ripple / 2 tripod — not inverted here
+        real_stride, height, params.direction, real_rotate)
+    ps = np.array(ps).reshape((6, -1, 3))   # [leg][sub][xyz]
+    ps = np.transpose(ps, (1, 0, 2))        # [sub][leg][xyz]
+    start_pose = ps[-1]                     # next part continues from here
+    poses.append(ps)
+```
+
+`kinematics.set_step_mode` is inside `kinematics.so`. It returns per-leg sequences; Python reshapes them into per-snapshot rows. `real_stride = stride × linear_factor` (factor defaults to 1.0).
+
+**How that meets the 20 ms loop.** Each tick of job C:
+
+```python
+# ros2_ws/src/driver/controller/controller/move.py:133-145
+out_pose = poses[part_index][sub_index]
+sub_index = (sub_index + 1) % sub_action_num
+if sub_index == 0:
+    part_index = (part_index + 1) % 6
+    if part_index == 0:
+        params.repeat = max(params.repeat - 1, 0)
+yield out_pose, (part_index == 0 and sub_index == 0), params, 'move'
+```
+
+One lookup, one snapshot, `last_part=True` only on the wrap. Job D then IK’s that snapshot with `duration=0.02`. A 1.0 s step is **many** 0.02 s messages. Opposite of the stand; same grain as the lean.
+
+If `self.pose` is replaced by a new Python object (a lean that ran in the same tick, or a named pose), the generator notices `cur_pose is not org_pose` and rebuilds the six parts from the new stance. That is an identity check, not a millimetre compare.
+
+### 8.5 Velocity walk (`CmdVelGenerator`)
+
+Same file. This is a **different algorithm**: keep a cycle of phases covering `0 … 2π`, driven by body velocity, not by “N steps of stride S.”
+
+**What the generator does.** Once per cycle it:
+
+1. Asks the library for AEP/PEP offsets from `(vx, vy, wz, period)`. **AEP** = anterior extreme position (where a swinging foot will land). **PEP** = posterior extreme position (where a stance foot will lift).
+2. Builds one table, one 6-foot pose per phase.
+3. Plays that table. When a new Twist arrives, it splices at a phase close to the current feet so a foot does not teleport.
+
+```python
+# ros2_ws/src/driver/controller/controller/move.py:196-234
+phase_num = math.ceil(round((params.period * 1000.0 / 20.0), 1))  # 1.0 s → 50
+phase_list = [(i / phase_num) * 2.0 * math.pi for i in range(phase_num)]
+aep_offset_x, aep_offset_y, ... = kinematics.cmd_vel_basic_data(vx, vy, wz, period)
+aep, pep = kinematics.cmd_vel_aep_pep(cur_pose, ...)
+for phase in phase_list:
+    steps.append(kinematics.cmd_vel_new_point(gait, height, phase, aep, pep))
+```
+
+**Gait number is inverted here only:**
+
+```python
+# ros2_ws/src/driver/controller/controller/move.py:189-191
+gait = 2 if params.gait == 1 else 1
+```
+
+`MovingGenerator` passes 1 = ripple, 2 = tripod straight through. `CmdVelGenerator` flips them before `cmd_vel_new_point`. Default `cmd_gait` on the worker is **2**, so a bare Twist walks with whatever the `.so` calls gait 1 after the flip. Joystick D-pad sends Traveling `11` first (`cmd_gait=1` → cmd_vel uses tripod). Analog stick sends `12` (`cmd_gait=2` → cmd_vel uses ripple). **Traveling `gait=2` is tripod. A Twist with `cmd_gait=2` is not.** Always check which generator is running.
+
+**How a new Twist meets the current one.** The worker passes a `status` string into `.send()`:
+
+| `status` | What the generator plays |
+|---|---|
+| `'first'` | The resume slice (`steps[idx:]`), starting near the previous generator’s last pose |
+| `'running'` | The full cycle, wrapping |
+| `'finish'` | The leftover prefix (`steps[:idx]`), then stash that pose in `finish_ps` for the next generator |
+
+`idx` is the table row whose six xyz are closest (sum of squared millimetre distances) to `finish_ps`. If the largest per-foot jump is still `> 7` mm, `slow='cmd_true'` and job D uses `duration=0.05` instead of `0.02` for that catch-up snapshot.
+
+**Odom.** Only this generator fills it. After publishing the snapshot, the worker integrates 20 ms of `(vx, vy, wz)` into `position` and `pose_yaw` (`step_controller.py:247-256`). Discrete-step Traveling does not.
+
+### 8.6 How this tick’s snapshot becomes servos
+
+Job C does not publish. It only produced `moving_pose`. The walk half of job D:
+
+```python
+# ros2_ws/src/driver/controller/controller/step_controller.py:236-243
+if moving_pose is not None:
+    if send_status == 'first' and slow == 'cmd_true':
+        self.set_pose_base(moving_pose, 0.05, pseudo=False, update_pose=False)
+    else:
+        self.set_pose_base(moving_pose, 0.02, pseudo=False, update_pose=False)
+```
+
+Same `set_pose_base` as the stand: 6× `kinematics.set_leg_position`, then pulses on `/servo_controller`. Differences from the stand:
+
+- **Many** messages, each a 20 ms slide (50 ms on a cmd_vel catch-up), not one 1.0 s slide.
+- `update_pose=False`: the walk does **not** replace `self.pose` with the swinging feet. `self.pose` stays the stance the generator started from. That is why a walk can keep indexing the same table: the identity check `cur_pose is not org_pose` stays false until a lean or a named pose writes a new stance object.
+
+If a lean ran on the same tick, job D’s *other* branch sees a new pose object and calls `set_pose_base(..., pseudo=True)` — IK into memory, **no** servo publish — then the walk’s `moving_pose` is what actually goes to the motors.
+
+### 8.7 Compared with jobs A and B
+
+| | Job A, named stand | Job B, body lean | Job C, walk |
+|---|---|---|---|
+| Inbox | `new_pose_setter` | `new_pose_transformer` | `new_moving_generator` |
+| Feet | All six go to stored xyz | All six stay planted | Some lift, some stance |
+| Plan | IK **once** | Lerp xyz **each tick** | Table of xyz **once per step/cycle**, then lookup |
+| Servo `duration` | 1.0 s (halt) | 0.02 s | 0.02 s (0.05 s on cmd_vel catch-up) |
+| Stops when | That one publish is done | `last_part` after `duration` | `repeat` used up, or inbox cleared after `last_part` |
+| Dance uses it? | Yes (halt) | No | No (halt exists to kill it) |
+
+If someone queued a walk in the middle of the dance, job C would start publishing again and the pianist would fight over `/servo_controller`. That is the whole reason halt is three postcards, not a Twist 0.
+
+---
+
+## 9. Cueing the dance file
 
 After Halt (and after Speak, which we skip), the director calls `start_dance()`:
 
@@ -536,11 +809,11 @@ def start_action_thread(self, actNum, lock_servos=''):
 
 ---
 
-## 9. How the pianist applies the action set
+## 10. How the pianist applies the action set
 
 This thread is **not** the 20 ms worker. It is a `while` loop over SQLite.
 
-### 9.0 Why this can work without IK (the pianist does not invent poses)
+### 10.0 Why this can work without IK (the pianist does not invent poses)
 
 IK posing and action-group posing live at **different heights**.
 
@@ -619,7 +892,7 @@ void on_action_complete(...) {
 
 ---
 
-## 10. Last millimetres: from `/servo_controller` to the motors
+## 11. Last millimetres: from `/servo_controller` to the motors
 
 Both the IK stand and every dance row become the same ROS type on the same topic.
 
@@ -675,7 +948,7 @@ self.buf_write(...)
 
 ---
 
-## 11. Two numberings
+## 12. Two numberings
 
 IK uses kinematic joint ids 1–18 (`SERVOS` in `ros2_ws/src/driver/kinematics/kinematics/config.py`). Action groups use **physical bus ids**. `JointControl` translates. The pianist does not.
 
@@ -693,7 +966,7 @@ IK uses kinematic joint ids 1–18 (`SERVOS` in `ros2_ws/src/driver/kinematics/k
 
 ---
 
-## 12. The same story, in time
+## 13. The same story, in time
 
 | When | Who | What, in the language of this page |
 |---|---|---|
@@ -712,9 +985,9 @@ If `/action_complete` never goes true, the director gives up at 16.5 s (`dance_t
 
 ---
 
-## 12a. Words: tick, step, part, snapshot/frame, lerp
+## 13a. Words: tick, step, part, snapshot/frame, lerp
 
-Read this before the “batch vs one interval” question. A **tick** is not a meal. It is: **trigger → read → execute → write → sleep.**
+Read this before the “batch vs one interval” question. The story of job C is §8; this subsection is only the words. A **tick** is not a meal. It is: **trigger → read → execute → write → sleep.**
 
 ### Tick (the 20 ms worker)
 
@@ -810,7 +1083,7 @@ If the total move is 40 mm in 20 ticks, each tick adds 2 mm of body shift (the c
 
 ---
 
-## 12b. Does the 20 ms worker plan many ticks, or only the current one?
+## 13b. Does the 20 ms worker plan many ticks, or only the current one?
 
 Two layers. Do not mix them.
 
@@ -852,7 +1125,7 @@ out_pose = poses[part_index][sub_index]  # lookup
 
 ---
 
-## 13. Is IK really computed every 20 ms? (no micrometres, not a hard job)
+## 14. Is IK really computed every 20 ms? (no micrometres, not a hard job)
 
 Short answer: **not for the dance, not for the halt stand, and never in micrometres.** Inverse kinematics of one 3-joint insect leg is a handful of trig functions. Fifty times a second on a Jetson is idle time.
 
@@ -888,7 +1161,7 @@ out_pose = poses[part_index][sub_index]  # table lookup, not a new plan
 
 ---
 
-## 14. Every “20 ms” you will meet
+## 15. Every “20 ms” you will meet
 
 They are different clocks. Posing uses some of them and not others.
 
@@ -897,6 +1170,8 @@ They are different clocks. Posing uses some of them and not others.
 | `time.sleep(0.02)` | `step_controller.py:268` | worker loop | Only if job A/B/C/D published this tick |
 | `duration=0.02` | job D in the same loop | one IK **frame** (leans and gaits) | Yes, one 20 ms slide |
 | `duration/0.02` | `pose_transformer.py:23` | how many lean frames | Indirectly |
+| `period/6/0.02` | `move.py:76-78` | snapshots per gait part (`MovingGenerator`) | Indirectly |
+| `period×1000/20` | `move.py:196` | phases in one cmd_vel cycle | Indirectly |
 | clamp `duration >= 0.02` | `servo_controller.py:83` | hardware minimum | Yes: shorter requests become 20 ms |
 | `time.sleep(0.02)` | `controller_manager.py:118` | `/joint_states` for RViz | No |
 | `.d6a` `Time` minimum 20 | Qt editor | shortest legal keyframe | Only if the file uses 20 |
@@ -905,7 +1180,7 @@ The director’s clock is **50 ms**, not 20. The pianist’s clock is **each row
 
 ---
 
-## 15. If you remember only this
+## 16. If you remember only this
 
 The director never moves a servo. It sends postcards to the receptionist.
 
@@ -914,5 +1189,7 @@ The director never moves a servo. It sends postcards to the receptionist.
 **The dance** is a different postcard: “play the file named `master_dance`.” The receptionist starts the pianist. The pianist is a file cursor. Each row is raw pulses and a duration. The 20 ms worker is idle on purpose so it does not fight.
 
 **Pose transformation** in the Python source is a third thing: feet planted, body leaned a little every 20 ms. This dance never queues it.
+
+**Walk** is a fourth motion machine, not a pose. Two generators share the walk inbox: `MovingGenerator` from a Traveling postcard (N steps of stride S), `CmdVelGenerator` from a Twist (keep stepping at this speed). Each 20 ms tick of job C reads one snapshot of six foot xyz from a table the generator built for the whole step or the whole velocity cycle, then IK’s it with duration 0.02 s. A step that has started is finished before a new generator is swapped in. This dance never queues a walk; Twist 0 would, which is why halt does not leave it alone.
 
 From `/servo_controller` downward there is only one pipe. Whoever publishes there owns the legs until the next message.
