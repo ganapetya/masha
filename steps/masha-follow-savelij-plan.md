@@ -1,34 +1,36 @@
-# Masha follows Saveli — corrected plan
+# Masha hunter — pluggable target (Saveli first)
 
 **Status:** plan only. Do **not** implement until Peter asks.  
 **Source:** host clipboard paste (2026-09-16) titled “Step 2 Execution Plan: Masha Following Savelij (Mecanum Car)”.  
 **This memo:** feasibility against Masha as she actually runs (Jetson Orin NX, ROS 2 Humble, `ROS_DOMAIN_ID=27`, `proud_up`, Aurora 930, LD19, bus servos).  
 **Name:** the other robot is **Saveli** in the trio docs; the clipboard used **Savelij**. Same machine. This file uses **Saveli**.  
-**Revision (2026-09-16, later same day):** custom gait is **in scope**. The first draft dropped it because a vendor `CmdVelGenerator` walk would already chase a tagged car. That was the *efficient* answer. Peter’s goal is **learning**, so we write the walk ourselves. **Map pick (Peter, same day): variant 3 — omnidirectional tripod.** Detailed design is in this file. Bounce / high-step / period are knobs, not a fourth map.
+**Revision (2026-09-16, later same day):** custom gait is **in scope**. Map pick: **variant 3 — omnidirectional tripod.**  
+**Revision (2026-09-16, hunter):** Saveli is the **first plug**, not the product. End goal is a spider **hunter**: deep stand, slow head scan, recognize, **call the target by name**, follow ≤ **60 s** or until lost, then scan again. Node: **`masha_hunter_node`**. Next plug: **cat**. Filename kept for the GitHub URL.
 
 Related reading (do not re-derive):
 
 - `~/steps/MASHA_GAITS.md` — 50 Hz loop, Traveling vs `cmd_vel`, halt codes, AEP/PEP, gait numbers.
 - `~/ros2_ws/info/TRAJECTORY.MD` — what “string of beads” actually means here (linear clock, not a keyframe table).
-- `~/steps/quarter-01-sprint-02-masha-plan.md` — camera topics, QoS, arm rest pose, `/controller/cmd_vel`.
-- `~/steps/quarter-01-sprint-03-plan.md` — `gait=5` `FollowGaitGenerator`, swing-only quintic, support-polygon contract. **Same gait engine.** Saveli-follow is a second *client* of that generator, not a second generator.
+- `~/steps/quarter-01-sprint-02-masha-plan.md` — camera topics, QoS, arm pan/tilt (ids 19 / 22), `/controller/cmd_vel`.
+- `~/steps/quarter-01-sprint-03-plan.md` — `gait=5` `FollowGaitGenerator`, swing-only quintic, `aplay` worker. **Same gait engine.** Hunter is a *client* of that generator, not a second generator.
 
 ---
 
-## Two products (both in scope)
+## Three products (all in scope)
 
 | Product | What we learn | What we do **not** do |
 |---|---|---|
 | **1. Custom gait** | Foot-tip map, two clocks (cycle vs swing), support triangle, hook into the 20 ms loop | A second 50 Hz node on `/servo_controller`. A new mode inside closed-source `kinematics.so`. Replacing IK. |
-| **2. Saveli follower** | AprilTag → `base_link` \((x,y,\theta)\), PD, **crab `vy` when he strafes**, LiDAR latch, halt that *stands* | Vendor `apriltag_track` / `lidar_app`. Bare `/cmd_vel`. Zero Twist as “stop”. |
+| **2. Hunter node** | `HUNT → NAME → FOLLOW (≤60 s) → HUNT`. Pluggable detect, speak name, PD + crab + LiDAR, halt that *stands*, slow pan “head” | Vendor `apriltag_track` / `lidar_app`. Bare `/cmd_vel`. Zero Twist as “stop”. A looping `.d6a` “spider dance.” |
+| **3. Target plugs** | Saveli = AprilTag (first, no train). Cat = COCO YOLO class 15 on existing `yolov8n.onnx` (v2 train only if that misses) | A second DNN node. Training on the Jetson as a gate. |
 
-Product 1 is the walk. Product 2 is who she walks toward. The clipboard glued them as `custom_gait_node` publishing servos. We keep them glued as **intent**, and split them at the **wire**: follower publishes velocity; our generator owns the feet; `StepController` still owns the servos.
+Product 1 is the walk. Product 2 is the spider that uses the walk. Product 3 is **who** she hunts. The clipboard glued walk + target as `custom_gait_node` publishing servos. Split at the **wire**: hunter publishes velocity; our generator owns the feet; `StepController` still owns the servos; each target is a `TargetSource`.
 
 ---
 
 ## Verdict
 
-**Following Saveli is feasible.** Rigid body + a rear AprilTag is a better first target than a person.
+**Hunter is feasible.** Saveli (rigid body + rear AprilTag, joystick in Peter’s hands) is the right **first** plug. Cat is the next plug, not a second node. A person is still a worse first target than either.
 
 **Writing our own gait is feasible, and it is a goal of this project.** The 20 ms loop does not require the vendor curve. It only requires a tuple of six foot positions, then IK, then pulses.
 
@@ -47,10 +49,10 @@ Product 1 is the walk. Product 2 is who she walks toward. The clipboard glued th
 | Stop by `vx = 0, ωz = 0` | **No** | Zero Twist **starts a gait in place**. Halt is Traveling `gait=0` then `gait=-2`. |
 | `r = √(x² + z²)`, `θ = atan2(x, z)` as body heading | **Only in optical frame** | Control must be in `base_link`: `r = √(x² + y²)`, `θ = atan2(y, x)`. Camera sits on the arm. |
 | `r_target = 0.60 m`, hard stop `0.50 m` | **Too tight** | One unfinished step (~0.7 s) at 0.05–0.12 m/s overshoots 3–8 cm. LiDAR is 10 cm forward of `base_link`. Use ~0.80 m standoff. |
-| Three nodes in series: tracker → lidar_safety → pid → gait | **Wrong shape** | Safety is an **override**, not a pipe stage. One C++ follower node + stock `apriltag_ros` + the gait **hook** in `controller`. |
+| Three nodes in series: tracker → lidar_safety → pid → gait | **Wrong shape** | Safety is an **override**, not a pipe stage. One C++ **hunter** node + plugs (`apriltag_ros` and/or in-process YOLO) + the gait **hook** in `controller`. |
 | Match Saveli’s Mecanum strafe with `vy` | **Not first** | Masha *can* `linear.y` (±0.10 m/s). First tests: `vx` + `ωz` only. Strafe-out-of-FOV is a lost-target halt, not a crab match. Later, if the custom gait’s map includes `vy`, we can add it as a character choice. |
 
-Do **not** mix this with Sprint 2 `follow_the_cat_node`, Sprint 3 `masha_interaction_node` FOLLOW, vendor `lidar_app`, Nav2, or joystick walk. Two publishers on `/controller/cmd_vel` fight. The **gait library** (`follow_gait.hpp` + `FollowGaitGenerator`) is shared with Sprint 3 Step 2; the **follow node** is not.
+Do **not** mix this with Sprint 2 `follow_the_cat_node`, Sprint 3 `masha_interaction_node` FOLLOW, vendor `lidar_app`, Nav2, or joystick walk. Two publishers on `/controller/cmd_vel` **and** two writers on arm servos 19/22 fight. Reuse Sprint 2 **gaze math** and the YOLO ONNX loader inside the hunter; do not launch that node. The **gait library** (`follow_gait.hpp` + `FollowGaitGenerator`) is shared with Sprint 3 Step 2; the hunter is the walk client.
 
 ---
 
@@ -58,11 +60,11 @@ Do **not** mix this with Sprint 2 `follow_the_cat_node`, Sprint 3 `masha_interac
 
 Same rule as Sprints 2 and 3. Headers, `.cpp`, tests, launch, yaml, and the Python generator: comments a Java/Python learner can learn from.
 
-- **Why, not restating the line.** Why zero Twist walks in place, why the arm is locked, why LiDAR metres and camera metres are not the same origin, why `gait=5` must never enter `kinematics.set_step_mode`.
+- **Why, not restating the line.** Why zero Twist walks in place, why HUNT pans and FOLLOW only *nudges* gaze, why LiDAR metres and camera metres are not the same origin, why `gait=5` must never enter `kinematics.set_step_mode`.
 - **Formulas next to code.** Name frames (`rgb_camera_link` / optical, `base_link`, `lidar_frame`) and units (m, rad, mm, pulse). Quintic `sigma(tau)` next to the swing sampler. Support triangle next to the phase split.
 - **Masha specifics.** Real topics, `ROS_DOMAIN_ID=27`, clamps, QoS, gait numbers (`1` ripple, `2` tripod, `5` ours, `12`/`15` as `cmd_vel` selectors, `-2` halt).
 - **Concurrency.** Image callback stores pointers; control timer owns PID + publish; never OpenCV on the DDS callback. The 20 ms gait thread already exists — we do not add another.
-- **Safety.** Halt with Traveling. Lost tag → halt. LiDAR floor → halt. Watchdog if commands go quiet. Stance triangle contains CoM projection at every sample.
+- **Safety.** Halt with Traveling. Lost target → halt + HUNT sweep (not a march). LiDAR floor → halt. 60 s follow cap. Watchdog if commands go quiet. Stance triangle contains CoM projection at every sample. Never OpenCV or `aplay` on the DDS callback.
 - **Tests.** Each gtest names the invariant (optical vs body heading, clamp, hysteresis, “zero Twist is not a halt”, swing `z-dot≈0` at lift/land, cycle clock does **not** rest at wrap).
 
 Do not spam `// increment i`. Match existing `proud_up` tone.
@@ -95,7 +97,7 @@ That loop is the **only** legal writer of leg pulses during a walk. Our custom g
 
 The TRAJECTORY.MD “string of beads” is the **clock**: equal time samples, no quintic. It is **not** a `.d6a` keyframe walk. Action groups (`twist.d6a`, dances) are the keyframe tables. Mixing those two machines is how you break the robot.
 
-We **skip this sampler for Saveli follow.** We still use:
+We **skip this sampler for hunter follow.** We still use:
 
 | Call | What it is | This project |
 |---|---|---|
@@ -116,7 +118,7 @@ Clipboard Phase 1 (“write `custom_gait_node`”) would duplicate the **executo
 
 A new Twist replaces the generator on a step boundary (`last_part`). A halt can take up to one period (~0.7 s). Budget that in the stop distance.
 
-Before the first follow Twist, publish Traveling `gait: 15` once (height ~25–30 mm, `time` ~0.6–0.8 s) so `cmd_gait=5` / `cmd_height` / `cmd_period` are defined. Default `cmd_gait` is 2 if nothing was sent — that would silently use the vendor tripod. The follower must not forget this select.
+Before the first follow Twist, publish Traveling `gait: 15` once (height ~25–30 mm, `time` ~0.6–0.8 s) so `cmd_gait=5` / `cmd_height` / `cmd_period` are defined. Default `cmd_gait` is 2 if nothing was sent — that would silently use the vendor tripod. The hunter must not forget this select.
 
 Hook (when implementing), in `step_controller.py`:
 
@@ -140,7 +142,9 @@ Better detector, already on the Jetson:
 - System / third-party: `apriltag_ros` (`AprilTagNode`), messages `apriltag_msgs/AprilTagDetectionArray`, yaml tag size in **metres**.
 - Or OpenCV ArUco `DICT_APRILTAG_36h11` inside `proud_up` (OpenCV 4.11 on this board; `cv2.aruco` present). Needs the **measured** tag edge length.
 
-Prefer **stock `apriltag_ros`** for pose (it already does PnP with `size`) plus a new C++ follower. Do not launch the vendor `apriltag_recognition` at the same time.
+**Saveli plug:** prefer **stock `apriltag_ros`** for pose (PnP with `size` in metres). Do not launch vendor `apriltag_recognition` at the same time.
+
+**Cat plug:** same `proud_up/models/yolov8n.onnx` Sprint 2 already serves for COCO **person** (class 0). Filter class **`cat` (15)**. Do not launch vendor `yolo_detect`. See [Target plugs](#target-plugs).
 
 ### LiDAR geometry
 
@@ -162,7 +166,7 @@ We write that map. We do **not** call `kinematics.set_step_mode(..., gait=5, ...
 
 C++ math lives in `proud_up` like ZMP: `include/proud_up/follow_gait.hpp` + `src/follow_gait.cpp` (no rclcpp) + `test/test_follow_gait.cpp`. Python generator copies the same formulas; comments in `move.py` point at the header. Do not invent a second IK.
 
-This is the same engine Sprint 3 Step 2 named `FollowGaitGenerator`. Write it **once**. Saveli-follow and (later) person-follow are two publishers of Twist into it. Do not create `gait=6` unless Peter later wants a *second* character that must run at the same time as this one (it cannot: one generator slot).
+This is the same engine Sprint 3 Step 2 named `FollowGaitGenerator`. Write it **once**. Hunter (Saveli plug, later cat plug) and Sprint 3 person-follow are *clients* of that generator. Do not create `gait=6` unless Peter later wants a *second* character that must run at the same time as this one (it cannot: one generator slot).
 
 ### Support constraint (the actual “special” contract)
 
@@ -254,9 +258,9 @@ Clipboard Phase 1 was “live `(vx, vy, ωz)` → feet.” Vendor `CmdVelGenerat
 - Stance foot is fixed on the floor, so in `base_link` it traces the **inverse** rigid motion. AEP/PEP are the ends of that track (no-slip).
 - Swing is the quintic bridge PEP→AEP, including the **lateral** gap, not only `x`.
 
-Crab is **not** a second gait. The generator always accepts `vy`. The follower **turns `vy` on** when Saveli is already ahead and slides left/right, so Masha sidesteps and stays in one line behind him instead of yawing after him. See [Crab policy](#crab-policy-follower-not-gait).
+Crab is **not** a second gait. The generator always accepts `vy`. The hunter **turns `vy` on** when the target is already ahead and slides left/right, so Masha sidesteps and stays in one line instead of yawing after it. See [Crab policy](#crab-policy-hunter-not-gait). First live crab is the **Saveli** plug (Mecanum). Cat plug keeps `enable_crab` false until that is boring.
 
-Cost: wrong AEP/PEP signs scuff or trip. First live gait tests keep `vy = 0` until `vx + ωz` is boring (Phase G2), then a hand `vy` Twist, then the follower crab gate.
+Cost: wrong AEP/PEP signs scuff or trip. First live gait tests keep `vy = 0` until `vx + ωz` is boring (Phase G2), then a hand `vy` Twist, then the hunter crab gate.
 
 #### Not a variant (knobs on the chosen map)
 
@@ -270,7 +274,7 @@ Do not spend a fourth generator on these:
 
 ## Variant 3 design (locked)
 
-Status: design only. Do **not** implement until Peter says to build. Package split stays: C++ math in `proud_up/follow_gait.hpp` (no rclcpp) + gtest; Python `FollowGaitGenerator` copies the same formulas; `StepController` consumes the generator; follower publishes Twist including `vy`.
+Status: design only. Do **not** implement until Peter says to build. Package split stays: C++ math in `proud_up/follow_gait.hpp` (no rclcpp) + gtest; Python `FollowGaitGenerator` copies the same formulas; `StepController` consumes the generator; hunter publishes Twist including `vy`.
 
 ### What “omnidirectional” means here
 
@@ -286,7 +290,7 @@ V = (vx, vy, ωz)     # m/s, m/s, rad/s   (generator uses mm/s internally)
 
 A tripod gait with only `vx` and `ωz` is still a tripod. What we add is the **no-slip map** from this twist onto six AEP/PEP points, including the lateral term. Without that map, `linear.y` on `/controller/cmd_vel` would either be ignored or fall through to vendor `CmdVelGenerator`.
 
-The gait does **not** decide when to crab. It only knows the twist it was given this cycle. When to set `vy ≠ 0` is the follower policy below.
+The gait does **not** decide when to crab. It only knows the twist it was given this cycle. When to set `vy ≠ 0` is the hunter policy below.
 
 ### Frames, units, nominal feet
 
@@ -426,7 +430,7 @@ C++ owns this function. Python generator calls the same math (port, with a comme
 
 IK remains `kinematics.set_leg_position` inside `set_pose_base`.
 
-### Crab policy (follower, not gait)
+### Crab policy (hunter, not gait)
 
 Peter’s assumption is right, with a gate so crab does not fight a large heading error.
 
@@ -479,7 +483,7 @@ else:
     vy = 0
 ```
 
-So crab is **activated when Saveli moves left or right and we are already looking at him**. It is not activated when he is 40° off to the side (that is Test 1: turn in place). Lost tag / LiDAR latch: `vy = 0` and `halt_legs()`, same as today.
+So crab is **activated when Saveli moves left or right and we are already looking at him**. It is not activated when he is 40° off to the side (that is Test 1: turn in place). Lost tag / LiDAR latch: `vy = 0` and `halt_legs()`, then HUNT sweep (lost) or STOPPED (lidar).
 
 Do **not** command `vy` from `θ` itself (`vy = Kp θ`). `θ` is a heading; `y` is the line offset. At 0.80 m, `θ = 5°` is only 7 cm of `y`.
 
@@ -500,13 +504,15 @@ Later (not G0): rotate `(e_x, e_y)` by `ψ` so the “line” is Saveli’s head
 | `h` / `cmd_height` | 25 mm | same |
 | `Ts` | `T/2` | gait math |
 | `stride_max` | 40 mm | gait clamp |
-| `vx_max` | 0.05 m/s | follower |
-| `vy_max` | 0.04 m/s | follower; 0 until crab gate |
-| `wz_max` | 0.3 rad/s | follower |
-| `r_target` | 0.80 m | follower |
+| `vx_max` | 0.05 m/s | hunter |
+| `vy_max` | 0.04 m/s | hunter; 0 until crab gate |
+| `wz_max` | 0.3 rad/s | hunter |
+| `r_target` | 0.80 m | hunter |
 | `θ_crab` | 15° | crab gate |
 | `y_on` / `y_off` | 0.06 / 0.03 m | crab hysteresis |
-| `enable_crab` | **false** until Test G2 `vy` is boring | yaml |
+| `enable_crab` | **false** until Test G2 `vy` is boring | yaml; Saveli plug first |
+| `follow_max_s` | 60 | hunter; then back to HUNT |
+| `search_timeout_s` | 20 | sticky id while scanning |
 
 ### Bring-up order for this map
 
@@ -514,14 +520,14 @@ Later (not G0): rotate `(e_x, e_y)` by `ψ` so the “line” is Saveli’s head
 2. **G1** — hook, Traveling `gait: 5`, `stride 0` / `V = 0`: tripod in place, soft landings, halt `-2`.
 3. **G2a** — `gait: 15`, `vx = 0.03`, halt; then `ωz` only, halt.
 4. **G2b** — `vy = 0.03` only, halt. She must **translate left**, not yaw. This is the gait proof of crab. Tape a line on the floor.
-5. **Follow C** — `enable_crab:=false`. Tests 1–2 as written (`vx`, `ωz`).
-6. **Follow Test 3b** — `enable_crab:=true`. Drive Saveli **sideways** on the Mecanum. Masha sidesteps, stays behind him, heading does not chase him around. If he leaves the 15° cone, she yaws first. Cover the tag → stand.
+5. **H2** — `enable_crab:=false`. Tests 1–2 (`vx`, `ωz`). 60 s cap. Lost → HUNT sweep.
+6. **Test 3b** — `enable_crab:=true` (Saveli plug). Drive Saveli **sideways**. Masha sidesteps, stays behind him. Cover the tag → HUNT sweep, not a march.
 
 ### Failure modes (this map)
 
 | Symptom | Likely cause |
 |---|---|
-| Crab is a spin | `vy` sign flipped, or follower is writing `ωz` from `y` instead of `vy` |
+| Crab is a spin | `vy` sign flipped, or hunter is writing `ωz` from `y` instead of `vy` |
 | Scuff / trip on turn | AEP/PEP rotation term sign (`ωz × r`) flipped |
 | March in place after alignment | streaming `Twist{}`; need `halt_legs()` |
 | Looks like vendor tripod, stomps | fell through to `CmdVelGenerator` (`cmd_gait` still 2; forgot `gait: 15`) or linear `s` on swing |
@@ -555,51 +561,46 @@ gtest names the invariant in the test title: `VyPositiveMovesAepLeft`, `WzPositi
 | Zero Twist = stop | Zero Twist = walk in place | `halt_legs()`: Traveling `gait=0` then `gait=-2`. Same helper as `follow_the_cat_node`. |
 | `custom_gait_node` @ 50 Hz → `/servo_controller` | `StepController` already owns that wire | **Write the gait. Do not write a servo publisher.** |
 | Replace “string of beads” gait | Beads = linear clock on the vendor AEP/PEP curve | **Replace the clock and the map** inside a new generator. Keep the 20 ms sampler. |
-| `camera_link` | `depth_cam_link` / `rgb_camera_link`, parent `link4` | Lock arm at camera-forward rest pose. TF detections into `base_link`. |
+| `camera_link` | `depth_cam_link` / `rgb_camera_link`, parent `link4` | **HUNT** pans id 19 (there is no neck). FOLLOW nudges gaze. TF detections into `base_link` (joint states update). |
 | `r = √(x²+z²)`, `θ = atan2(x,z)` | Optical: X right, Z forward. Body: X forward, Y left | Optical only inside the detector. Control: `r = hypot(x,y)`, `θ = atan2(y,x)` in `base_link`. |
 | `r_target = 0.60`, stop `0.50`, go `0.55` | Halt delay + lidar offset + body ~0.4 m wide | Start: `r_target = 0.80 m`, `d_stop = 0.55 m`, `d_go = 0.70 m` (all `base_link`). First `vx` cap **0.05 m/s**. |
 | P-only `vx = Kp er`, `ωz = Kp eθ` | Hexapod lags a full step | PD + deadband. No I on first bring-up (windup during the unfinished step). |
-| Three nodes in series | Safety must override | One follower node: tracker, PID, lidar, halt, watchdog. Gait lives in `controller`, selected by `gait=5` / `15`. |
+| Three nodes in series | Safety must override | One hunter node: plugs, PID, lidar, halt, watchdog, 60 s cap. Gait lives in `controller`, selected by `gait=5` / `15`. |
 | 60° LiDAR sector | Vendor follow uses 90° | Parameter, default **90°**. Ignore non-finite / `< 0.2 m`. |
-| Test 3: match Mecanum strafe | Variant 3 gait accepts `vy`; follower **gates** it | G2b: hand `vy` Twist. Follow C: `vx`,`ωz`. Test 3b: crab when `|θ|<15°` and `|y|` grows. Lost tag → halt. |
+| Test 3: match Mecanum strafe | Variant 3 gait accepts `vy`; hunter **gates** it | G2b: hand `vy` Twist. H2: `vx`,`ωz`. Test 3b: crab when `|θ|<15°` and `|y|` grows. Lost → HUNT sweep. |
 
 ---
 
 ## Architecture (corrected)
 
 ```
-Saveli (Mecanum car)
-  rear: AprilTag 36h11, measured edge length in yaml
-           │
-           ▼
-Aurora RGB  /depth_cam/rgb/image_raw     LD19 /scan
-  + camera_info (best-effort)
-           │
-           ▼
-apriltag_ros  AprilTagNode
-  → detections (pose in camera / optical frame)
-           │
-           ▼
-savelij_follow_node   (NEW, package proud_up)
-  1. lock arm rest pose (ids 19–24), never pan while following
-  2. TF tag pose → base_link   (x forward, y left)
-  3. x,y in base_link;  r = hypot(x,y);  θ = atan2(y,x)
-  4. optional: depth at tag pixel as range sanity check
-  5. frontal /scan → d_min in base_link
-  6. once: Traveling gait=15  (select our generator for cmd_vel)
-  7. if lost / lidar stop / watchdog: halt_legs()
-     else: PD(e_x, e_θ) → vx, ωz;  if crab gate: PD(e_y) → vy
-           Twist (vx, vy, ωz) on /controller/cmd_vel
-           │
-           ▼
+enabled_targets yaml:  [saveli]           later: [saveli, cat]
+
+  Saveli plug                         Cat plug
+  apriltag_ros 36h11                  yolov8n.onnx COCO class 15
+  pose in camera → TF                 bbox + depth/heuristic → TF
+           \                               /
+            \                             /
+             ▼                           ▼
+         TargetHit { id, spoken_wav, pose_in_base, pixel }
+                           │
+                           ▼
+masha_hunter_node   (NEW, package proud_up)
+  IDLE:   halt, hunter_pose, wait ~/start
+  HUNT:   halt, slow pan id 19 (optional tilt 22), any enabled plug
+  NAME:   halt, hold gaze, aplay spoken_wav once (worker thread)
+  FOLLOW: gait 15 + PD Twist, gentle gaze, sticky id, ≤ 60 s
+          LiDAR latch / lost / timeout → halt → HUNT (sticky search)
+                           │
+                           ▼
 /controller
   cmd_gait==5  →  FollowGaitGenerator @ 50 Hz   (SE(2) AEP/PEP + swing quintic)
-           │
-           ▼
+                           │
+                           ▼
 StepController  →  kinematics.set_leg_position (IK only)  →  /servo_controller
 ```
 
-Saveli is a **separate** computer. Do not assume a shared ROS domain. Masha only *sees* the tag.
+Saveli is a **separate** computer. Do not assume a shared ROS domain. Masha only *sees* the tag (or the cat).
 
 Do **not** start:
 
@@ -614,26 +615,30 @@ Voice stack may stay up. “Stop” via existing voice halt is a plus if it does
 
 ---
 
-## Hardware (Peter, before any follow node)
+## Hardware (Peter)
 
-Gait dry-run (Phases G0–G2) does **not** need Saveli or a tag. Follow phases do.
+Gait dry-run (G0–G2) needs no target. Hunter HUNT sweep needs no target. Saveli plug needs the tag. Cat plug needs a cat (or a printed photo on the bench).
+
+**Saveli (first plug):**
 
 1. Print **tag36h11 id 0** (or another id, then set yaml). Measure the **black-square edge** in metres. Clipboard-era yaml in `apriltag_ros` defaults to **0.08 m** — do not trust that; measure.
-2. Mount it **vertical, facing backward**, on Saveli’s rear, as high as the Aurora sees at 0.6–1.5 m with Masha’s arm in the rest pose. Not on the floor. Not at an angle that foreshortens to a line.
+2. Mount it **vertical, facing backward**, on Saveli’s rear, as high as the Aurora sees at 0.6–1.5 m during the pan sweep (not only at rest 19=500). Not on the floor. Not at an angle that foreshortens to a line.
 3. Lighting: AprilTag wants contrast. Avoid pointing the tag at a window behind Masha.
 4. Keep Saveli’s rear clear of cables that cover the tag when it turns.
 
-Arm rest pose (camera-forward, same numbers as proud-up / follow-the-cat):
+**Arm (there is no neck).** Camera is on `link4`. “Rotating head” = **id 19 pan**. Optional small **id 22 tilt**. Hold 23 and 24 at 500. **Do not** command servo 23 as tilt (wrist yaw). Sprint 2 rest snapshot (centre of the sweep):
 
 ```
 19=500, 20=810, 21=180, 22=150, 23=500, 24=500
 ```
 
-Hold 23 and 24 at 500. **Do not** command servo 23 as tilt (it is wrist yaw). This project **does not** gaze-track: the camera stays bolted forward so `base_link` ↔ camera TF is stable.
+Pan window start ~200–800 (same clamps as `follow_the_cat`). Sweep period ~8–12 s. TF `base_link` → camera **is valid while panning** because `robot_state_publisher` follows `/joint_states`. The old “bolt the camera forward for the whole follow” rule is **dropped**. HUNT must pan. FOLLOW only *nudges* gaze to keep the hit centered (`integrate_gaze`).
+
+**Deep hunter pose:** halt `gait=-2` → `DEFAULT_POSE` (body ~70 mm). That is already a low hexapod stand. Yaml `hunter_pose` (built-in name) if Peter later wants a deeper crouch. **Not** a looping `.d6a` (action groups fight the gait).
 
 ---
 
-## Frames and math (follower)
+## Frames and math (hunter walk)
 
 Optical (ROS camera, `rgb_camera_link`): **X right, Y down, Z out of the lens.**  
 Clipboard `r = √(x_s² + z_s²)`, `θ = atan2(x_s, z_s)` is **this** frame. Fine as a detector local, wrong as a walk command.
@@ -651,7 +656,7 @@ e_y   = y                           # left/right of our nose — crab error
 e_θ   = θ
 ```
 
-PD (first bring-up; I-term off). Crab gate is in [Variant 3 design](#crab-policy-follower-not-gait); `enable_crab` default **false**.
+PD (first bring-up; I-term off). Crab gate is in [Variant 3 design](#crab-policy-hunter-not-gait); `enable_crab` default **false**.
 
 ```text
 vx = clamp( Kp_x * e_x  + Kd_x * ė_x,  -vx_max, +vx_max )
@@ -687,52 +692,112 @@ Start values (all discussed as **base_link** range to the obstacle, not “lidar
 | `r_target` | 0.80 m | follow standoff |
 | `d_stop` | 0.55 m | hard stop |
 | `d_go` | 0.70 m | re-enable |
-| `lost_timeout` | 0.5 s | no tag → halt |
+| `lost_timeout` | 0.5 s | no hit → halt + HUNT |
 | `walk_watchdog` | 0.3 s | no control tick → halt |
+| `follow_max_s` | 60 s | even if still tracking → HUNT |
+| `search_timeout_s` | 20 s | sticky id while scanning |
 
 `r_target` must sit **above** `d_go`, otherwise the PID drives her into the latch. Clipboard 0.60 / 0.50 / 0.55 violates that once halt delay is included.
 
-Lost tag: halt, stay in LOST. Optional later: slow search `ωz` in place — **not** first tests.
+Lost target: `halt_legs()`, enter **HUNT** (slow pan), sticky to the last id until `search_timeout_s`. Do **not** search by walking `ωz` in place (that is a gait, not a head sweep).
 
-Depth sanity (optional, after Phase C): sample `/depth_cam/depth/image_raw` at the tag centre. If `|z_depth - z_pnp|` is large, trust lidar for range and tag for bearing, or halt.
+Depth sanity (optional, after H2): sample `/depth_cam/depth/image_raw` at the tag/box centre. If `|z_depth - z_pnp|` is large, trust lidar for range and the plug for bearing, or halt.
 
 ---
 
-## Node design (follower)
+## Node design (hunter)
 
 **Package:** `proud_up` (no new ament package).  
-**Executable:** `savelij_follow_node`.  
-**Launch:** `ros2 launch proud_up savelij_follow.launch.py` after slim bringup — do **not** run `~/.stop_ros.sh` to start it.
+**Executable:** `masha_hunter_node`.  
+**Launch:** `ros2 launch proud_up masha_hunter.launch.py` after slim bringup — do **not** run `~/.stop_ros.sh` to start it.
 
-Split like follow-the-cat:
+Split:
 
-- `include/proud_up/savelij_follow.hpp` + `src/savelij_follow.cpp` — no rclcpp: PD, deadband, lidar hysteresis, crab gate (`θ_crab`, `y_on`/`y_off`), optical→body heading tests with fake poses.
-- `src/savelij_follow_node.cpp` — subscriptions, TF, timer, publishers, services.
-- `test/test_savelij_follow.cpp` — offline gtest.
-- `launch/savelij_follow.launch.py` + `config/savelij_follow.yaml`.
-- Launch also starts `apriltag_ros` remapped to `/depth_cam/rgb/image_raw` and `/depth_cam/rgb/camera_info`, yaml with **measured** `size` and `tag_ids`.
+- `include/proud_up/hunter.hpp` + `src/hunter.cpp` — no rclcpp: PD, deadband, lidar hysteresis, crab gate, 60 s cap, phase helpers. Fake poses in gtest.
+- `include/proud_up/target_source.hpp` — `TargetHit` + virtual `TargetSource`.
+- `src/target_saveli.cpp` — AprilTag array + TF → `TargetHit` (`id = saveli`).
+- `src/target_cat.cpp` — YOLO class 15 + pixel ray / depth → `TargetHit` (`id = cat`). Reuse Sprint 2 ONNX load path; do not copy-paste a second net if one net can filter two classes.
+- `src/masha_hunter_node.cpp` — subscriptions, TF, timer, arm sweep, `aplay` worker, publishers, services.
+- `test/test_hunter.cpp` — offline gtest (including “NAME once”, “60 s → HUNT”, crab, halt ≠ zero Twist).
+- `launch/masha_hunter.launch.py` + `config/masha_hunter.yaml`.
+- Launch starts `apriltag_ros` **only if** `saveli` is in `enabled_targets`.
 
-**QoS:** image, camera_info, scan: `KeepLast(5)` + `best_effort()`, copy `follow_the_cat_node` / `lidar_controller`.
+**QoS:** image, camera_info, depth, scan: `KeepLast(5)` + `best_effort()`, copy `follow_the_cat_node`.
 
-**Phases:** `IDLE → LOCKED → FOLLOW → STOPPED / LOST`.
+**Phases:** `IDLE → HUNT → NAME → FOLLOW → STOPPED` (and HUNT on lost / timeout).
 
-- `IDLE`: rest pose, `halt_legs()`, wait `~/start`.
-- `LOCKED`: tag seen for `lock_seconds` (~0.5–1 s) and `r` in `[d_go, 1.5]`.
-- `FOLLOW`: PD Twist on our gait. LiDAR latch → `STOPPED`. Miss `lost_timeout` → `LOST` + halt.
-- `STOPPED`: halt; wait `d_min > d_go` and tag still locked → `FOLLOW`.
-- `LOST`: halt; tag returns → `LOCKED`.
+| Phase | Legs | Head (arm) | What happens |
+|---|---|---|---|
+| **IDLE** | `halt_legs()` | `hunter_pose` centre (19=500, …) | Wait `~/start`. No sweep. |
+| **HUNT** | Halt. Deep stand (`DEFAULT_POSE` unless yaml `hunter_pose`). | Slow pan id 19, optional tilt 22, ~8–12 s period, ~200–800. | Any **enabled** plug can fire. Spider in the room. |
+| **NAME** | Halt. | Hold the pose that sees the hit. | `aplay` `spoken_wav` **once**, worker thread, Sprint 3 pattern. Skip re-name if re-lock within `search_timeout_s`. |
+| **FOLLOW** | Traveling `gait: 15` then Twist. Sticky `id`. | Gentle `integrate_gaze` (no wide scan). | ≤ **`follow_max_s = 60`**. LiDAR latch → `STOPPED`. Lost / timeout → halt → **HUNT**. |
+| **STOPPED** | Halt. | Hold gaze. | `d_min > d_go` and time left → FOLLOW; else HUNT. |
 
-On entering `FOLLOW` the first time (and after a halt that cleared `cmd_gait`): publish Traveling `gait: 15` so the next Twist is ours.
+On entering `FOLLOW` the first time (and after a halt that cleared `cmd_gait`): publish Traveling `gait: 15`.
 
-Services (Masha app pattern): `~/start`, `~/stop` (`std_srvs/Trigger`). Parameter `enable_walk` **default false**: first live bring-up of the *follower* is **detect-and-print** (`r`, `θ`, `d_min`) with legs halted. Turn walk on after the numbers look right on the real floor. Gait dry-run does not use this node.
+Services: `~/start`, `~/stop` (`std_srvs/Trigger`). `enable_walk` **default false**. `enabled_targets: [saveli]` first. Gait dry-run does not use this node.
 
-Debug: optional overlay image `~/image_result` (tag box, `r`, `θ`, `d_min`, phase). Do not `cv2.imshow` on the Jetson (vendor trackers do; we do not).
+Debug: overlay `~/image_result` (box, id, `r`, `θ`, `d_min`, phase, follow time left). No `cv2.imshow`.
+
+---
+
+## Target plugs
+
+```text
+TargetHit:
+  id            # "saveli" | "cat"
+  display_name  # "Saveli" | "cat"
+  spoken_wav    # basename under feedback_voice/english/
+  stamp
+  pose_in_base  # x, y, z, yaw if known; walk ignores z
+  pixel         # gaze + overlay
+  range_ok      # metric (tag) vs estimated (bbox+depth)
+  confidence
+```
+
+```text
+TargetSource (virtual, no rclcpp in the header):
+  id()
+  enabled()
+  detect(...) -> optional<TargetHit>   # timer thread; never OpenCV on DDS callback
+```
+
+Yaml:
+
+```text
+enabled_targets: [saveli]     # first bring-up; later [saveli, cat]
+follow_max_s: 60.0
+search_timeout_s: 20.0
+```
+
+Two plugs in one tick: prefer **sticky** id, else yaml order.
+
+**Saveli (first, no training).** Stock `apriltag_ros`, tag36h11, measured size, TF → `base_link`. Crab / `r_target` / LiDAR as in variant 3. Spoken wav: `saveli.wav` (“Saveli”).
+
+**Cat (next).** Same `yolov8n.onnx` already in `proud_up/models/` (COCO 80). Filter class **`cat` = 15**. Range: finite depth at box centre, else bbox-height heuristic. Bearing: pixel ray → TF → `base_link`. `enable_crab` default **false** for this plug until Saveli Test 3b is boring. Spoken wav: `cat.wav` (“cat”).
+
+Do **not** launch vendor `yolo_detect` or a second DNN process.
+
+---
+
+## Training / serving
+
+| Target | Train? | Serve |
+|---|---|---|
+| **Saveli** | **No.** Fiducial. | `apriltag_ros` + TF |
+| **Cat v1** | **No.** COCO `cat` on existing `yolov8n.onnx`. | OpenCV DNN ONNX, CUDA if Sprint 2 path works, else CPU. `imgsz` start 320. |
+| **Cat v2** | Only if v1 misses the house cat. **Off-board** fine-tune (not a Jetson training job). Export ONNX (optional TensorRT `.engine` later). Yaml `cat_onnx`. Same `TargetSource`. | Same hunter node, swap the file. |
+
+Do **not** gate hunter on a training pipeline. During Saveli work, grab a few Aurora frames of the cat; if COCO recall is poor, then v2.
+
+Wavs next to Sprint 3 clips: `~/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/saveli.wav`, `cat.wav`. `aplay -D pulse` on a **worker thread**, timeout, never `system()` on the timer.
 
 ---
 
 ## Phases (execution order)
 
-**Gait first, then tag, then glue.** That is the learning order. Clipboard Phase 1 (new gait *node*) stays rejected. Clipboard Phase 1 (new gait *map*) is Phases G0–G2.
+**Gait first, then hunter sweep, then Saveli plug, then cat plug.** Clipboard Phase 1 (new gait *node*) stays rejected. Clipboard Phase 1 (new gait *map*) is G0–G2.
 
 ### Phase G0 — gait map on paper + gtest (no robot)
 
@@ -760,40 +825,47 @@ Traveling `gait: 15` once, then small Twists by hand (`vx = 0.03`, then `ωz` on
 
 DoD: visibly not vendor walk (softer landings; wave if pick is 2). Halt stands.
 
-### Phase A — Tag visible (no walk)
+### Phase H0 — hunter sweep, no plug
+
+`enable_walk:=false`. `~/start`. Legs `DEFAULT_POSE`. Id 19 pans slowly. No Twist. `~/stop` centres the arm and stops the sweep.
+
+### Phase H1 / old A–B — Saveli plug, legs off
 
 1. Mount tag. Measure edge. Put metres in yaml.
-2. Slim bringup. Arm rest pose (node or a one-shot `pose_commander`).
-3. Launch `apriltag_ros` on Aurora RGB. `ros2 topic echo` detections. Walk Saveli by hand through 0.6–1.5 m, ±30° yaw.
-4. Confirm TF `base_link` → tag. Print `r`, `θ`. If `r` is nonsense, the yaml size is wrong.
+2. Slim bringup. `enabled_targets: [saveli]`.
+3. `apriltag_ros` on Aurora RGB. Walk Saveli by hand 0.6–1.5 m, ±30° yaw, **and** through the pan sweep.
+4. Confirm TF `base_link` → tag. Print `x,y,θ`. If `r` is nonsense, yaml size is wrong.
+5. Lock → **NAME** once (`saveli.wav`). Re-cover within 20 s → no second wav.
 
-DoD: stable `r` within ~5 cm of a tape measure at 1.0 m; `θ` sign matches “tag on Masha’s left → +θ”.
+DoD: `r` within ~5 cm of tape at 1.0 m; `θ` sign matches “tag on Masha’s left → +θ”; one spoken name.
 
-G0–G2 and A can overlap in calendar (gait on the bench vs tag on the car). Do **not** start Phase C until both G2 and A are green.
+G0–G2 and H0/H1 can overlap in calendar. Do **not** start H2 until G2 and H1 are green.
 
-### Phase B — Controller math, legs off
+gtest: body heading, deadband, lidar hysteresis, crab gate, “zero Twist is not halt”, “NAME once”, “60 s → HUNT”.
 
-gtest: body heading, deadband, lidar hysteresis, “zero Twist is not halt” as a documented invariant (the halt helper publishes Traveling, tested with a fake publisher or a pure function `should_halt(...)`).
+`enable_walk:=false`. Logs show commanded `vx`,`ωz` but **no** Twist on the walk topic. Legs stay in `DEFAULT_POSE`.
 
-`enable_walk:=false`. Start the node. Drive Saveli. Foxglove / logs show commanded `vx`,`ωz` but **no** Twist on the walk topic (or Twist not published). Legs stay in `DEFAULT_POSE`.
+### Phase H2 / old C–D — follow Saveli, our gait
 
-### Phase C — Follow, slow, **our** gait
-
-`enable_walk:=true`. Floor clear. First `vx_max = 0.05`.
+`enable_walk:=true`. Floor clear. First `vx_max = 0.05`. `follow_max_s = 60`.
 
 1. Node publishes Traveling `gait: 15` once.
-2. Tests 1–3 below.
+2. Tests 1–5 below (lost → **HUNT sweep**, not stand-and-wait only).
 3. Raise `vx_max` only after Test 2 is boring.
+4. Test 4 LiDAR latch. Halt is a stand, then sweep if still in HUNT.
+5. After Test 2: Test 3b crab. After 60 s still tracking → halt + HUNT.
 
-### Phase D — LiDAR latch on the real car
+### Phase E — knobs on the chosen variant (after H2, not a gate)
 
-Same node, no extra process. Confirm Test 4. Confirm she does **not** chatter at the boundary (hysteresis). Confirm halt is a stand, not a march.
+Height, period, optional bounce. Do **not** switch to a second map. Do **not** add a second servo node. Do **not** pass `5` into `kinematics.set_step_mode`.
 
-### Phase E — knobs on the chosen variant (after C/D, not a gate)
+### Phase C0 — cat plug, no walk
 
-Height, period, optional bounce. Do **not** switch to a second map in this phase. Do **not** add a second servo node. Do **not** pass `5` into `kinematics.set_step_mode`.
+`enabled_targets: [cat]` (or `[saveli, cat]` only after sticky-id gtest). `enable_walk:=false`. COCO class 15. Overlay + `cat.wav`. Bench stand-in: a printed cat photo is allowed for C0.
 
-After Test 2 is boring: Test 3b, `enable_crab:=true`. Lost-tag halt remains the backstop.
+### Phase C1 — cat follow
+
+Same 60 s / lost / LiDAR as H2. `enable_crab` stays false until Saveli 3b is boring. Do not debug both plugs walking in the same run until sticky-id is proven.
 
 ---
 
@@ -809,21 +881,31 @@ Joystick / pad on Masha unplugged. No Saveli required.
 
 **Test G2 — slow `cmd_vel`.** `gait: 15` then `vx = 0.03` for ~3 s, halt. Then `ωz` only, halt. She must translate / yaw and then **stand**, not march. Variant 3 only, after that is boring: `vy` only, then halt.
 
+### Hunter (no walk)
+
+**Test H0 — sweep.** `~/start`. Id 19 moves slowly. Legs `DEFAULT_POSE`. No Twist. `~/stop` centres pan.
+
+**Test NAME.** One `saveli.wav` per lock. Cover and uncover within 20 s → no second wav.
+
 ### Follow (clipboard Phase 5, corrected)
 
-Joystick on Saveli. Masha’s pad unplugged. `enable_walk` only after Phase B. Walk is **gait=5**.
+Joystick on Saveli. Masha’s pad unplugged. `enable_walk` only after H1. Walk is **gait=5**. `enabled_targets: [saveli]`.
 
-**Test 1 — Stationary heading.** Saveli still, offset ~20–30° at ~1 m. Masha turns in place (`ωz` only) until `|θ| < 5°`, then **halt** (stand). She must not step in place after alignment.
+**Test 1 — Stationary heading.** Saveli still, offset ~20–30° at ~1 m. Masha turns in place (`ωz` only) until `|θ| < 5°`, then **halt**. She must not step in place after alignment.
 
-**Test 2 — Straight follow.** Drive Saveli forward slowly. Masha holds ~0.80 m. No contact. Lost tag (you cover it) → stand within one step.
+**Test 2 — Straight follow.** Drive Saveli forward slowly. Masha holds ~0.80 m. No contact. Cover tag → halt within one step, then **HUNT sweep**.
 
-**Test 3 — Gentle curve.** Saveli yaws. Masha updates `ωz` and `vx`. `enable_crab:=false`: if Saveli **strafes** out of the camera, she **stops** (pass).
+**Test 3 — Gentle curve.** Saveli yaws. Masha updates `ωz` and `vx`. `enable_crab:=false`: if Saveli **strafes** out of the camera, she **stops** and hunts (pass).
 
-**Test 3b — Crab / one line.** `enable_crab:=true`. Drive Saveli sideways (Mecanum). Masha crabs (`vy`) and stays behind him; she does **not** spin in place to face the tag. If `|θ| > θ_crab` she yaws first. Cover tag → stand.
+**Test 3b — Crab / one line.** `enable_crab:=true`. Drive Saveli sideways (Mecanum). Masha crabs (`vy`) and stays behind him; she does **not** spin in place to face the tag. If `|θ| > θ_crab` she yaws first. Cover tag → HUNT.
 
-**Test 4 — LiDAR cutoff.** From a follow, drive Saveli **backward** toward Masha. She stands at `d_stop` and stays stood until Saveli opens past `d_go`. Repeat three times: no chatter, no servo fight, no march-in-place.
+**Test 4 — LiDAR cutoff.** From a follow, drive Saveli **backward** toward Masha. She stands at `d_stop` and stays stood until Saveli opens past `d_go` (if follow time remains). Repeat three times: no chatter, no servo fight, no march-in-place.
 
-**Test 5 — Watchdog.** Kill `apriltag_ros` while following. Masha stands. Same if the follow node is `Ctrl-C`’d (`on_shutdown` → `halt_legs()`).
+**Test 5 — Watchdog / 60 s.** Kill `apriltag_ros` while following → halt + HUNT. Same if the hunter is `Ctrl-C`’d (`on_shutdown` → `halt_legs()`). Still tracking at 60 s → halt + HUNT even if the tag is visible.
+
+**Test C0 — cat.** Overlay + `cat.wav`. No walk.
+
+**Test sticky.** Both plugs enabled, gtest or dry: only the locked id is followed.
 
 Tape-measure the real standoff once. If 0.80 m feels far on this floor, lower `r_target` toward 0.70 **after** Test 4, never below `d_go + 0.10`.
 
@@ -837,15 +919,20 @@ Tape-measure the real standoff once. If 0.80 m feels far on this floor, lower `r
 - `src/follow_gait.cpp`
 - `test/test_follow_gait.cpp`
 
-**Add in `proud_up` (follower):**
+**Add in `proud_up` (hunter + plugs):**
 
-- `include/proud_up/savelij_follow.hpp`
-- `src/savelij_follow.cpp`
-- `src/savelij_follow_node.cpp`
-- `test/test_savelij_follow.cpp`
-- `launch/savelij_follow.launch.py`
-- `config/savelij_follow.yaml` (topics, tag id, **measured** size, `r_target`, `d_stop`, `d_go`, gains, `enable_walk: false`, `enable_crab: false`, `θ_crab`, `y_on`/`y_off`, `follow_gait: 5` / select `15`)
-- `config/apriltag_36h11_savelij.yaml` (copy of `apriltag_ros` 36h11 template with our size / id / image remaps)
+- `include/proud_up/hunter.hpp`
+- `src/hunter.cpp`
+- `include/proud_up/target_source.hpp`
+- `src/target_saveli.cpp`
+- `src/target_cat.cpp`
+- `src/masha_hunter_node.cpp`
+- `test/test_hunter.cpp`
+- `launch/masha_hunter.launch.py`
+- `config/masha_hunter.yaml` (`enabled_targets: [saveli]`, tag size, `r_target`, `d_stop`, `d_go`, gains, `enable_walk: false`, `enable_crab: false`, `follow_max_s: 60`, `search_timeout_s: 20`, `hunter_pose`, pan window, wav paths, `follow_gait: 5` / select `15`)
+- `config/apriltag_36h11_savelij.yaml` (Saveli plug; measured size / id / image remaps)
+
+**Wavs:** `xf_mic_asr_offline/feedback_voice/english/saveli.wav`, `cat.wav`.
 
 **Edit:** `proud_up/CMakeLists.txt`, `proud_up/package.xml` (`tf2_ros`, `tf2_geometry_msgs`, `apriltag_msgs`, `kinematics_msgs` already used by follow-the-cat).
 
@@ -858,7 +945,7 @@ Do **not** rebuild `kinematics.so`. Do **not** pass `gait=5` into `set_step_mode
 
 C++ rebuild: `colcon build --packages-select proud_up` then `source ~/ros2_ws/install/local_setup.zsh`. Python controller is usually symlink-installed; still restart `move_controller` after editing `move.py`. `need_compile=False` does not help C++.
 
-If Sprint 3 Step 2 lands first, **reuse** `follow_gait.*` and the generator hook; this project then only adds the follower node. If this project lands first, Sprint 3 Step 2 reuses the gait and only adds ASK / YOLO.
+If Sprint 3 Step 2 lands first, **reuse** `follow_gait.*` and the generator hook; this project then adds the hunter. If this project lands first, Sprint 3 Step 2 reuses the gait and only adds ASK / YOLO person — still do **not** launch `follow_the_cat_node` beside the hunter.
 
 ---
 
@@ -866,9 +953,9 @@ If Sprint 3 Step 2 lands first, **reuse** `follow_gait.*` and the generator hook
 
 The clipboard’s 50 Hz node is the right *ambition* (we own the foot curve) aimed at the wrong *socket* (the servo topic).
 
-What following Saveli needs from the legs, and where it comes from once we write the gait:
+What the hunter needs from the legs, and where it comes from once we write the gait:
 
-- omnidirectional-enough `vx` and `ωz` — **our** generator, driven by Twist,
+- omnidirectional-enough `vx`, `vy`, and `ωz` — **our** generator, driven by Twist,
 - a halt that stands — `halt_legs()`,
 - a speed cap the unfinished step cannot overshoot through the LiDAR wall — parameters,
 - a walk that is *ours* to change — the map + swing clock, not a second publisher.
@@ -879,4 +966,4 @@ Two writers on `/servo_controller` is how a gait fights a dance, and how a “cu
 
 ## Do not implement on this turn
 
-This file is the corrected plan. Map is **variant 3** (omnidirectional tripod + crab gate). No node, no generator, no launch, no yaml in `proud_up` until Peter says to build it.
+This file is the corrected plan. Map is **variant 3**. Client is **`masha_hunter_node`** with pluggable targets (Saveli first, cat next). No node, no generator, no launch, no yaml in `proud_up` until Peter says to build it.
