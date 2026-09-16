@@ -706,7 +706,43 @@ If `/action_complete` never goes true, the director gives up at 16.5 s (`dance_t
 
 ---
 
-## 13. Every “20 ms” you will meet
+## 13. Is IK really computed every 20 ms? (no micrometres, not a hard job)
+
+Short answer: **not for the dance, not for the halt stand, and never in micrometres.** Inverse kinematics of one 3-joint insect leg is a handful of trig functions. Fifty times a second on a Jetson is idle time.
+
+**What “IK” means here.** Given one foot’s xyz in **millimetres**, compute three joint **radians**. That is `kinematics.set_leg_position` inside `kinematics.so` (compiled). Six legs = six independent 3-DOF solves. There is no iterative optimiser, no whole-body Jacobian, no micrometre mesh.
+
+**When it actually runs**
+
+| What she is doing | IK every 20 ms? | What really happens |
+|---|---|---|
+| Dance (`master_dance.d6a`) | **No. Zero times.** | Pianist copies stored pulses. Worker is idle. |
+| Halt stand (`DEFAULT_POSE`) | **Once**, not every tick | One `set_pose_base(..., duration=1.0)`. STM32 slides for a second. |
+| Body lean (`PoseTransformer`) | Yes, for the duration of the lean | Each tick: new foot xyz, then 6× IK, publish `duration=0.02`. A 0.4 s lean ≈ 20 solves, then it stops. |
+| Walk (gait) | Yes, while walking | Foot xyz for a whole step is **precomputed** (`move.py` `set_step_mode` in a batch). Each 20 ms tick only **indexes** that table, then still calls `set_pose_base` so xyz → radians. When walking stops, IK stops. |
+
+Halt, in code: job A calls `set_pose_base` **once** (`step_controller.py:138-150`), then later ticks see an empty inbox.
+
+Walk, in code: heavy gait geometry once per step —
+
+```python
+# ros2_ws/src/driver/controller/controller/move.py:114-133
+for i in range(6):
+    ps = kinematics.set_step_mode(...)   # a whole part of the step, many frames
+    poses.append(ps)
+# then every 20 ms:
+out_pose = poses[part_index][sub_index]  # table lookup, not a new plan
+```
+
+— then `set_pose_base` still does 6× `set_leg_position` so the servos get radians (`step_controller.py:341`). That second step is cheap.
+
+**Not micrometres.** `DEFAULT_POSE` is millimetres (LF foot about `(+164, +141, −70)`). A typical stride is tens of millimetres over about 1 s. At 50 Hz that is **about a millimetre per tick**, not a micrometre. One servo pulse is 0.24° (1000 pulses over 240°). At a ~100 mm shin that is roughly **0.4 mm at the foot** — coarser than a millimetre. The stack cannot even *command* micrometres.
+
+**Why 20 ms is an easy job.** Closed-form 3-DOF IK is microseconds of CPU. Industrial arms run IK at kilohertz. 50 Hz is a leisurely rate chosen so the STM32 has 20 ms to slide the servos, not because the Jetson is busy. The expensive thing on this robot is never the math; it is fighting two publishers on `/servo_controller`.
+
+---
+
+## 14. Every “20 ms” you will meet
 
 They are different clocks. Posing uses some of them and not others.
 
@@ -723,7 +759,7 @@ The director’s clock is **50 ms**, not 20. The pianist’s clock is **each row
 
 ---
 
-## 14. If you remember only this
+## 15. If you remember only this
 
 The director never moves a servo. It sends postcards to the receptionist.
 
