@@ -302,3 +302,189 @@ def CmdVelGenerator(params, log=None):
             # 两次初始姿态变了我们需要重算(stance pose object changed: recompute AEP/PEP and the cycle table)
             if cur_pose is not org_pose:
                 break
+
+
+# ---------------------------------------------------------------------------
+# Follow gait (gait=5). Formulas: proud_up/include/proud_up/follow_gait.hpp
+#
+# This generator is a *client* of that map. It does not call
+# kinematics.set_step_mode or cmd_vel_new_point. StepController still
+# owns the 20 ms loop and the IK (set_leg_position).
+#
+# Same handshake as CmdVelGenerator so halt can finish a cycle and a new
+# Twist can splice on last_part without teleporting the feet.
+# ---------------------------------------------------------------------------
+
+_PI = math.pi
+_TWO_PI = 2.0 * math.pi
+_W_EPS = 1.0e-6
+_GROUP_A = (0, 2, 4)
+
+
+def _sigma(tau):
+    """Swing clock only. σ-dot = 0 at lift and land (kiss the floor)."""
+    t = 0.0 if tau < 0.0 else (1.0 if tau > 1.0 else tau)
+    return 10.0 * t**3 - 15.0 * t**4 + 6.0 * t**5
+
+
+def _se2_exp(vx, vy, wz, t):
+    """SE(2) exponential of a constant body twist. vx, vy mm/s, t seconds."""
+    theta = wz * t
+    if abs(wz) < _W_EPS:
+        return vx * t, vy * t, theta
+    s = math.sin(theta)
+    omc = 1.0 - math.cos(theta)
+    return (vx * s - vy * omc) / wz, (vy * s + vx * omc) / wz, theta
+
+
+def _rot2(x, y, a):
+    c, s = math.cos(a), math.sin(a)
+    return x * c - y * s, x * s + y * c
+
+
+def _body_of_world_fixed(p0, vx, vy, wz, t):
+    tx, ty, th = _se2_exp(vx, vy, wz, t)
+    x, y = _rot2(p0[0] - tx, p0[1] - ty, -th)
+    return x, y, p0[2]
+
+
+def _clamp_stride(end_xy, p0, stride_max):
+    dx = end_xy[0] - p0[0]
+    dy = end_xy[1] - p0[1]
+    d = math.hypot(dx, dy)
+    if d <= stride_max or d < 1e-9:
+        return end_xy
+    s = stride_max / d
+    return (p0[0] + dx * s, p0[1] + dy * s)
+
+
+def _aep_pep(p0, vx, vy, wz, ts, stride_max, linear_factor=1.0):
+    vx *= linear_factor
+    vy *= linear_factor
+    half = 0.5 * ts
+    aep = _body_of_world_fixed(p0, vx, vy, wz, -half)
+    pep = _body_of_world_fixed(p0, vx, vy, wz, +half)
+    ax, ay = _clamp_stride((aep[0], aep[1]), p0, stride_max)
+    px, py = _clamp_stride((pep[0], pep[1]), p0, stride_max)
+    return (ax, ay, p0[2]), (px, py, p0[2])
+
+
+def sample_follow_gait(phi, vx, vy, wz, lift, period, nominal, stride_max=40.0, linear_factor=1.0):
+    """One 20 ms bead. vx,vy mm/s; lift mm; period s; nominal six (x,y,z) mm.
+
+    Cycle clock keeps rolling (no rest at wrap). Swing uses sigma(τ).
+    """
+    phi = phi % _TWO_PI
+    if phi < 0.0:
+        phi += _TWO_PI
+    T = period if period > 1e-3 else 0.70
+    ts = 0.5 * T
+    a_swing = phi < _PI
+    tau_lin = (phi / _PI) if a_swing else ((phi - _PI) / _PI)
+    sig = _sigma(tau_lin)
+    feet = []
+    for leg in range(6):
+        p0 = nominal[leg]
+        aep, pep = _aep_pep(p0, vx, vy, wz, ts, stride_max, linear_factor)
+        swinging = a_swing if (leg in _GROUP_A) else (not a_swing)
+        if swinging:
+            o = 1.0 - sig
+            x = o * pep[0] + sig * aep[0]
+            y = o * pep[1] + sig * aep[1]
+            z = p0[2] + 4.0 * sig * (1.0 - sig) * lift
+        else:
+            o = 1.0 - tau_lin
+            x = o * aep[0] + tau_lin * pep[0]
+            y = o * aep[1] + tau_lin * pep[1]
+            z = p0[2]
+        feet.append((x, y, z))
+    return feet
+
+
+def FollowGaitGenerator(params, log=None):
+    """Yield omnidirectional-tripod poses for gait=5 / cmd_gait=5.
+
+    Never calls kinematics.set_step_mode. IK stays in StepController.
+    """
+    global finish_ps, slow, stop, finish_index
+    height = params.height
+    org_pose = None
+    phase_index = 0
+    phase_num = math.ceil(round((params.period * 1000.0 / 20.0), 1))
+    phase_num = max(int(phase_num), 2)
+    phase_list = [(i / phase_num) * 2.0 * math.pi for i in range(phase_num)]
+    stride_max = 40.0
+    linear_factor = getattr(params, 'linear_factor', 1.0)
+
+    if log is not None:
+        log.info(
+            'FollowGaitGenerator start (gait=5, never set_step_mode). '
+            f'vx={params.velocity_x:.1f} mm/s vy={params.velocity_y:.1f} '
+            f'wz={params.angular_z:.3f} T={params.period:.2f}s h={height:.1f} mm'
+        )
+
+    cur_pose, status = yield None
+    while True:
+        org_pose = cur_pose
+        nominal = [(float(p[0]), float(p[1]), float(p[2])) for p in cur_pose]
+        if params.relative_h:
+            height = abs(nominal[0][2]) * (params.height / 100.0)
+        steps = []
+        for phase in phase_list:
+            steps.append(sample_follow_gait(
+                phase,
+                params.velocity_x,
+                params.velocity_y,
+                params.angular_z,
+                height,
+                params.period,
+                nominal,
+                stride_max,
+                linear_factor,
+            ))
+
+        if finish_ps:
+            dists = [total_dist_sq(finish_ps, bi) for bi in steps]
+            idx = min(range(len(dists)), key=lambda i: dists[i])
+            if idx == 0:
+                idx = 1
+                stop = True
+            else:
+                stop = False
+        else:
+            idx = min(range(len(steps) // 2), key=lambda i: abs(steps[i][1][0]))
+            if idx == 0:
+                idx = 1
+                stop = True
+            else:
+                stop = False
+
+        steps1 = steps[idx:]
+        steps2 = steps[:idx]
+
+        while True:
+            if status == 'first':
+                ps = steps1[phase_index]
+                if finish_ps:
+                    distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, finish_ps)])
+                    if distances > 7 or stop:
+                        slow = 'cmd_true'
+                    finish_ps = []
+                else:
+                    slow = 'cmd_false'
+                phase_index = (phase_index + 1) % (len(steps) - idx)
+            elif status == 'finish':
+                ps = steps2[phase_index]
+                phase_index = (phase_index + 1) % max(idx, 1)
+                finish_ps = ps
+                finish_index = phase_index
+            else:
+                ps = steps[phase_index]
+                phase_index = (phase_index + 1) % phase_num
+            if phase_index == 0:
+                cur_pose, status = yield ps, True, params, slow
+            else:
+                cur_pose, status = yield ps, False, params, slow
+            if cur_pose is not org_pose:
+                break
+

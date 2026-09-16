@@ -1,0 +1,74 @@
+masha_hunter_node:
+  ros__parameters:
+    image_topic: /depth_cam/rgb/image_raw
+    camera_info_topic: /depth_cam/rgb/camera_info
+    depth_topic: /depth_cam/depth/image_raw
+    scan_topic: /scan
+    apriltag_topic: /apriltag/apriltag_detections
+    servo_topic: servo_controller
+    cmd_vel_topic: /controller/cmd_vel
+    traveling_topic: /controller/traveling
+    camera_frame: rgb_camera_link
+    base_frame: base_link
+    saveli_tag_frame: saveli_tag
+    saveli_tag_id: 0
+
+    # First bring-up: HUNT + NAME only. Turn walk on after G2 and H1.
+    enabled_targets: [saveli]
+    enable_walk: false
+    enable_crab: false
+    enable_wander: false
+    dry_run: false
+
+    r_target: 0.80
+    d_stop: 0.55
+    d_go: 0.70
+    lost_timeout: 0.5
+    walk_watchdog: 0.3
+    follow_max_s: 60.0
+    search_timeout_s: 20.0
+    vx_max: 0.05
+    vy_max: 0.04
+    wz_max: 0.30
+    kp_x: 0.35
+    kd_x: 0.05
+    kp_y: 0.50
+    kd_y: 0.05
+    kp_th: 1.20
+    kd_th: 0.10
+    wander_vx: 0.03
+    wander_wz: 0.25
+    lidar_x: 0.102
+    lidar_y: 0.0
+    follow_gait: 5
+    follow_gait_select: 15
+    cmd_height: 25.0
+    cmd_period: 0.70
+
+    pan_min: 200.0
+    pan_max: 800.0
+    pan_period_s: 10.0
+    yaw_sign: -1.0
+    pitch_sign: 1.0
+    gaze_gain: 0.10
+    max_step_pulses: 8.0
+    deadband_rad: 0.06
+
+    # Hunter pose = camera-forward rest. Tilt is id 22, not 23.
+    arm_duration: 1.0
+    arm_id19: 500.0
+    arm_id20: 810.0
+    arm_id21: 180.0
+    arm_id22: 150.0
+    arm_id23: 500.0
+    arm_id24: 500.0
+
+    person_onnx: ""
+    person_imgsz: 320
+    person_conf: 0.45
+    dnn_cuda: true
+
+    # Spoken names. Placeholders are chimes until Peter records
+    # "Saveli" / "cat" over these paths.
+    # saveli_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/saveli.wav
+    # cat_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/cat.wav

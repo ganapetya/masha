@@ -107,10 +107,21 @@ void HumanDetector::apply_runtime_cfg(const HumanDetectConfig &cfg) {
   cfg_.max_box_frac = cfg.max_box_frac;
   cfg_.max_aspect = cfg.max_aspect;
   cfg_.track_gate_frac = cfg.track_gate_frac;
+  cfg_.coco_class = cfg.coco_class;
+  cfg_.require_person_shape = cfg.require_person_shape;
+  cfg_.enable_face_fallback = cfg.enable_face_fallback;
 }
 
 bool HumanDetector::looks_like_person(const cv::Rect &r, int width, int height,
                                       const HumanDetectConfig &cfg) {
+  if (!cfg.require_person_shape) {
+    if (r.width < 12 || r.height < 12) {
+      return false;
+    }
+    const double frac =
+        static_cast<double>(r.area()) / static_cast<double>(std::max(1, width * height));
+    return frac <= 0.95;
+  }
   if (r.width < 20 || r.height < 32) {
     return false;
   }
@@ -186,10 +197,15 @@ std::optional<cv::Rect> HumanDetector::detect_person_box(const cv::Mat &bgr) {
   }
   for (int i = 0; i < pred.rows; ++i) {
     const float *row = pred.ptr<float>(i);
-    // row[4] is the COCO "person" score. We do not require person to beat
-    // "chair" or "couch" on the same candidate. A seated person often
-    // loses that comparison, and we would miss them.
-    const float person_s = row[4];
+    // row[4 + coco_class] is that class's score. Class 0 is person, 15 is
+    // cat. We do not require this class to beat "chair" on the same
+    // candidate — a seated person (or a loafed cat) often loses that
+    // comparison.
+    const int cls = cfg_.coco_class;
+    if (cls < 0 || 4 + cls >= pred.cols) {
+      continue;
+    }
+    const float person_s = row[4 + cls];
     if (person_s < conf_th) {
       continue;
     }
@@ -335,13 +351,17 @@ std::optional<PersonDetection> HumanDetector::detect(const cv::Mat &bgr) {
       const double frac =
           (cfg_.person_head_frac > 0.05 && cfg_.person_head_frac < 0.9) ? cfg_.person_head_frac
                                                                        : 0.45;
-      return finish(box_to_detection(*box, "person", frac));
+      const char *label = (cfg_.coco_class == 15) ? "cat" : "person";
+      return finish(box_to_detection(*box, label, frac));
     }
   }
 
   // Close-up facing the camera with no YOLO box (or no ONNX file loaded).
-  if (auto face = detect_face_in(bgr, cv::Rect())) {
-    return finish(face);
+  // Cat plug turns this off: a face is not a cat.
+  if (cfg_.enable_face_fallback) {
+    if (auto face = detect_face_in(bgr, cv::Rect())) {
+      return finish(face);
+    }
   }
 
   return finish(std::nullopt);

@@ -23,6 +23,17 @@ find_package(Eigen3 REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs objdetect dnn)
 find_package(CURL REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+# Prefer the Jetson overlay (pose + size) over Humble's corner-only message
+# so we match the apriltag_ros that actually runs on this board.
+if(NOT apriltag_msgs_DIR AND EXISTS
+    "/home/ubuntu/third_party/third_party_ws/install/apriltag_msgs/share/apriltag_msgs/cmake")
+  set(apriltag_msgs_DIR
+      "/home/ubuntu/third_party/third_party_ws/install/apriltag_msgs/share/apriltag_msgs/cmake")
+endif()
+find_package(apriltag_msgs REQUIRED)
 
 add_library(proud_up_core STATIC
   src/camera_frame.cpp
@@ -58,6 +69,26 @@ target_link_libraries(follow_the_cat PUBLIC ${OpenCV_LIBS})
 if(TARGET Eigen3::Eigen)
   target_link_libraries(follow_the_cat PUBLIC Eigen3::Eigen)
 endif()
+
+# Variant-3 omnidirectional tripod map. No rclcpp — gtest links this alone.
+add_library(follow_gait STATIC src/follow_gait.cpp)
+target_include_directories(follow_gait PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+# Hunter policy + target plugs. No rclcpp in hunter.cpp.
+add_library(hunter STATIC
+  src/hunter.cpp
+  src/target_saveli.cpp
+  src/target_cat.cpp
+)
+target_include_directories(hunter PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(hunter PUBLIC follow_gait follow_the_cat ${OpenCV_LIBS})
 
 add_executable(proud_up_node src/proud_up_node.cpp)
 target_include_directories(proud_up_node PUBLIC
@@ -114,7 +145,35 @@ target_link_libraries(follow_the_cat_node
   ${OpenCV_LIBS}
 )
 
-install(TARGETS proud_up_node follow_the_cat_node masha_interaction_node
+add_executable(masha_hunter_node src/masha_hunter_node.cpp)
+target_include_directories(masha_hunter_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  ${OpenCV_INCLUDE_DIRS}
+  ${Eigen3_INCLUDE_DIRS}
+)
+ament_target_dependencies(masha_hunter_node
+  rclcpp
+  sensor_msgs
+  geometry_msgs
+  kinematics_msgs
+  std_srvs
+  cv_bridge
+  servo_controller_msgs
+  ament_index_cpp
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  apriltag_msgs
+)
+target_link_libraries(masha_hunter_node
+  hunter
+  follow_gait
+  follow_the_cat
+  proud_up_core
+  ${OpenCV_LIBS}
+)
+
+install(TARGETS proud_up_node follow_the_cat_node masha_interaction_node masha_hunter_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -148,6 +207,19 @@ if(BUILD_TESTING)
   target_include_directories(test_interaction_phrases PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
+
+  ament_add_gtest(test_follow_gait test/test_follow_gait.cpp)
+  target_include_directories(test_follow_gait PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  target_link_libraries(test_follow_gait follow_gait)
+
+  ament_add_gtest(test_hunter test/test_hunter.cpp)
+  target_include_directories(test_hunter PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${OpenCV_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_hunter hunter follow_gait follow_the_cat ${OpenCV_LIBS})
 endif()
 
 ament_package()

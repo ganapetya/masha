@@ -21,7 +21,13 @@ from kinematics import kinematics, config, kinematics_calculate
 from kinematics.x_joint_control import JointControl
 from servo_controller.action_group_controller import ActionGroupController
 from controller.pose_transformer import PoseTransformer, PoseTransformerParams
-from controller.move import MovingGenerator, MovingParams, CmdVelGenerator, CmdVelParams
+from controller.move import (
+    MovingGenerator,
+    MovingParams,
+    CmdVelGenerator,
+    CmdVelParams,
+    FollowGaitGenerator,
+)
 from servo_controller_msgs.msg import ServosPosition
 class StepController(Node):
     """50 Hz gait/pose loop. Callers queue work on the new_* slots; loop()
@@ -446,7 +452,7 @@ class StepController(Node):
         angular_z = twist.angular.z # 旋转角速度 rad/sec(the speed of rotation angle is rad/sec)
 
 
-        generator = CmdVelGenerator(CmdVelParams(
+        vel_params = CmdVelParams(
             gait =  self.cmd_gait,
             velocity_x = linear_x,
             velocity_y = linear_y,
@@ -456,7 +462,15 @@ class StepController(Node):
             period = self.cmd_period,
             linear_factor = 1.0,
             rotate_factor = 1.0 # 转向时的转向系数， 即给定的值(the turning coefficient during turning, which is the given value)
-        ), self.get_logger())
+        )
+        # gait 5 is ours. Vendor CmdVelGenerator would call
+        # kinematics.cmd_vel_new_point and, worse, set_step_mode if this
+        # Twist had been a Traveling walk. Never fall through: default
+        # cmd_gait is 2 (vendor tripod).
+        if self.cmd_gait == 5:
+            generator = FollowGaitGenerator(vel_params, self.get_logger())
+        else:
+            generator = CmdVelGenerator(vel_params, self.get_logger())
         if generator:
             with self.lock:
                 generator.send(None)
@@ -479,12 +493,18 @@ class StepController(Node):
                       interrupt=True,
                       feedback_cb=None):
 
-        # gait 11/12/13 are not walks: they store cmd_vel defaults.
+        # gait 11/12/13/15 are not walks: they store cmd_vel defaults.
         # 11 → ripple (1), 12 → tripod (2), 13 → gait 3 if kinematics has one.
-        if gait == 11 or gait == 12 or gait == 13:
+        # 15 → our follow gait (5). Do not start a walk on 15.
+        if gait == 11 or gait == 12 or gait == 13 or gait == 15:
             self.cmd_period = duration
             self.cmd_gait = gait - 10
             self.cmd_height = height
+            if gait == 15:
+                self.get_logger().info(
+                    'Traveling gait=15: cmd_gait=5 (FollowGaitGenerator). '
+                    'Not a walk. Later cmd_vel will not use vendor CmdVelGenerator.'
+                )
 
         else:
             self.set_step_mode_base(gait, amplitude, height, direction, rotation, duration, repeat, relative_height, rectify, integral, feedback_cb)
@@ -517,6 +537,33 @@ class StepController(Node):
         :param integral: 是否对行走距离进行积分实现里程计(whether to integrate the walking distance to implement odom)
         :param feedback_cb: 运行中状态报告的回调，不建议使用(a callback for reporting the status during operation, which is not recommended to use)
         """
+
+        if gait == 5:
+            # Discrete / in-place custom walk. Never MovingGenerator:
+            # that path calls kinematics.set_step_mode(..., 5) and the
+            # .so does not know 5.
+            period = max(float(duration), 1e-3)
+            vx = float(amplitude) * math.cos(float(direction)) / period
+            vy = float(amplitude) * math.sin(float(direction)) / period
+            wz = float(rotation) / period
+            generator = FollowGaitGenerator(CmdVelParams(
+                gait=5,
+                velocity_x=vx,
+                velocity_y=vy,
+                angular_z=wz,
+                height=height,
+                relative_h=relative_height,
+                period=duration,
+            ), self.get_logger())
+            self.get_logger().info(
+                'FollowGaitGenerator gait=5 (never kinematics.set_step_mode). '
+                f'stride={amplitude} mm T={duration}s'
+            )
+            if generator:
+                with self.lock:
+                    generator.send(None)
+                    self.new_moving_generator = generator
+            return
 
         generator = MovingGenerator(MovingParams(
                 gait=gait,

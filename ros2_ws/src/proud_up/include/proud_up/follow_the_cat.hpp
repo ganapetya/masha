@@ -93,6 +93,9 @@ struct HumanDetectConfig {
   double max_box_frac{0.40};     // a box that fills the frame is a wall, not a person
   double max_aspect{1.05};       // a person is taller than they are wide
   double track_gate_frac{0.22};  // stay on the same person; do not jump to a neighbour
+  int coco_class{0};             // 0 = person, 15 = cat. Same ONNX, different column.
+  bool require_person_shape{true};
+  bool enable_face_fallback{true};
 };
 
 class HumanDetector {
