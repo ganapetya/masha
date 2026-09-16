@@ -54,6 +54,8 @@ A Python class, not its own ROS node. File: `ros2_ws/src/driver/servo_controller
 
 The pianist opens a SQLite file (`*.d6a`), reads rows, and publishes raw servo pulses. It does not think about feet or balance. It is a cursor over a piano roll.
 
+**It does not know coordinates.** A pulse is not an xyz of a foot. It is the motor’s own position number (0–1000) for one physical servo. Those numbers were **recorded earlier**, usually in the Qt ActionSet editor, by reading the servos after a human posed the legs, or by dragging sliders. The pianist only **plays the recording back**. How that recording is made, and why no IK is needed, is §9.
+
 ### 1.5 The translator — `JointControl`
 
 Python class/node used by the 20 ms worker. File: `ros2_ws/src/driver/kinematics/kinematics/x_joint_control.py`.
@@ -531,6 +533,31 @@ def start_action_thread(self, actNum, lock_servos=''):
 ## 9. How the pianist applies the action set
 
 This thread is **not** the 20 ms worker. It is a `while` loop over SQLite.
+
+### 9.0 Why this can work without IK (the pianist does not invent poses)
+
+IK posing and action-group posing live at **different heights**.
+
+| | Named stand (`DEFAULT_POSE`) | Action group (`master_dance.d6a`) |
+|---|---|---|
+| What is stored | six foot **xyz in millimetres** | 24 servo **pulses 0–1000** |
+| Who computes joint angles | `kinematics.set_leg_position` (IK) at play time | nobody at play time |
+| What is published | pulses **computed now** from xyz | pulses **copied** from the file |
+
+A pulse is the servo firmware’s coordinate: “horn position 500,” not “foot at x=164 mm.” The STM32 already knows how to go to a pulse. IK is only needed when the *programmer* thinks in feet. The pianist thinks in motors.
+
+Those motor numbers got into the file **before** ROS ever plays it. Typical recording, Qt editor `software/actionset_editor/main.py`:
+
+1. **Manual** — torque off, you bend a leg by hand (`angularReadback` path first unloads servos, lines 405–407).
+2. **Read angle** — the editor asks each servo `getServoPulse(i)` and appends a table row (lines 412–418). That is a photograph of the 24 motors, not a geometric pose.
+3. Or you drag a slider: `pulse_valuechange` sends that pulse live (`setServoPulse`, lines 332–335) and **Add action** stores the slider values.
+4. **Save** writes the table as SQLite: `Time, Servo1 … Servo24` (lines 685–721).
+
+`master_dance.d6a` on disk right now is exactly that photograph, 25 times. First row: `Time=500`, servos 1–18 all pulse `500`, arm `500,720,130,150,500,500`. The pianist will send those integers again. It never asks “where is the foot.”
+
+So the low-level look is the point: **playback is a tape recorder, not a geometer.** The person (or the slider) who recorded the row already solved “what the legs should look like,” by posing the real robot. IK would only be required if we wanted to *generate* those pulses from millimetres at run time. We do not.
+
+The cost of skipping IK: the file has no idea whether three feet are on the floor. If a recorded row lifts too many legs, she falls. That is why halt to `DEFAULT_POSE` happens first, and why the first/last rows of a dance should be a stand.
 
 File on disk: `/home/ubuntu/software/actionset_editor/ActionGroups/master_dance.d6a`  
 Table `ActionGroup`: `Index`, `Time` (milliseconds), `Servo1` … `Servo24` (pulse 0–1000).  
