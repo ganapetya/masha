@@ -1,9 +1,9 @@
 # Saveli plug for apriltag_ros (AprilTagNode).
-# Clipboard-era default size is 0.08 m — do not trust that.
-# Measure the black-square edge of the printed tag36h11 and put metres here.
+# Printed on Saveli: BLACK square 60 mm (white margin extra, not in this number).
+# After printing, measure with a ruler and correct these two numbers.
 image_transport: 'raw'
 family: '36h11'
-size: 0.08
+size: 0.06
 threads: 2
 max_hamming: 0
 z_up: false
@@ -13,4 +13,4 @@ refine-edges: 1
 debug: 0
 tag_ids: [0]
 tag_frames: [saveli_tag]
-tag_sizes: [0.08]
+tag_sizes: [0.06]
