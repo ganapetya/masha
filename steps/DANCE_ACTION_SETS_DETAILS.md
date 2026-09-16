@@ -712,7 +712,105 @@ If `/action_complete` never goes true, the director gives up at 16.5 s (`dance_t
 
 ---
 
-## 12a. Does the 20 ms worker plan many ticks, or only the current one?
+## 12a. Words: tick, step, part, snapshot/frame, lerp
+
+Read this before the “batch vs one interval” question. A **tick** is not a meal. It is: **trigger → read → execute → write → sleep.**
+
+### Tick (the 20 ms worker)
+
+`StepController.loop` (`step_controller.py:135-268`) is a `while True` with `sleep(0.02)` at the end.
+
+| Phase | What happens |
+|---|---|
+| **Trigger** | Sleep ended. This pass of the loop starts. |
+| **Read** | Look at inboxes (`new_pose_setter`, `new_pose_transformer`, `new_moving_generator`). If a generator is running, `send(...)` it; it **returns one 6-foot xyz** for *this* tick. |
+| **Execute** | `set_pose_base`: six times `kinematics.set_leg_position` (xyz → joint radians → pulses). |
+| **Write** | Publish one `ServosPosition` on `/servo_controller` (`duration` usually 0.02 s). |
+| **Sleep** | `time.sleep(0.02)`. Next trigger is ~20 ms later. |
+
+The worker does not “eat a table.” It **reads one row** of a table (if a generator built one), executes IK for that row, writes pulses.
+
+A **snapshot** (I also said **frame**, like one film still) is that row: the xyz of all six feet at one instant. Example shape: `((x1,y1,z1), …, (x6,y6,z6))` in millimetres.
+
+### Step (walking only — `MovingGenerator`)
+
+A **step** here is **one walking cycle**: all legs go through their lift/place pattern once and the body has advanced about one stride. It is **not** “one foot lifting.” It is closer to “one bar of music.”
+
+**Who divided walking into steps?** The authors of `MovingGenerator` plus `kinematics.set_step_mode`. Not the 20 ms worker. The worker only asks “next snapshot?”
+
+A step is hard-split into **6 parts** (`for i in range(6)` in `move.py:115`). That 6 matches the kinematics library (one gait cycle = six phases). Each part is then split into **sub-actions** so the whole step lasts about `params.period` seconds at 20 ms per snapshot:
+
+```text
+sub_action_num = ceil(period / 6 / 0.02)   # at least 1
+snapshots in one step ≈ 6 × sub_action_num
+```
+
+**Numeric example.** Command: “walk with period = 1.0 s, stride = 40 mm, repeat = 3.”
+
+- `1.0 / 6 / 0.02 = 8.333` → `ceil` → **9 snapshots per part**
+- **6 × 9 = 54 snapshots in one step** (about 1.08 s because of `ceil`, a bit longer than 1.0)
+- **3 steps** = play that 54-row table three times (same table, unless the stance pose object changes)
+
+**Who sets the limits?**
+
+| Limit | Who | What |
+|---|---|---|
+| How many steps | `Traveling.steps` → `repeat` | `0` means forever (`forever=True`) |
+| How long one step should last | `Traveling.time` → `period` | Used only to compute `sub_action_num` |
+| Smallest part | `max(..., 1)` then `ceil` | Each of the 6 parts has at least one snapshot |
+| How far the body should go per step | `Traveling.stride` / `height` / `direction` / `rotation` | Passed into `set_step_mode`; no extra Python clamp here (cmd_vel *is* clamped elsewhere) |
+
+First trigger that starts a new step **builds the whole 54-row table** (`set_step_mode` six times), then **writes row 0**. Later triggers only **read the next row**.
+
+```
+step 1, part 0: snapshots 0..8
+step 1, part 1: snapshots 9..17
+...
+step 1, part 5: snapshots 45..53
+step 2: start again at row 0 of the same table
+```
+
+One tick:
+
+```
+TRIGGER  20 ms alarm
+READ     out_pose = poses[part_index][sub_index]   # one snapshot, six xyz
+EXECUTE  6 × set_leg_position(out_pose[leg])
+WRITE    ServosPosition, duration=0.02
+SLEEP    0.02
+```
+
+### Body transform — “how many frames” and lerp
+
+Still not a gait. One command: “move the body by this translation/rotation in `duration` seconds.”
+
+**Frame** = the same thing as **snapshot**: one tick’s 6-foot xyz. Count:
+
+```text
+how many frames = ceil(duration / 0.02)    # pose_transformer.py:23
+```
+
+Example: “shift the body 40 mm to +Y (robot’s left) in 0.4 s.”
+
+- `0.4 / 0.02 = 20` frames. That is the only meaning of “20 ticks for 0.4 s.”
+- There is **no precomputed table**. Each tick **computes** the snapshot for *now*.
+
+**Lerp** (linear interpolation) means: do not jump 40 mm on the first tick. Spread the 40 mm evenly.
+
+If the total move is 40 mm in 20 ticks, each tick adds 2 mm of body shift (the code writes it as `nx = total - increment × remaining`).
+
+| Tick | Body Y shift so far | What this tick does |
+|---|---|---|
+| 1 | 2 mm | READ/compute xyz for +2 mm, EXECUTE IK, WRITE pulses 0.02 s |
+| 10 | 20 mm | same for halfway |
+| 20 | 40 mm | last snapshot, generator dies (`last_part=True`) |
+| 21 | — | inbox empty: trigger, read nothing, no IK, no write, sleep |
+
+“Only while the lean lasts” = ticks 1–20. Tick 21 is idle.
+
+---
+
+## 12b. Does the 20 ms worker plan many ticks, or only the current one?
 
 Two layers. Do not mix them.
 
@@ -727,17 +825,17 @@ worker (dumb clock)          generator (optional memory)
   tick n+1: send() -------->  yield frame n+1
 ```
 
-**Is there “compute once, consume over many 20 ms ticks”?** Yes for **foot xyz of a walk**. No for **named-pose IK**, and not as a queue of joint angles.
+**Is there “compute once, then many ticks each read one row”?** Yes for **foot xyz of a walk**. No for **named-pose IK**, and not as a queue of joint angles.
 
-| Job | Computed once? | What the 20 ms ticks consume | `set_leg_position` (xyz→radians) |
-|---|---|---|---|
-| Named stand `DEFAULT_POSE` | Six-leg IK **once**, one message `duration=1.0` | **Nothing.** Later ticks are idle. The STM32 slides for 1 s. | Once |
-| Walk `MovingGenerator` | Whole-step table of foot xyz (`set_step_mode` × 6 parts) | One xyz snapshot per tick from `poses[part][sub]` | **Every tick** in `set_pose_base` |
-| Walk `CmdVelGenerator` | One gait-cycle table of xyz (`cmd_vel_new_point` per phase) | One snapshot per tick from `steps[i]` | **Every tick** |
-| Body transform | Only `duration/0.02` and lerp sizes | One new xyz per tick, computed **that** tick | **Every tick** |
-| Dance `.d6a` | Not this worker | — | Never |
+| Job | Built once? | Each later tick READ | EXECUTE | WRITE |
+|---|---|---|---|---|
+| Named stand | Six-leg IK **once**, one message `duration=1.0` | Empty inbox | Skip | Skip. STM32 still sliding. |
+| Walk `MovingGenerator` | Whole-step **table of xyz** | Next row `poses[part][sub]` | 6× IK | pulses, 0.02 s |
+| Walk `CmdVelGenerator` | One cycle **table of xyz** | Next row `steps[i]` | 6× IK | pulses, 0.02 s |
+| Body transform | Only the count `duration/0.02` | Compute xyz **now** (lerp) | 6× IK | pulses, 0.02 s |
+| Dance `.d6a` | Not this worker | — | — | — |
 
-So the pattern you are asking about exists, but the batch is **millimetre foot positions for a step**, not a batch of IK joint answers. Walking: plan the path once, play it like a film strip, still convert each frame’s xyz to radians on that tick (cheap). Standing: IK once, **hardware** (not the 20 ms loop) consumes the duration. Dancing: this worker is not involved.
+The batch is **millimetre foot positions**, not a pile of IK joint answers. Walk: build table once; each tick reads one row, executes IK, writes pulses. Stand: IK once; later ticks read nothing; **STM32** does the 1 s slide. Dance: this worker is idle.
 
 Walk batch, in code:
 
