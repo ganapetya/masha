@@ -12,6 +12,14 @@ from nav_msgs.msg import Odometry
 from ros_robot_controller_msgs.msg import MotorsState, BusServoState, SetBusServoState 
 from geometry_msgs.msg import Pose2D, Pose, Twist, PoseWithCovarianceStamped, TransformStamped
 
+# 6x6 pose/twist covariances for nav_msgs/Odometry (row-major).
+# Diagonal meaning: x, y, z, roll, pitch, yaw.
+# 1e-3  = reasonably trusted planar x/y (or yaw in the last slot)
+# 1e3   = yaw (or yaw-rate) weakly trusted
+# 1e6   = unused axes (z / roll / pitch on a ground robot) — "ignore me"
+# STOP variants shrink x and yaw (1e-9) when commanded velocity is zero,
+# so EKF trusts this odom more while standing still.
+
 ODOM_POSE_COVARIANCE = list(map(float, 
                         [1e-3, 0, 0, 0, 0, 0, 
                         0, 1e-3, 0, 0, 0, 0,
@@ -45,6 +53,7 @@ ODOM_TWIST_COVARIANCE_STOP = list(map(float,
                               0, 0, 0, 0, 0, 1e-9]))
 
 def rpy2qua(roll, pitch, yaw):
+    """Roll-pitch-yaw (radians) to quaternion. Half-angle product, yaw-pitch-roll composition."""
     cy = math.cos(yaw*0.5)
     sy = math.sin(yaw*0.5)
     cp = math.cos(pitch*0.5)
@@ -60,6 +69,7 @@ def rpy2qua(roll, pitch, yaw):
     return q.orientation
 
 def qua2rpy(x, y, z, w):
+    """Quaternion to roll-pitch-yaw (radians). Standard aerospace extraction."""
     roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
     pitch = math.asin(2 * (w * y - x * z))
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (z * z + y * y))
@@ -67,6 +77,7 @@ def qua2rpy(x, y, z, w):
     return roll, pitch, yaw
 
 class Controller(Node):
+    """Dead-reckoning odom publisher: integrate cmd_vel in the odom frame at 50 Hz."""
     
     def __init__(self, name):
         rclpy.init()
@@ -130,6 +141,8 @@ class Controller(Node):
         rclpy.shutdown()
 
     def load_calibrate_param(self, request, response):
+        # '~name' is ROS 1 private-name syntax; on ROS 2 this looks up a
+        # parameter literally named "~linear_correction_factor". Falls back to 1.00.
         self.linear_factor = self.get_parameter('~linear_correction_factor').value or 1.00
 
         self.angular_factor = self.get_parameter('~angular_correction_factor').value or 1.00
@@ -139,6 +152,7 @@ class Controller(Node):
         return response
 
     def set_odom(self, msg):
+        """Teleport the dead-reckoned pose to (x, y, theta) and zero twist."""
         self.odom = Odometry()
         self.odom.header.frame_id = self.odom_frame_id
         self.odom.child_frame_id = self.base_frame_id
@@ -162,6 +176,7 @@ class Controller(Node):
         self.pose_pub.publish(pose)
 
     def cmd_vel_callback(self, msg):
+        # commanded body-frame velocity; cal_odom_fun integrates this
         self.linear_x = msg.linear.x
         self.linear_y = msg.linear.y
 
@@ -169,6 +184,7 @@ class Controller(Node):
 
 
     def cal_odom_fun(self):
+        """50 Hz dead-reckoning: rotate body vx,vy into odom, integrate x,y,yaw."""
         while True:
             self.current_time = time.time()
             if self.last_time is None:
@@ -178,6 +194,7 @@ class Controller(Node):
                 self.dt = self.current_time - self.last_time
             self.odom.header.stamp = self.clock.now().to_msg()
 
+            # body-frame (vx, vy) → odom-frame displacement using current yaw
             self.x += math.cos(self.pose_yaw)*self.linear_x*self.dt - math.sin(self.pose_yaw)*self.linear_y*self.dt
             self.y += math.sin(self.pose_yaw)*self.linear_x*self.dt + math.cos(self.pose_yaw)*self.linear_y*self.dt
 

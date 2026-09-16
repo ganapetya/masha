@@ -24,6 +24,16 @@ from controller.pose_transformer import PoseTransformer, PoseTransformerParams
 from controller.move import MovingGenerator, MovingParams, CmdVelGenerator, CmdVelParams
 from servo_controller_msgs.msg import ServosPosition
 class StepController(Node):
+    """50 Hz gait/pose loop. Callers queue work on the new_* slots; loop()
+    promotes them to cur_* and drives Python generators at 20 ms.
+
+    Each work type uses a pair of slots:
+      new_*  — next command, written under self.lock by ROS callbacks
+      cur_*  — the generator/tuple the loop thread is currently sending to
+    Pose-set wins: applying a new pose clears every generator (stand, then idle).
+    Walking never aborts mid-step: the current generator is swapped only when
+    it reports last_part (a full step / cycle wrap).
+    """
     
     RIPPLE_GAIT = 1
     TRIPOD_GAIT = 2
@@ -40,6 +50,9 @@ class StepController(Node):
 
         self.lock = threading.RLock()
 
+        # Dual-slot command queues. ROS callbacks only write new_*; loop() only
+        # reads/clears them. That way a callback never mutates a generator that
+        # is mid-send().
         self.cur_moving_generator = None
         self.new_moving_generator = None
         self.cur_pose_transformer = None
@@ -77,8 +90,9 @@ class StepController(Node):
         self.create_subscription(CmdParam, '/step_controller/cmd_param', self.cmd_param_callback, 1)
         
     def cmd_param_callback(self, msg):
+        """CmdParam: named built-in pose plus the gait/height/period that later cmd_vel will use."""
         with self.lock:
-            self.pose = msg.pose
+            self.pose = msg.pose  # name string, e.g. 'DEFAULT_POSE' — not a 6-leg tuple
             self.cmd_gait = msg.gait
             self.cmd_height = msg.height
             self.cmd_period = msg.period
@@ -88,12 +102,14 @@ class StepController(Node):
 
 
     def reset_all_new_gen(self):
+        """Drop every queued (not-yet-started) command."""
         self.new_pose_setter = None
         self.new_actionset_runner = None
         self.new_pose_transformer = None
         self.new_moving_generator = None
 
     def reset_all_cur_gen(self):
+        """Drop every in-flight generator. Next loop iteration is idle unless something new is queued."""
         self.cur_pose_setter = None
         self.cur_actionset_runner = None
         self.cur_pose_transformer = None
@@ -104,9 +120,18 @@ class StepController(Node):
         实际执行具体操作的线程循环(the thread loop that actually performs the specific operation)
         """
         os.system("sudo renice -n -19 -p " + str(os.getpid()))
+        # CmdVelGenerator handshake (MovingGenerator ignores status and always
+        # yields slow=='move'). send_status is what we pass into .send();
+        # last_status is this loop's own phase of a generator switch:
+        #   send_status 'first'   — play the resume slice (steps1)
+        #   send_status 'running' — full cycle
+        #   send_status 'finish'  — play the wind-down slice (steps2), stash finish_ps
+        #   last_status 'start' → on last_part + queued replacement → 'stop' and send 'finish'
+        #   last_status 'stop'  → after the pose is applied → 'finish'
+        #   last_status 'finish'→ promote temp (the queued generator), send 'first' again
         last_status = 'start'
         send_status = 'first'
-        temp = None
+        temp = None  # queued CmdVelGenerator held while the current one winds down
         while self.loop_enable:
             # 设置姿态(set posture)
             try:
@@ -116,6 +141,7 @@ class StepController(Node):
                 if self.cur_pose_setter is not None:
                     pose, transform, duration = self.cur_pose_setter
                     if pose is None or transform is None:
+                        # set_pose(None, None, t) from stop_running: hold current pose, then drop all generators
                         self.set_pose_base(self.pose, duration, update_pose=True)
                     else:
                         self.set_pose_base(pose, duration, update_pose=True)
@@ -161,21 +187,25 @@ class StepController(Node):
                     moving_pose, last_part, params, slow = self.cur_moving_generator.send((pose, send_status))
                     
                 except StopIteration as e:
-                    # 生成器已自然结束
+                    # 生成器已自然结束(generator exhausted: no more frames)
                     self.cur_moving_generator = None
                 except Exception as e:
-                    # 其他异常（如类型错误、数值错误等）
+                    # 其他异常（如类型错误、数值错误等）(any other error: drop this generator)
                     self.get_logger().error("GENERATE ERROR: " + repr(e))
                     self.cur_moving_generator = None
 
                 if last_part:
                     if slow == 'move':
+                        # discrete-step generator: swap on the step boundary
                         if self.cur_moving_generator is not self.new_moving_generator:
                             self.cur_moving_generator = self.new_moving_generator
-                        # 如果没有移动生成器，重置线性和角速度
+                        # 如果没有移动生成器，重置线性和角速度(no generator left: zero the published twist)
                         if self.cur_moving_generator is None:
                             self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
                     else:
+                        # cmd_vel generator: do not swap mid-cycle. After a wrap,
+                        # either keep running, or tell it 'finish' so it can park
+                        # the feet and hand finish_ps to the next generator.
                         send_status = 'running'
                         if self.cur_moving_generator is not self.new_moving_generator:
                             if last_status != 'finish':
@@ -192,6 +222,9 @@ class StepController(Node):
                 self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
                         
             # 应用新的姿态(apply new posture)
+            # Identity check: PoseTransformer yields a new pose object. If a
+            # gait is also running, pseudo=True so this only updates self.pose
+            # and the actual servos are driven by moving_pose below.
             if pose is not self.pose:
                 try:
                     self.set_pose_base(pose, 0.02, pseudo=(moving_pose is not None), update_pose=True)
@@ -203,6 +236,7 @@ class StepController(Node):
             if moving_pose is not None:
                 try: 
                     if send_status == 'first' and slow == 'cmd_true':
+                        # large foot jump from the previous cycle: 50 ms blend instead of 20 ms
                         self.set_pose_base(moving_pose, 0.05, pseudo=False, update_pose=False)
                         # time.sleep(0.02)
                     else:
@@ -211,6 +245,7 @@ class StepController(Node):
                         last_status = 'finish'
                     self.transform = transform
                     if isinstance(params, CmdVelParams):
+                        # mm/s → m/s, then integrate 20 ms of body velocity into odom x,y,yaw
                         self.linear_x = params.velocity_x / 1000.0
                         self.linear_y = params.velocity_y / 1000.0
                         self.angular_z = params.angular_z
@@ -288,6 +323,7 @@ class StepController(Node):
 
 
     def set_leg_relatively(self, leg_id, offset, duration):
+        """Move one foot by a xyz offset from the pose currently stored in self.pose."""
         cur_pos = list(self.pose[leg_id - 1])
         new_pos = cur_pos[0] + offset[0], cur_pos[1] + offset[1], cur_pos[2] + offset[2]
         self.set_leg_position(leg_id, new_pos, duration)
@@ -301,6 +337,7 @@ class StepController(Node):
         :param pseudo: 是否真的控制舵机运动， 若为True则只计算并设置相应变量而不真正发送控制指令给舵机(whether to actually control the servo movement. If True, only calculate and set the corresponding variables without actually sending control commands to the servo)
         :return: None
         """
+        # 6 legs × 3 joints → 18 servo radians, ids 1..18 in leg order
         joints = [kinematics.set_leg_position(i + 1, position) for i, position in enumerate(new_pose)]
         joints = list(itertools.chain.from_iterable(joints))
         joints_data = [[j, r] for j, r in zip(list(range(1, 19)), joints)]
@@ -351,6 +388,7 @@ class StepController(Node):
         self.set_pose_base(kinematics_calculate.transform_quat(translate, quaternion), duration) 
     
     def transform_absolutely(self, translate, euler, duration):
+        """Queue a body transform whose translation/euler are absolute targets, not deltas."""
         generator = PoseTransformer(PoseTransformerParams(translation=translate, rotation=euler, absolutely=True, duration=duration))
         if generator:
             with self.lock:
@@ -376,32 +414,35 @@ class StepController(Node):
                 self.new_pose_transformer = generator
       
     def cmd_vel(self, twist: Twist):
-        # 1. 定义速度变化的阈值
+        # Dead-band on Twist (disabled). If re-enabled, tiny cmd_vel chatter
+        # would not rebuild the gait generator.
+        # 1. 定义速度变化的阈值(velocity-change thresholds)
         # LINEAR_VEL_THRESHOLD = 0.01  # m/s, 线性速度变化阈值，例如1cm/s
         # ANGULAR_VEL_THRESHOLD = 0.1 # rad/s, 角速度变化阈值，例如约3度/s
 
-        # # 2. 如果上一次的速度存在，则进行判断
+        # # 2. 如果上一次的速度存在，则进行判断(if we have a previous Twist, compare against it)
         # if self.last_twist:
-        #     # 计算线速度和角速度的变化量
+        #     # 计算线速度和角速度的变化量(deltas on vx, vy, wz)
         #     linear_x_diff = abs(twist.linear.x - self.last_twist.linear.x)
         #     linear_y_diff = abs(twist.linear.y - self.last_twist.linear.y)
         #     angular_z_diff = abs(twist.angular.z - self.last_twist.angular.z)
 
-        #     # 如果所有变化量都在阈值之内，则认为速度未变，直接返回
+        #     # 如果所有变化量都在阈值之内，则认为速度未变，直接返回(all under threshold: ignore this message)
         #     if (linear_x_diff < LINEAR_VEL_THRESHOLD and
         #         linear_y_diff < LINEAR_VEL_THRESHOLD and
         #         angular_z_diff < ANGULAR_VEL_THRESHOLD):
         #         return
         
-        # # 3. 如果是第一次接收指令，或者速度变化超过阈值，则更新last_twist
-        # # 如果twist是 (0, 0, 0)，表示停止，将last_twist设为None，以便下次任何非零速度都能启动
+        # # 3. 如果是第一次接收指令，或者速度变化超过阈值，则更新last_twist(first command or over threshold: store last_twist)
+        # # 如果twist是 (0, 0, 0)，表示停止，将last_twist设为None，以便下次任何非零速度都能启动(zero Twist means stop: clear last_twist so the next non-zero always starts a generator)
         # if twist.linear.x == 0 and twist.linear.y == 0 and twist.angular.z == 0:
         #     self.last_twist = None
         # else:
         #     self.last_twist = twist
         
-        linear_x = twist.linear.x*1000  # linear_x 单位为 毫米每秒(linear_x is measured in meters per second)
-        linear_y = twist.linear.y*1000  # linear_y 单位为 毫米每秒(linear_y is measured in meters per second)
+        # Twist is m/s; kinematics / CmdVelParams use mm/s
+        linear_x = twist.linear.x*1000  # linear_x 单位为 毫米每秒(linear_x is measured in millimeters per second after this scale; Twist itself is m/s)
+        linear_y = twist.linear.y*1000  # linear_y 单位为 毫米每秒(linear_y is measured in millimeters per second after this scale; Twist itself is m/s)
         angular_z = twist.angular.z # 旋转角速度 rad/sec(the speed of rotation angle is rad/sec)
 
 
@@ -438,6 +479,8 @@ class StepController(Node):
                       interrupt=True,
                       feedback_cb=None):
 
+        # gait 11/12/13 are not walks: they store cmd_vel defaults.
+        # 11 → ripple (1), 12 → tripod (2), 13 → gait 3 if kinematics has one.
         if gait == 11 or gait == 12 or gait == 13:
             self.cmd_period = duration
             self.cmd_gait = gait - 10

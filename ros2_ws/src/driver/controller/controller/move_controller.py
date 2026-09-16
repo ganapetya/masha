@@ -21,6 +21,7 @@ from geometry_msgs.msg import Quaternion, Vector3, TransformStamped, TwistWithCo
 
 
 class MoveController(Node):
+    """ROS 2 facade over StepController: topics/services in, gait/pose/actions out."""
     def __init__(self, node_name):
         rclpy.init()
         super().__init__(node_name)
@@ -29,15 +30,15 @@ class MoveController(Node):
         self.bian = 1
         self.last_time = 0.03
         self.action_complete = True
-        # 初始化计数器
-        self.current_trans = [0.0, 0.0, 0.0]  # x,y,z位移累计
-        self.current_rot = [0.0, 0.0, 0.0]  # x,y,z旋转累计
+        # 初始化计数器(accumulators for relative pose_transform_euler commands)
+        self.current_trans = [0.0, 0.0, 0.0]  # x,y,z位移累计(cumulative body translation)
+        self.current_rot = [0.0, 0.0, 0.0]  # x,y,z旋转累计(cumulative body rotation, radians)
     
-        # 设置计数边界（根据实际需求调整）
-        self.translation_limits = [0.60, 0.14, 40.0]  # 位移最大阈值
-        self.rotation_limits = [0.20, 0.20, 0.40]  # 旋转最大阈值
+        # 设置计数边界（根据实际需求调整）(clamp the accumulators so stacked relative transforms cannot run away)
+        self.translation_limits = [0.60, 0.14, 40.0]  # 位移最大阈值(max |x|, |y|, |z| of the accumulator)
+        self.rotation_limits = [0.20, 0.20, 0.40]  # 旋转最大阈值(max |roll|, |pitch|, |yaw| of the accumulator)
 
-        # 控制器初始化
+        # 控制器初始化(own a StepController; both nodes are spun by the same executor)
         self.step_controller = step_controller.StepController()
         # ROS 2 name lesson (this is the mailbox the C++ dance node waits on):
         #   'action_complete'  →  /action_complete
@@ -50,7 +51,7 @@ class MoveController(Node):
         self.status_pub = self.create_publisher(Bool, 'action_complete', 1)
         self.agc = ActionGroupController(self.create_publisher(ServosPosition, 'servo_controller', 1), '/home/ubuntu/software/actionset_editor/ActionGroups',self.status_pub)
 
-        # 启动完成信号
+        # 启动完成信号(tf_prefix / odom_enable are launch parameters, not a "started" signal)
         self.declare_parameter('tf_prefix', '')
         self.declare_parameter('odom_enable', False)
         
@@ -58,33 +59,33 @@ class MoveController(Node):
             self.odom_trans_pub = self.create_publisher(TransformStamped, 'middle_tf', 1)
             self.odometry_pub = self.create_publisher(Odometry, 'odom/raw', 1)
         timer_cb_group = ReentrantCallbackGroup()
-        # 姿态控制订阅
-        # 机器人机体姿态变换
-        # 通过 平移和欧拉角旋转变换机器人的姿态， 相对姿态变换, 旋转顺序为 RPY
+        # 姿态控制订阅(body-pose topics)
+        # 机器人机体姿态变换(body pose transform)
+        # 通过 平移和欧拉角旋转变换机器人的姿态， 相对姿态变换, 旋转顺序为 RPY(relative transform: translation + RPY Euler, added to the accumulator then clamped)
         self.create_subscription(TransformEuler, '~/pose_transform_euler', self.pose_transform_euler_callback, 1)  
-        # 通过 平移和欧拉角旋转变换机器人的姿态， 绝对变换, 旋转顺序为 RPY
+        # 通过 平移和欧拉角旋转变换机器人的姿态， 绝对变换, 旋转顺序为 RPY(absolute pose: go to this position + RPY, duration hardcoded to 0.4 s)
         self.create_subscription(Pose, '~/set_pose_euler', self.set_pose_euler_callback, 1)
 
-        # 腿部控制订阅
-        # 设置一条腿末端移动到指定位置, 绝对坐标
+        # 腿部控制订阅(single-leg topics)
+        # 设置一条腿末端移动到指定位置, 绝对坐标(move one foot to an absolute xyz)
         self.create_subscription(LegPosition, '~/set_leg_absolute', self.set_leg_absolute_callback, 1)  
-         # 设置一条腿末端移动当相对与当期位置的指定位置
+         # 设置一条腿末端移动当相对与当期位置的指定位置(move one foot by a delta from its current xyz)
         self.create_subscription(LegPosition, '~/set_leg_relatively', self.set_leg_relatively_callback,1)
         
-        # 运动控制订阅
-        # 通过步态参数控制机器人的移动
+        # 运动控制订阅(walking topics)
+        # 通过步态参数控制机器人的移动(Traveling: gait, stride, height, heading, steps)
+         # 通过线速度、角速度控制机器人的移动，其他参数由上一次执行的 gait大于0的traveling来指定(cmd_vel: body Twist; gait/height/period come from the last Traveling with gait>0, or from gait 11/12/13)
         self.create_subscription(Traveling, '~/traveling', self.set_traveling_callback, 1)
-         # 通过线速度、角速度控制机器人的移动，其他参数由上一次执行的 gait大于0的traveling来指定
         self.create_subscription(Twist, '~/cmd_vel', self.cmd_vel_callback, 1)  
         # Action-group cue. This is a *topic* (postcard), not a service.
         # Type: interfaces/msg/RunActionSet (action_path, interrupt).
         # ~/run_actionset → /controller/run_actionset because of the tilde.
         self.create_subscription(RunActionSet, '~/run_actionset', self.run_actionset_callback, 1)
-        # 机器人姿态设置服务
+        # 机器人姿态设置服务(built-in pose by name, e.g. DEFAULT_POSE)
         self.create_service(SetPose1, '~/set_pose_1', self.set_pose1_callback, callback_group=timer_cb_group)
-        # 机器人特殊动作组发布
+        # 机器人特殊动作组发布(forward dance_1/2/3 and stop to the perform_actions node)
         self.perfrom_actions_pub = self.create_publisher(RunActionSet, '/perform_actions/actions', 1)
-        # 机器人动作组运行完成订阅
+        # 机器人动作组运行完成订阅(True when the last action group finished; gates starting a new one)
         self.create_subscription(Bool, '/action_complete', self.action_complete_callback, 1)
 
         if self.get_parameter('odom_enable').value:
@@ -93,15 +94,18 @@ class MoveController(Node):
         self.tf_prefix = f"{self.tf_prefix}/" if self.tf_prefix else ''
         
     def action_complete_callback(self, msg):
-        """获取动作组完成状态"""
+        """获取动作组完成状态(True = last action group finished, a new one may start)"""
         self.action_complete = msg.data
 
    
     def pose_transform_euler_callback(self, msg: TransformEuler):
-        # 获取当前值
+        # 获取当前值(this message's relative delta)
         current_trans = [msg.translation.x, msg.translation.y, msg.translation.z]
         current_rot = [msg.rotation.x, msg.rotation.y, msg.rotation.z]
 
+        # Stack relative commands, but if the running total would exceed the
+        # per-axis limit, drop this axis's delta (send 0) and pin the total
+        # at ±limit so later commands cannot push further that way.
         for i in range(3):
             self.current_trans[i] += current_trans[i]
             self.current_rot[i] += current_rot[i]
@@ -124,7 +128,7 @@ class MoveController(Node):
             self.get_logger().error(str(e))
 
     def set_pose_euler_callback(self, msg: Pose):
-        """设置欧拉角姿态"""
+        """设置欧拉角姿态(absolute body pose: position + roll/pitch/yaw, 0.4 s)"""
         self.step_controller.transform_absolutely(
             (msg.position.x, msg.position.y, msg.position.z), 
             (msg.orientation.roll, msg.orientation.pitch, msg.orientation.yaw), 
@@ -132,7 +136,7 @@ class MoveController(Node):
         )
 
     def set_leg_absolute_callback(self, msg: LegPosition):
-        """设置腿部绝对位置"""
+        """设置腿部绝对位置(one foot to an absolute xyz)"""
         self.step_controller.set_leg_position(
             msg.leg_id,
             (msg.position.x, msg.position.y, msg.position.z),
@@ -140,7 +144,7 @@ class MoveController(Node):
         )
 
     def set_leg_relatively_callback(self, msg: LegPosition):
-        """设置腿部相对位置"""
+        """设置腿部相对位置(one foot by a delta from the pose currently stored in StepController)"""
         leg_id = msg.leg_id
         duration = msg.duration
         leg_pos = msg.position.x, msg.position.y, msg.position.z
@@ -149,7 +153,7 @@ class MoveController(Node):
         self.step_controller.set_leg_position(leg_id, new_pos, duration)
 
     def set_traveling_callback(self, msg: Traveling):
-        """运动控制回调"""
+        """运动控制回调(Traveling.gait selects walk / stop / built-in poses / cmd_vel defaults)"""
 
         try:
             if msg.gait > 0:
@@ -181,15 +185,15 @@ class MoveController(Node):
                     self.step_controller.set_build_in_pose('SLAM_POSE', msg.time)
                 elif msg.gait == -2:
                     self.step_controller.set_build_in_pose('DEFAULT_POSE', msg.time)
-                    self.current_trans = [0.0, 0.0, 0.0]  # x,y,z位移累计
-                    self.current_rot = [0.0, 0.0, 0.0]     # x,y,z旋转累计
+                    self.current_trans = [0.0, 0.0, 0.0]  # x,y,z位移累计(reset relative-transform accumulators)
+                    self.current_rot = [0.0, 0.0, 0.0]     # x,y,z旋转累计(reset relative-rotation accumulators)
 
         except Exception as e:
             self.get_logger().error('error1'+str(e))
 
     def cmd_vel_callback(self, msg: Twist):
         # self.get_logger().info(str(msg))
-        """速度控制回调"""
+        """速度控制回调(clamp body Twist, then hand it to StepController.cmd_vel)"""
         msg.linear.x = max(min(msg.linear.x, 0.12), -0.12)
         msg.linear.y = max(min(msg.linear.y, 0.10), -0.10)
         msg.angular.z = max(min(msg.angular.z, 0.6), -0.6)
@@ -197,9 +201,9 @@ class MoveController(Node):
         self.step_controller.cmd_vel(msg)
 
 
-    # 服务回调 
+    # 服务回调(service callbacks)
     def set_pose1_callback(self, request: SetPose1.Request, response: SetPose1.Response):
-        """内置姿态服务回调"""
+        """内置姿态服务回调(look up a named pose in build_in_pose and queue it)"""
         try:
             self.step_controller.set_build_in_pose(request.pose, request.duration)
             
@@ -238,17 +242,23 @@ class MoveController(Node):
             if self.action_complete == True:
                 self.agc.start_action_thread(file_path)
 
-    # 定时发布任务 
+    # 定时发布任务(50 Hz odom timer, only if odom_enable)
     def odometry_publish(self):
-        """发布里程计信息"""
+        """发布里程计信息(publish odom→base_link TF from StepController's integrated pose.
+
+        Note: odometry_pub ('odom/raw') is created when odom_enable is set, but this
+        timer only publishes TransformStamped on 'middle_tf'. The actual Odometry
+        message is produced by odom_publisher_node.py.)
+        """
         cur_time = self.get_clock().now().to_msg()
+        # roll/pitch from the body transform (negated to odom convention), yaw from integrated pose_yaw
         cur_quat = R.from_euler('xyz', [
             -self.step_controller.transform[1][0],
             -self.step_controller.transform[1][1],
             self.step_controller.pose_yaw
         ]).as_quat()
         
-        # 发布TF转换
+        # 发布TF转换(odom → base_link, using dead-reckoned x,y and pose_yaw)
         odom_trans = TransformStamped()
         odom_trans.header.stamp = cur_time
         odom_trans.header.frame_id = f"{self.tf_prefix}odom"
