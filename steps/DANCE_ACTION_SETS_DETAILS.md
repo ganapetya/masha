@@ -712,6 +712,48 @@ If `/action_complete` never goes true, the director gives up at 16.5 s (`dance_t
 
 ---
 
+## 12a. Does the 20 ms worker plan many ticks, or only the current one?
+
+Two layers. Do not mix them.
+
+**The worker thread (`StepController.loop`) is only the current interval.** It is a metronome: wake, look at inboxes, maybe publish one servo message, `sleep(0.02)`, repeat. It has no calendar of “at t=0.34 s do this.” It does not store a list of future joint commands.
+
+**A generator the worker is currently holding can know many intervals.** That object lives across ticks. The worker’s only long-term act is `generator.send(...)` once per tick and keep the same Python generator in `cur_moving_generator` / `cur_pose_transformer`.
+
+```
+worker (dumb clock)          generator (optional memory)
+  tick n: send()  --------->  yield frame n of a table it already built
+  sleep 0.02
+  tick n+1: send() -------->  yield frame n+1
+```
+
+**Is there “compute once, consume over many 20 ms ticks”?** Yes for **foot xyz of a walk**. No for **named-pose IK**, and not as a queue of joint angles.
+
+| Job | Computed once? | What the 20 ms ticks consume | `set_leg_position` (xyz→radians) |
+|---|---|---|---|
+| Named stand `DEFAULT_POSE` | Six-leg IK **once**, one message `duration=1.0` | **Nothing.** Later ticks are idle. The STM32 slides for 1 s. | Once |
+| Walk `MovingGenerator` | Whole-step table of foot xyz (`set_step_mode` × 6 parts) | One xyz snapshot per tick from `poses[part][sub]` | **Every tick** in `set_pose_base` |
+| Walk `CmdVelGenerator` | One gait-cycle table of xyz (`cmd_vel_new_point` per phase) | One snapshot per tick from `steps[i]` | **Every tick** |
+| Body transform | Only `duration/0.02` and lerp sizes | One new xyz per tick, computed **that** tick | **Every tick** |
+| Dance `.d6a` | Not this worker | — | Never |
+
+So the pattern you are asking about exists, but the batch is **millimetre foot positions for a step**, not a batch of IK joint answers. Walking: plan the path once, play it like a film strip, still convert each frame’s xyz to radians on that tick (cheap). Standing: IK once, **hardware** (not the 20 ms loop) consumes the duration. Dancing: this worker is not involved.
+
+Walk batch, in code:
+
+```python
+# ros2_ws/src/driver/controller/controller/move.py:114-133  (once per step)
+for i in range(6):
+    ps = kinematics.set_step_mode(...)  # many frames of xyz for this part
+    poses.append(ps)
+# then every 20 ms:
+out_pose = poses[part_index][sub_index]  # lookup
+# worker then:
+# step_controller.py:243  set_pose_base(moving_pose, 0.02)  → 6× set_leg_position
+```
+
+---
+
 ## 13. Is IK really computed every 20 ms? (no micrometres, not a hard job)
 
 Short answer: **not for the dance, not for the halt stand, and never in micrometres.** Inverse kinematics of one 3-joint insect leg is a handful of trig functions. Fifty times a second on a Jetson is idle time.
