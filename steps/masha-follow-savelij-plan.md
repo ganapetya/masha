@@ -4,7 +4,7 @@
 **Source:** host clipboard paste (2026-09-16) titled “Step 2 Execution Plan: Masha Following Savelij (Mecanum Car)”.  
 **This memo:** feasibility against Masha as she actually runs (Jetson Orin NX, ROS 2 Humble, `ROS_DOMAIN_ID=27`, `proud_up`, Aurora 930, LD19, bus servos).  
 **Name:** the other robot is **Saveli** in the trio docs; the clipboard used **Savelij**. Same machine. This file uses **Saveli**.  
-**Revision (2026-09-16, later same day):** custom gait is **in scope**. The first draft dropped it because a vendor `CmdVelGenerator` walk would already chase a tagged car. That was the *efficient* answer. Peter’s goal is **learning**, so we write the walk ourselves. How the walk *looks* (bounce, wave, high-step, …) is a later decision; the injection point is not.
+**Revision (2026-09-16, later same day):** custom gait is **in scope**. The first draft dropped it because a vendor `CmdVelGenerator` walk would already chase a tagged car. That was the *efficient* answer. Peter’s goal is **learning**, so we write the walk ourselves. **Three map variants** (quintic-swing tripod, wave, omnidirectional tripod) are in this file; Peter picks one before Phase G0. Bounce / high-step / period are knobs, not a fourth map.
 
 Related reading (do not re-derive):
 
@@ -194,29 +194,79 @@ Chassis jerk is fixed by that landing (and by matching swing speed into stance s
 
 The vendor walk *does* stomp: linear `s = t/T` on a parabola, so `z-dot ≠ 0` at touchdown. That difference is visible. It is also the Chapter 9 lesson TRAJECTORY.MD says is missing.
 
-### Character — decide later (not a gate)
+### Three map variants (Peter picks one)
 
-Peter: follow Saveli “in a bit customized way (we decide later how).” Until that pick, implement **one** map that is already a gait (support triangle + swing quintic + rolling cycle) and expose the look as **parameters**, not as a second generator.
+Same injection point for all three: `FollowGaitGenerator`, `gait=5` / select `15`, vendor IK, swing quintic, rolling cycle, halt `-2`. The choice is the **map** (which feet, what body motion), not a second servo node. Implement **one**. Do not add `gait=6`.
 
-| Knob | Start (until we pick) | What it changes |
-|---|---|---|
-| Grouping | Tripod A/B above | Wave/ripple later = one swing foot at a time; more stable, slower |
-| Lift `height` | 25–30 mm | Higher than voice walk (~20 mm) so landings are obvious |
-| Period | 0.6–0.8 s | Stalking = longer; scurrying = shorter |
-| Stance compression | 0 mm (off) | Non-zero → body bob (“follow bounce”) |
-| `vx` cap | 0.05 m/s | Safety vs unfinished-step overshoot |
-| `vy` | 0 (off) | Crab match to Mecanum strafe — later skill |
-| Duty (fraction of cycle a foot is up) | 0.5 (tripod) | Wave uses ~1/6 |
+Shared, not optional:
 
-Menu for the later decision (change the map / knobs, not the ROS wiring):
+- Cycle clock keeps rolling (no rest-to-rest on the whole step).
+- Swing only: `sigma(tau) = 10*tau^3 - 15*tau^4 + 6*tau^5`. Because `sigma-dot = 0` at lift and plant, `x-dot` and `z-dot` are ~0 there even on a spatial parabola. Vendor `s = t/T` stomps.
+- Support: at every 20 ms sample the grounded feet contain the CoM projection.
+- First live `vx` cap 0.05 m/s. Lift start 25–30 mm.
 
-1. **Quintic-swing tripod** — default. Looks different from vendor stomp; same grouping as `gait=2`.
-2. **Follow bounce** — extra stance compression, visible body bob.
-3. **Wave** — one leg at a time; slower, always five feet down; good for close standoff.
-4. **High-step** — more clearance, same tripod.
-5. **Stalking** — long period, small stride, still quintic landings.
+| | **1. Quintic-swing tripod** | **2. Wave (one leg up)** | **3. Omnidirectional tripod** |
+|---|---|---|---|
+| What you see | Same 3+3 as vendor, but she *kisses* the floor | Insect: one foot in the air, five down | Same 3+3, but she can **crab** |
+| Grouping | A = LF, LR, RM; B = LM, RR, RF | Legs 1→6 in 60° steps | Same as 1 |
+| Duty (time in air) | ~50% | ~15–25% | ~50% |
+| Command | `vx`, `ωz` | `vx`, `ωz` | `vx`, `vy`, `ωz` |
+| Book lesson | Ch. 9 **clock** vs vendor metronome | Duty factor + large support polygon | Planar **twist** → six AEP/PEP |
+| Follow-Saveli fit | Polite copy of today’s walk | Best for 0.80 m standoff + reverse (Test 4) | Best match to a Mecanum car |
+| Risk | Low | Low–medium (phase table) | Medium (no-slip stance math) |
+| “That’s ours” from across the room | Weak unless you watch the feet | Strong | Strong when Saveli strafes |
 
-Do not invent a sixth option in chat and then a seventh generator. Pick from this list when we have seen Test G2 on the floor.
+**Pick (locked when Peter says 1, 2, or 3):** _none yet._
+
+Grok recommendation: **3** if the goal is the most interesting gait to live with while following Saveli (only variant that adds a skill the car has). **2** if the goal is the most obviously custom walk on the first dry-run. **1** is the right *internal* clock for 2 and 3; do not implement 1 as the final character if we only get one map.
+
+#### Variant 1 — Quintic-swing tripod
+
+Vendor skeleton, our clock.
+
+- `φ ∈ [0, π)`: group A swings, B stance. Then they swap.
+- Swing foot: linear PEP→AEP in `xy`, lift in `z`, progress `sigma(tau)` quintic.
+- Stance: retract at constant `z` (ground). Cycle does **not** pause at wrap.
+
+Why it is interesting: cleanest A/B against Traveling `gait=2`. Same triangle, different time law. That is the TRAJECTORY.MD gap.
+
+Why it may bore: from two metres away she still “looks like Masha walking,” only quieter. Following Saveli she does not gain a new skill (no crab, no extra stability).
+
+Period start ~0.6–0.8 s.
+
+#### Variant 2 — Wave (one leg up)
+
+Different **who moves**, same clock.
+
+- Six slices of 60°. One leg swings; five stay down. Support polygon is almost the whole body.
+- Swing still quintic. Period longer (~1.0–1.2 s). Top speed lower for the same stride — fine at 0.05 m/s.
+- **Not** vendor ripple. Ripple in the `.so` is ~32% swing (overlapping pairs). This is pentapedal wave.
+
+Why it is interesting: you can count the walk. Best when the car may reverse into the LiDAR wall (Test 4): always a huge polygon, small unfinished-step overshoot. Closest to “stalking follow.”
+
+Cost: six phase windows, not two. Turns in place are slower. If Saveli drives off at normal speed she will lag more than a tripod.
+
+#### Variant 3 — Omnidirectional tripod
+
+Different **body math**, same 3+3 grouping.
+
+Clipboard Phase 1 was “live `(vx, vy, ωz)` → feet.” Vendor `CmdVelGenerator` already does that inside the `.so`. We write it in the open:
+
+- Body planar twist over one period `T`: `Δx = vx T`, `Δy = vy T`, `Δθ = ωz T`.
+- Stance foot is fixed on the floor, so in `base_link` it traces the **inverse** rigid motion. AEP/PEP are the ends of that track (no-slip).
+- Swing is the quintic bridge PEP→AEP, including the **lateral** gap, not only `x`.
+
+Why it is interesting: Saveli is holonomic; Masha is not, *until this map exists*. Test 3 today is “strafe out of FOV → halt (pass).” This gait is what makes “strafe → crab after him” a later controller flag instead of a rewrite. It is the parametric engine the clipboard asked for.
+
+Cost: hardest of the three (rotation of each foot’s ground track, not just `x ± stride/2`). First live tests still keep `vy = 0` until `vx + ωz` is boring. Wrong AEP/PEP signs scuff or trip.
+
+#### Not a variant (knobs on the chosen map)
+
+Do not spend a fourth generator on these:
+
+- **Bounce / body bob** — stance-`z` amplitude on variant 1 or 3.
+- **High-step / stalking period** — `height` and `T`, same map.
+- **Rest-to-rest quintic on the whole cycle** — point-to-point, not a walk (lurch–pause). Correct for a single creep step; wrong as a cyclic gait.
 
 ---
 
@@ -401,11 +451,10 @@ Debug: optional overlay image `~/image_result` (tag box, `r`, `θ`, `d_min`, pha
 
 ### Phase G0 — gait map on paper + gtest (no robot)
 
-Write `follow_gait.hpp`: (1) spatial map: phase, stride, height, vx, wz → six feet; (2) quintic `sigma(t)` on **swing only**; cycle phase keeps rolling. Invariants in `test_follow_gait.cpp`:
+**Blocked until the variant pick is filled in** (1, 2, or 3). Write `follow_gait.hpp` for **that** map: (1) spatial map: phase, stride, height, velocity → six feet; (2) quintic `sigma(t)` on **swing only**; cycle phase keeps rolling. Invariants in `test_follow_gait.cpp` (all variants):
 
-- At \(\varphi = 0\) and \(\varphi = \pi\), the stance triangle is the tripod group that is supposed to be down.
-- CoM projection (equal masses ok in the unit test) is inside that triangle.
-- `vx > 0` moves swing feet toward \(+X\); `wz > 0` rotates the AEP/PEP the correct way.
+- Grounded feet at each sample contain the CoM projection (equal masses ok in the unit test). Variant 1/3: at \(\varphi = 0\) and \(\varphi = \pi\) the stance triangle is tripod group B then A. Variant 2: five feet down in every 60° slice; the one marked swing is the only one up.
+- `vx > 0` moves swing feet toward \(+X\); `wz > 0` rotates the AEP/PEP the correct way. Variant 3: `vy > 0` moves swing feet toward \(+Y\) (body left).
 - No foot \(z\) above the contact band while marked stance.
 - Swing quintic: at lift-off and touchdown, that foot’s `z-dot` and `sigma-dot` are ~0. Beads on the arch cluster at the ground ends, not at cycle wrap.
 - Two cycles concatenated: **body / stance speed at the join is not ~0** (no rest-to-rest walk). A test that wants zero cycle-end `s-dot` is the wrong test.
@@ -422,9 +471,9 @@ If this dry-run falls through to `set_step_mode(..., 5)` the `.so` will do somet
 
 ### Phase G2 — our gait under `cmd_vel`, no Saveli
 
-Traveling `gait: 15` once, then small Twists by hand (`vx = 0.03`, then `ωz` only). Confirm: she translates, she turns, halt `-2` stands. Floor clear. This is also when Peter can look at the walk and pick a character from the menu (or keep the default).
+Traveling `gait: 15` once, then small Twists by hand (`vx = 0.03`, then `ωz` only). Confirm: she translates, she turns, halt `-2` stands. Floor clear. Variant 3: after that, `vy` only.
 
-DoD: visibly not vendor tripod (softer landings / different lift), still a tripod (or whichever grouping we chose), halt stands.
+DoD: visibly not vendor walk (softer landings; wave if pick is 2). Halt stands.
 
 ### Phase A — Tag visible (no walk)
 
@@ -455,9 +504,11 @@ gtest: body heading, deadband, lidar hysteresis, “zero Twist is not halt” as
 
 Same node, no extra process. Confirm Test 4. Confirm she does **not** chatter at the boundary (hysteresis). Confirm halt is a stand, not a march.
 
-### Phase E — character retune (after C/D, not a gate)
+### Phase E — knobs on the chosen variant (after C/D, not a gate)
 
-Pick from the character menu. Change parameters or the map. Do **not** add a second servo node. Do **not** pass `5` into `kinematics.set_step_mode`.
+Height, period, optional bounce. Do **not** switch to a second map in this phase. Do **not** add a second servo node. Do **not** pass `5` into `kinematics.set_step_mode`.
+
+If the pick is variant 3: after Test 2 is boring, a later Test 3b may enable `vy` when Saveli strafes (lost-tag halt remains the backstop).
 
 ---
 
@@ -469,9 +520,9 @@ Joystick / pad on Masha unplugged. No Saveli required.
 
 **Test G0 — gtest.** All invariants in Phase G0. Fail the build if swing `z-dot` at touchdown is not ~0, or if cycle-end stance speed *is* ~0.
 
-**Test G1 — in-place cycle.** Traveling `gait: 5`, `stride: 0`. Tripod (or chosen grouping) visible. Soft landings. No body pause at wrap. `gait: -2` → `DEFAULT_POSE`. Repeat. No servo fight (one publisher).
+**Test G1 — in-place cycle.** Traveling `gait: 5`, `stride: 0`. Chosen grouping visible (tripod A/B, or one-leg wave). Soft landings. No body pause at wrap. `gait: -2` → `DEFAULT_POSE`. Repeat. No servo fight (one publisher).
 
-**Test G2 — slow `cmd_vel`.** `gait: 15` then `vx = 0.03` for ~3 s, halt. Then `ωz` only, halt. She must translate / yaw and then **stand**, not march.
+**Test G2 — slow `cmd_vel`.** `gait: 15` then `vx = 0.03` for ~3 s, halt. Then `ωz` only, halt. She must translate / yaw and then **stand**, not march. Variant 3 only, after that is boring: `vy` only, then halt.
 
 ### Follow (clipboard Phase 5, corrected)
 
@@ -481,7 +532,7 @@ Joystick on Saveli. Masha’s pad unplugged. `enable_walk` only after Phase B. W
 
 **Test 2 — Straight follow.** Drive Saveli forward slowly. Masha holds ~0.80 m. No contact. Lost tag (you cover it) → stand within one step.
 
-**Test 3 — Gentle curve.** Saveli yaws. Masha updates `ωz` and `vx`. If Saveli **strafes** out of the camera, she **stops** (pass). Matching `vy` is a later test, not a fail of Test 3.
+**Test 3 — Gentle curve.** Saveli yaws. Masha updates `ωz` and `vx`. If Saveli **strafes** out of the camera, she **stops** (pass) unless the pick is variant 3 **and** Phase E Test 3b is on (`vy` from tag `y`). Matching `vy` is not a fail of Test 3.
 
 **Test 4 — LiDAR cutoff.** From a follow, drive Saveli **backward** toward Masha. She stands at `d_stop` and stays stood until Saveli opens past `d_go`. Repeat three times: no chatter, no servo fight, no march-in-place.
 
@@ -541,4 +592,4 @@ Two writers on `/servo_controller` is how a gait fights a dance, and how a “cu
 
 ## Do not implement on this turn
 
-This file is the corrected plan, with custom gait restored as a learning product. No node, no generator, no launch, no yaml in `proud_up` until Peter says to build it. Character of the walk stays a later pick from the menu above.
+This file is the corrected plan, with custom gait restored as a learning product. No node, no generator, no launch, no yaml in `proud_up` until Peter says to build it. **Map variant is unset** — pick **1**, **2**, or **3** in “Three map variants” before Phase G0.
