@@ -421,6 +421,12 @@ If someone queued a walk or a lean in the middle of the dance, job C or B would 
 
 ## 7. Body lean (the other “pose transformation”)
 
+**“Body lean” is a teaching name, not a word in the code and not part of a gait.** The code calls this `PoseTransformer`. The dance never starts it. It is a third motion machine: six feet stay on the floor, the **body** is shifted or tilted over them.
+
+Picture a table. You do not pick the table up (that would be a new named pose of the feet). You do not walk it (that would be a gait: some feet lift). You **lean the tabletop** while the legs stay planted. The legs must fold a little so the top can move; that folding is IK, but the *intent* is “move the body,” not “step.”
+
+Live examples on this robot (not the dance): joystick tilt (`peripherals/joystick_control.py`), raise/lower the chassis (`example/body_control/include/height_adjustment.py`: translate z by 3 mm), roll/pitch demos (`posture_adjustment.py`: rotate ±15°).
+
 The dance does not call this. It is here because the Python name “pose transformation” is this generator, not the dance.
 
 **Who commands it.** Anyone who publishes `kinematics_msgs/TransformEuler` on `/controller/pose_transform_euler`. The receptionist stacks those deltas, clamps them, and asks the worker to start a generator:
