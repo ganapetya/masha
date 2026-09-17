@@ -34,7 +34,6 @@
 #include <vector>
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
-#include <apriltag_msgs/msg/april_tag_detection_array.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -308,6 +307,7 @@ class MashaHunterNode : public rclcpp::Node {
     detect_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     control_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     watchdog_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    service_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
     servo_pub_ = create_publisher<servo_controller_msgs::msg::ServosPosition>(servo_topic_, 1);
     cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 1);
@@ -333,21 +333,20 @@ class MashaHunterNode : public rclcpp::Node {
         scan_topic_, sensor_qos,
         [this](sensor_msgs::msg::LaserScan::ConstSharedPtr msg) { on_scan(std::move(msg)); },
         image_opts);
-    tag_sub_ = create_subscription<apriltag_msgs::msg::AprilTagDetectionArray>(
-        apriltag_topic_, 10,
-        [this](apriltag_msgs::msg::AprilTagDetectionArray::ConstSharedPtr msg) {
-          on_tags(std::move(msg));
-        },
-        image_opts);
+    // Saveli pose is TF child saveli_tag. Do not subscribe to apriltag_msgs:
+    // Humble and the Jetson overlay ship different AprilTagDetection layouts;
+    // deserializing the wrong one SIGSEGVs the node (start service never appears).
 
     start_srv_ = create_service<std_srvs::srv::Trigger>(
         "~/start",
         [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-               std::shared_ptr<std_srvs::srv::Trigger::Response> response) { on_start(response); });
+               std::shared_ptr<std_srvs::srv::Trigger::Response> response) { on_start(response); },
+        rmw_qos_profile_services_default, service_cb_group_);
     stop_srv_ = create_service<std_srvs::srv::Trigger>(
         "~/stop",
         [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-               std::shared_ptr<std_srvs::srv::Trigger::Response> response) { on_stop(response); });
+               std::shared_ptr<std_srvs::srv::Trigger::Response> response) { on_stop(response); },
+        rmw_qos_profile_services_default, service_cb_group_);
 
     detect_timer_ = create_wall_timer(50ms, [this]() { detect_tick(); }, detect_cb_group_);
     control_timer_ = create_wall_timer(50ms, [this]() { control_tick(); }, control_cb_group_);
@@ -355,12 +354,12 @@ class MashaHunterNode : public rclcpp::Node {
 
     RCLCPP_INFO(get_logger(),
                 "masha_hunter enable_walk=%s enable_crab=%s enable_wander=%s "
-                "targets=%zu gait_select=%d (tilt is servo 22, not 23). "
-                "Zero Twist is not a halt.",
+                "targets=%zu gait_select=%d saveli_frame=%s (TF, not %s). "
+                "Call ~/start to hunt. Zero Twist is not a halt.",
                 hunter_.config().enable_walk ? "true" : "false",
                 hunter_.config().enable_crab ? "true" : "false",
                 hunter_.config().enable_wander ? "true" : "false", enabled_targets_.size(),
-                follow_gait_select_);
+                follow_gait_select_, saveli_tag_frame_.c_str(), apriltag_topic_.c_str());
   }
 
   ~MashaHunterNode() override { emergency_stop(); }
@@ -400,12 +399,18 @@ class MashaHunterNode : public rclcpp::Node {
     std::lock_guard<std::mutex> lock(mutex_);
     latest_scan_ = std::move(msg);
   }
-  void on_tags(apriltag_msgs::msg::AprilTagDetectionArray::ConstSharedPtr msg) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_tags_ = std::move(msg);
-  }
 
   void detect_tick() {
+    try {
+      detect_tick_inner();
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(get_logger(), "detect_tick: %s", e.what());
+    } catch (...) {
+      RCLCPP_ERROR(get_logger(), "detect_tick: unknown exception");
+    }
+  }
+
+  void detect_tick_inner() {
     sensor_msgs::msg::Image::ConstSharedPtr image;
     sensor_msgs::msg::Image::ConstSharedPtr depth;
     sensor_msgs::msg::CameraInfo::ConstSharedPtr info;
@@ -451,17 +456,22 @@ class MashaHunterNode : public rclcpp::Node {
     cat_hit_ = std::move(hit);
   }
 
-  void fill_cat_base_pose(TargetHit &hit) {
+  void fill_cat_base_pose(TargetHit &hit, sensor_msgs::msg::CameraInfo::ConstSharedPtr info) {
     if (!hit.pose.has_pixel || hit.range_m <= 0.05) {
       return;
     }
     try {
-      auto tf = tf_buffer_.lookupTransform(base_frame_, camera_frame_, tf2::TimePointZero,
-                                           tf2::durationFromSec(0.05));
+      if (!tf_buffer_._frameExists(base_frame_) || !tf_buffer_._frameExists(camera_frame_)) {
+        return;
+      }
+      if (!tf_buffer_.canTransform(base_frame_, camera_frame_, tf2::TimePointZero)) {
+        return;
+      }
+      auto tf = tf_buffer_.lookupTransform(base_frame_, camera_frame_, tf2::TimePointZero);
       CameraIntrinsics K = fallback_intrinsics();
-      if (latest_info_ && latest_info_->k.size() >= 9) {
-        K = from_k_matrix(static_cast<int>(latest_info_->width),
-                          static_cast<int>(latest_info_->height), latest_info_->k.data());
+      if (info && info->k.size() >= 9) {
+        K = from_k_matrix(static_cast<int>(info->width), static_cast<int>(info->height),
+                          info->k.data());
       }
       const Eigen::Vector3d ray = pixel_to_ray(hit.pose.u, hit.pose.v, K);
       geometry_msgs::msg::PointStamped cam;
@@ -478,15 +488,46 @@ class MashaHunterNode : public rclcpp::Node {
     }
   }
 
+  std::string saveli_tf_frame() const {
+    // canTransform() prints to stderr if the frame was never published.
+    // Check existence first. Fallback names: yaml tag_frames not applied
+    // → AprilTagNode uses family:id (tag36h11:0).
+    if (tf_buffer_._frameExists(saveli_tag_frame_)) {
+      return saveli_tag_frame_;
+    }
+    const std::string family_id = "tag36h11:" + std::to_string(saveli_tag_id_);
+    if (tf_buffer_._frameExists(family_id)) {
+      return family_id;
+    }
+    const std::string short_id = "36h11:" + std::to_string(saveli_tag_id_);
+    if (tf_buffer_._frameExists(short_id)) {
+      return short_id;
+    }
+    return {};
+  }
+
   std::optional<TargetHit> saveli_from_tf() {
     if (!saveli_ || !saveli_->enabled()) {
+      return std::nullopt;
+    }
+    if (!tf_buffer_._frameExists(base_frame_)) {
+      return std::nullopt;
+    }
+    const std::string tag_frame = saveli_tf_frame();
+    if (tag_frame.empty()) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "no Saveli TF yet (want %s or tag36h11:%d). Tag not in view, or "
+                           "not 36h11 id %d.",
+                           saveli_tag_frame_.c_str(), saveli_tag_id_, saveli_tag_id_);
       return std::nullopt;
     }
     DetectInput in;
     in.tag_id = saveli_tag_id_;
     try {
-      auto tf = tf_buffer_.lookupTransform(base_frame_, saveli_tag_frame_, tf2::TimePointZero,
-                                           tf2::durationFromSec(0.05));
+      if (!tf_buffer_.canTransform(base_frame_, tag_frame, tf2::TimePointZero)) {
+        return std::nullopt;
+      }
+      auto tf = tf_buffer_.lookupTransform(base_frame_, tag_frame, tf2::TimePointZero);
       const double age = (now() - rclcpp::Time(tf.header.stamp)).seconds();
       if (age > hunter_.config().lost_timeout) {
         return std::nullopt;
@@ -497,9 +538,9 @@ class MashaHunterNode : public rclcpp::Node {
       in.saveli_pose.yaw = yaw_from_quat(tf.transform.rotation);
       in.saveli_pose.has_pixel = false;
     } catch (const tf2::TransformException &) {
-      // Pose is the TF child saveli_tag, not the detection message.
-      // Humble's apriltag_msgs has no pose field; third_party's does.
-      // We always take TF so either message set still works.
+      // No tag TF yet (or base_link chain not up). Hunt keeps panning.
+    } catch (const std::exception &) {
+      return std::nullopt;
     }
     if (!in.have_saveli_pose) {
       return std::nullopt;
@@ -508,7 +549,19 @@ class MashaHunterNode : public rclcpp::Node {
   }
 
   void control_tick() {
+    try {
+      control_tick_inner();
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(get_logger(), "control_tick: %s", e.what());
+    } catch (...) {
+      RCLCPP_ERROR(get_logger(), "control_tick: unknown exception");
+    }
+  }
+
+  void control_tick_inner() {
     sensor_msgs::msg::LaserScan::ConstSharedPtr scan;
+    sensor_msgs::msg::Image::ConstSharedPtr image;
+    sensor_msgs::msg::CameraInfo::ConstSharedPtr info;
     std::optional<TargetHit> cat_hit;
     HunterPhase prev;
     {
@@ -517,6 +570,8 @@ class MashaHunterNode : public rclcpp::Node {
         return;
       }
       scan = latest_scan_;
+      image = latest_image_;
+      info = latest_info_;
       cat_hit = cat_hit_;
       prev = hunter_.phase();
     }
@@ -541,7 +596,7 @@ class MashaHunterNode : public rclcpp::Node {
     }
 
     if (cat_hit && !cat_hit->pose_in_base) {
-      fill_cat_base_pose(*cat_hit);
+      fill_cat_base_pose(*cat_hit, info);
     }
     std::vector<std::optional<TargetHit>> hits;
     hits.push_back(saveli_from_tf());
@@ -583,15 +638,20 @@ class MashaHunterNode : public rclcpp::Node {
     }
 
     apply_legs(out);
-    apply_head(out, hit);
-    publish_overlay(out, hit, d_min);
+    apply_head(out, hit, info);
+    publish_overlay(out, hit, d_min, image);
   }
 
   void apply_legs(const HunterOutput &out) {
     if (out.legs == LegCommandKind::Halt) {
-      halt_legs();
+      // Idle/Hunt halt every 50 ms would spam gait=0/-2. Once is a stand.
+      if (last_applied_legs_ != LegCommandKind::Halt) {
+        halt_legs();
+      }
+      last_applied_legs_ = LegCommandKind::Halt;
       return;
     }
+    last_applied_legs_ = out.legs;
     if (out.legs == LegCommandKind::SelectGait15) {
       select_gait15();
       return;
@@ -614,7 +674,8 @@ class MashaHunterNode : public rclcpp::Node {
     }
   }
 
-  void apply_head(const HunterOutput &out, const std::optional<TargetHit> &hit) {
+  void apply_head(const HunterOutput &out, const std::optional<TargetHit> &hit,
+                  sensor_msgs::msg::CameraInfo::ConstSharedPtr info) {
     ArmPulses arm = rest_;
     arm.duration_s = 0.08;
     if (out.pan_head) {
@@ -635,10 +696,10 @@ class MashaHunterNode : public rclcpp::Node {
       if (elapsed >= period) {
         pan_sweep_done_ = true;
       }
-    } else if (out.phase == HunterPhase::Follow && hit && hit->pose.has_pixel && latest_info_) {
-      CameraIntrinsics K = from_k_matrix(static_cast<int>(latest_info_->width),
-                                         static_cast<int>(latest_info_->height),
-                                         latest_info_->k.data());
+    } else if (out.phase == HunterPhase::Follow && hit && hit->pose.has_pixel && info &&
+               info->k.size() >= 9) {
+      CameraIntrinsics K = from_k_matrix(static_cast<int>(info->width),
+                                         static_cast<int>(info->height), info->k.data());
       const Eigen::Vector3d ray = pixel_to_ray(hit->pose.u, hit->pose.v, K);
       const GazeAngles err = ray_to_yaw_pitch(ray);
       const GazePulses next =
@@ -664,15 +725,17 @@ class MashaHunterNode : public rclcpp::Node {
     servo_pub_->publish(make_arm_command(arm));
   }
 
-  void publish_overlay(const HunterOutput &out, const std::optional<TargetHit> &hit,
-                       double d_min) {
-    if (!latest_image_) {
+  void publish_overlay(const HunterOutput &out, const std::optional<TargetHit> &hit, double d_min,
+                       sensor_msgs::msg::Image::ConstSharedPtr image) {
+    if (!image || image->data.empty() || image->width == 0 || image->height == 0) {
       return;
     }
     cv_bridge::CvImagePtr cv;
     try {
-      cv = cv_bridge::toCvCopy(latest_image_, "bgr8");
+      cv = cv_bridge::toCvCopy(image, "bgr8");
     } catch (const cv_bridge::Exception &) {
+      return;
+    } catch (const std::exception &) {
       return;
     }
     char buf[256];
@@ -705,6 +768,7 @@ class MashaHunterNode : public rclcpp::Node {
 
   void halt_legs() {
     walking_active_ = false;
+    last_applied_legs_ = LegCommandKind::Halt;
     if (dry_run_) {
       return;
     }
@@ -813,6 +877,7 @@ class MashaHunterNode : public rclcpp::Node {
   bool pan_sweep_done_{false};
   bool stopping_{false};
   bool walking_active_{false};
+  LegCommandKind last_applied_legs_{LegCommandKind::None};
   float gaze_id19_{500.0f};
   float gaze_id22_{150.0f};
   ArmPulses rest_;
@@ -831,11 +896,11 @@ class MashaHunterNode : public rclcpp::Node {
   sensor_msgs::msg::Image::ConstSharedPtr latest_depth_;
   sensor_msgs::msg::CameraInfo::ConstSharedPtr latest_info_;
   sensor_msgs::msg::LaserScan::ConstSharedPtr latest_scan_;
-  apriltag_msgs::msg::AprilTagDetectionArray::ConstSharedPtr latest_tags_;
   rclcpp::CallbackGroup::SharedPtr image_cb_group_;
   rclcpp::CallbackGroup::SharedPtr detect_cb_group_;
   rclcpp::CallbackGroup::SharedPtr control_cb_group_;
   rclcpp::CallbackGroup::SharedPtr watchdog_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr service_cb_group_;
   rclcpp::Publisher<servo_controller_msgs::msg::ServosPosition>::SharedPtr servo_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<kinematics_msgs::msg::Traveling>::SharedPtr traveling_pub_;
@@ -844,7 +909,6 @@ class MashaHunterNode : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr info_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
-  rclcpp::Subscription<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr tag_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;
   rclcpp::TimerBase::SharedPtr detect_timer_;
@@ -856,18 +920,24 @@ class MashaHunterNode : public rclcpp::Node {
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<proud_up::MashaHunterNode>();
-  std::weak_ptr<proud_up::MashaHunterNode> weak = node;
-  rclcpp::on_shutdown([weak]() {
-    if (auto n = weak.lock()) {
-      n->emergency_stop();
-    }
-  });
-  rclcpp::executors::MultiThreadedExecutor exec;
-  exec.add_node(node);
-  exec.spin();
-  node->emergency_stop();
-  node.reset();
+  try {
+    auto node = std::make_shared<proud_up::MashaHunterNode>();
+    std::weak_ptr<proud_up::MashaHunterNode> weak = node;
+    rclcpp::on_shutdown([weak]() {
+      if (auto n = weak.lock()) {
+        n->emergency_stop();
+      }
+    });
+    rclcpp::executors::MultiThreadedExecutor exec;
+    exec.add_node(node);
+    exec.spin();
+    node->emergency_stop();
+    node.reset();
+  } catch (const std::exception &e) {
+    fprintf(stderr, "masha_hunter_node failed: %s\n", e.what());
+    rclcpp::shutdown();
+    return 1;
+  }
   rclcpp::shutdown();
   return 0;
 }

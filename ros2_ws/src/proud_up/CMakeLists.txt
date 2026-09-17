@@ -26,14 +26,6 @@ find_package(CURL REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
-# Prefer the Jetson overlay (pose + size) over Humble's corner-only message
-# so we match the apriltag_ros that actually runs on this board.
-if(NOT apriltag_msgs_DIR AND EXISTS
-    "/home/ubuntu/third_party/third_party_ws/install/apriltag_msgs/share/apriltag_msgs/cmake")
-  set(apriltag_msgs_DIR
-      "/home/ubuntu/third_party/third_party_ws/install/apriltag_msgs/share/apriltag_msgs/cmake")
-endif()
-find_package(apriltag_msgs REQUIRED)
 
 add_library(proud_up_core STATIC
   src/camera_frame.cpp
@@ -163,7 +155,6 @@ ament_target_dependencies(masha_hunter_node
   tf2
   tf2_ros
   tf2_geometry_msgs
-  apriltag_msgs
 )
 target_link_libraries(masha_hunter_node
   hunter

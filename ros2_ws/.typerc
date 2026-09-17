@@ -29,7 +29,8 @@ export need_compile=False
 #export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export ROS_DOMAIN_ID=27 # Numbers from 0 to 232
 export CYCLONEDDS_URI=file:///etc/cyclonedds/config.xml
-export BRINGUP_JOYSTICK=true
+# Off: Saveli's 2.4 GHz pad is the same link. joystick_control would drive Masha.
+export BRINGUP_JOYSTICK=false
 # slim = motion+sensors (default). full = vendor phone/demo tree.
 export BRINGUP_PROFILE=slim
 # Boot the sherpa voice stack (Hello Masha → commands). See ros2_ws/info/voice.md.

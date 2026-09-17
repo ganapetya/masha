@@ -19,6 +19,7 @@ def _launch_setup(context, *args, **kwargs):
     dry_run = _as_bool(LaunchConfiguration('dry_run').perform(context))
     enabled_targets = LaunchConfiguration('enabled_targets').perform(context)
 
+    target_list = [t.strip() for t in enabled_targets.split(',') if t.strip()]
     hunter = Node(
         package='proud_up',
         executable='masha_hunter_node',
@@ -29,6 +30,7 @@ def _launch_setup(context, *args, **kwargs):
             {
                 'enable_walk': enable_walk,
                 'dry_run': dry_run,
+                'enabled_targets': target_list,
             },
         ],
     )
@@ -49,12 +51,29 @@ def _launch_setup(context, *args, **kwargs):
                         name='apriltag',
                         package='apriltag_ros',
                         plugin='AprilTagNode',
-                        parameters=[apriltag_params],
+                        parameters=[
+                            apriltag_params,
+                            {
+                                'family': '36h11',
+                                'size': 0.06,
+                                'threads': 2,
+                                'max_hamming': 1,
+                                'z_up': False,
+                                'image_transport': 'raw',
+                                'tag_ids': [0],
+                                'tag_frames': ['saveli_tag'],
+                                'tag_sizes': [0.06],
+                            },
+                        ],
                         remappings=[
                             ('image', '/depth_cam/rgb/image_raw'),
                             ('/image', '/depth_cam/rgb/image_raw'),
                             ('camera_info', '/depth_cam/rgb/camera_info'),
                             ('/camera_info', '/depth_cam/rgb/camera_info'),
+                            # Plugin Node("apriltag") publishes /apriltag_detections.
+                            # Pin the name so it does not depend on container namespace.
+                            ('apriltag_detections', '/apriltag/apriltag_detections'),
+                            ('/apriltag_detections', '/apriltag/apriltag_detections'),
                         ],
                     ),
                 ],
