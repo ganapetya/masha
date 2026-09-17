@@ -6,7 +6,8 @@
 **Name:** the other robot is **Saveli** in the trio docs; the clipboard used **Savelij**. Same machine. This file uses **Saveli**.  
 **Revision (2026-09-16, later same day):** custom gait is **in scope**. Map pick: **variant 3 — omnidirectional tripod.**  
 **Revision (2026-09-16, hunter):** Saveli is the **first plug**, not the product. End goal is a spider **hunter**: deep stand, slow head scan, recognize, **call the target by name**, follow ≤ **60 s** or until lost, then scan again. Node: **`masha_hunter_node`**. Next plug: **cat**. Filename kept for the GitHub URL.  
-**Revision (2026-09-16, wander):** No SLAM / Nav2. Optional HUNT rule: go into open space, halt at an obstacle, rotate, look again. Default **off**.
+**Revision (2026-09-16, wander):** No SLAM / Nav2. Optional HUNT rule: go into open space, halt at an obstacle, rotate, look again. Default **off**.  
+**Revision (2026-09-17, start):** Hunter is live in `proud_up`. Operator recipe is [Start Instructions](#start-instructions). Launch **must** pass `enable_walk:=true` (yaml/launch default is **false**). Crab-follow run: `enable_crab:=true` `vx_max:=0.12` `vy_max:=0.08`.
 
 Related reading (do not re-derive):
 
@@ -14,6 +15,100 @@ Related reading (do not re-derive):
 - `~/ros2_ws/info/TRAJECTORY.MD` — what “string of beads” actually means here (linear clock, not a keyframe table).
 - `~/steps/quarter-01-sprint-02-masha-plan.md` — camera topics, QoS, arm pan/tilt (ids 19 / 22), `/controller/cmd_vel`.
 - `~/steps/quarter-01-sprint-03-plan.md` — `gait=5` `FollowGaitGenerator`, swing-only quintic, `aplay` worker. **Same gait engine.** Hunter is a *client* of that generator, not a second generator.
+
+---
+
+## Start Instructions
+
+Checked on Masha (2026-09-17). These files exist:
+
+| File | Role |
+|---|---|
+| `/opt/ros/humble/setup.bash` | ROS 2 Humble (`setup.zsh` also exists) |
+| `~/ros2_ws/install/setup.bash` | overlay with `proud_up` (`setup.zsh` also exists) |
+| `~/ros2_ws/.typerc` | `ROS_DOMAIN_ID=27` |
+| `~/ros2_ws/src/proud_up/launch/masha_hunter.launch.py` | launch args below |
+| `~/ros2_ws/src/proud_up/config/masha_hunter.yaml` | node params (overridden by launch args) |
+
+A normal Masha zsh already sources `.typerc` + Humble + the overlay via `.robotrc`. Re-source anyway so a bare terminal still sees domain **27** and `masha_hunter_node`. Do **not** run `~/.stop_ros.sh`. Slim bringup is assumed already up. Do **not** start `follow_the_cat` or `masha_interaction` with the hunter. Unplug Masha’s joystick (shared 2.4 GHz pad with Saveli). Place Savelij ~**0.8–1.0 m** in front, rear **36h11 id 0** facing the camera.
+
+Launch args do **not** hot-reload. Ctrl-C the old hunter, then relaunch.
+
+### Terminal 1 — launch
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+source ~/ros2_ws/.typerc
+ros2 launch proud_up masha_hunter.launch.py \
+  enabled_targets:=saveli \
+  enable_walk:=true \
+  enable_crab:=true \
+  vx_max:=0.12 \
+  vy_max:=0.08 \
+  dry_run:=false
+```
+
+First log line must show `enable_walk=true enable_crab=true`. `enable_wander` stays **false** unless you pass it in yaml. First lock is safer with `enable_walk:=false` (Twist is logged only; legs stay in hunter pose). After a clean lock, relaunch with walk on.
+
+### Launch arguments (all of them)
+
+| Argument | This run | Launch default | What it does |
+|---|---|---|---|
+| `enabled_targets` | `saveli` | `saveli` | Which plugs run. `apriltag_ros` starts only if `saveli` is listed. |
+| `enable_walk` | **`true`** | **`false`** | If false: HUNT/NAME only, log Twist, do not publish `/controller/cmd_vel`. |
+| `enable_crab` | **`true`** | `true` | Side offset uses `vy` when `\|bearing\| < 15°` and `\|y\| > 6 cm`. |
+| `vx_max` | `0.12` | `0.12` | Forward cap m/s (voice “go forward” is 0.12). |
+| `vy_max` | `0.08` | `0.08` | Crab cap m/s (`move_controller` also clamps 0.10). |
+| `dry_run` | `false` | `false` | Log servo / Traveling / Twist and skip publishes. |
+| `params_file` | (omit) | `proud_up/config/masha_hunter.yaml` | Node YAML. |
+| `apriltag_params` | (omit) | `proud_up/config/apriltag_36h11_savelij.yaml` | Tag size in metres (not the 0.08 stock default). |
+
+### Terminal 2 — start / watch / stop
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+source ~/ros2_ws/.typerc
+ros2 service call /masha_hunter_node/start std_srvs/srv/Trigger
+```
+
+Watch crab (same terminal after start, or a third one):
+
+```bash
+ros2 topic echo /controller/cmd_vel
+```
+
+- **Sideways = crab gated on:** `linear.y` nonzero (and hunter log `crab=true`).
+- **Pure turn-in-place again:** crab **not** gated. Saveli is too far around (`\|bearing\| ≥ 15°`); policy yaws first (`angular.z`, `linear.y = 0`).
+- If start hangs on “waiting for service”, launch + AprilTag can still be up while `masha_hunter_node` has died. Confirm the node is in `ros2 node list`. Watch `/apriltag/apriltag_detections` and `/masha_hunter_node/image_result`. Non-empty detections = tag seen.
+
+Stop:
+
+```bash
+ros2 service call /masha_hunter_node/stop std_srvs/srv/Trigger
+```
+
+Stop centres the head, halt-stands (`gait=-2`), returns IDLE. Halt is Traveling `gait=-2`, **not** a zero Twist (zero Twist marches in place).
+
+### Crab gate and yaml (not launch args)
+
+C++ defaults (not overlaid by the launch line above):
+
+| Name | Value | Role |
+|---|---|---|
+| `θ_crab` | 15° | already roughly facing him |
+| `y_on` / `y_off` | 0.06 / 0.03 m | start / stop crab (hysteresis) |
+| `wz_max` | 0.30 rad/s | yaw cap; while crabbing, `ωz` is scaled ×0.3 |
+| `r_target` | 0.80 m | follow standoff |
+| `d_stop` / `d_go` | 0.55 / 0.70 m | LiDAR latch in `base_link` |
+| `lost_timeout` | 1.5 s | FOLLOW → HUNT after no fresh TF |
+| `pose_max_age` | 0.40 s | older TF is not a live hit (coast) |
+| `walk_watchdog` | 0.30 s | no `cmd_vel` → halt |
+| `follow_max_s` | 60 | then back to HUNT |
+| `enable_wander` | false | HUNT stay/pan, do not walk into open space |
+| `follow_gait` / select | 5 / 15 | our generator, not vendor tripod |
+| `cmd_period` / `cmd_height` | 0.70 s / 25 mm | Traveling `gait: 15` |
 
 ---
 
