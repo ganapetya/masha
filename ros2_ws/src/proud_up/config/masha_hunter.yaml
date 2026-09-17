@@ -77,7 +77,8 @@ masha_hunter_node:
     person_conf: 0.45
     dnn_cuda: true
 
-    # Spoken names. Placeholders are chimes until Peter records
-    # "Saveli" / "cat" over these paths.
-    # saveli_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/saveli.wav
-    # cat_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/cat.wav
+    # NAME clips. Paths are mp3; hunter plays them with ffplay (aplay is wav-only).
+    saveli_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/call-savelij.mp3
+    cat_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/call-kitten.mp3
+    name_timeout_s: 5.0
+    name_play_timeout_s: 8.0

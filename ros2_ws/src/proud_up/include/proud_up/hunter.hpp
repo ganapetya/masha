@@ -60,7 +60,7 @@ struct HunterConfig {
   double lost_timeout{1.5};  // Follow→Hunt; brief TF drops coast until then
   double follow_max_s{60.0};
   double search_timeout_s{20.0};
-  double name_timeout_s{2.5};
+  double name_timeout_s{5.0};
   double vx_max{0.05};
   double vy_max{0.04};
   double wz_max{0.30};

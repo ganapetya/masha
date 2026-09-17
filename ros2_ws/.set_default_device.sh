@@ -77,8 +77,8 @@ USB_SINK=$(
 if [ -n "$USB_SINK" ]; then
     echo "set output: $USB_SINK"
     pactl set-default-sink "$USB_SINK"
-    pactl set-sink-volume "$USB_SINK" 80%
-    echo "set volume: 80%"
+    pactl set-sink-volume "$USB_SINK" 100%
+    echo "set volume: 100%"
 else
     echo "cannot find output device"
 fi

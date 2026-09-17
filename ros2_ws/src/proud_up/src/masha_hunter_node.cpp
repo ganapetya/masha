@@ -3,7 +3,7 @@
 // Policy lives in hunter.hpp (no ROS). This file is the wiring:
 // sensors, TF, arm pan, Traveling halt, aplay worker, overlay.
 //
-//   IDLE --~/start--> HUNT --hit--> NAME --wav--> FOLLOW (≤60 s)
+//   IDLE --~/start--> HUNT --hit--> NAME --mp3--> FOLLOW (≤60 s)
 //                         ^                         |
 //                         +-- lost / timeout / LiDAR +
 //
@@ -104,9 +104,47 @@ void kill_group(pid_t pid) {
   }
 }
 
+void wait_spawned(pid_t pid, double timeout_s) {
+  if (pid <= 0) {
+    return;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  while (true) {
+    int status = 0;
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+      return;
+    }
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (timeout_s > 0.0 && elapsed >= timeout_s) {
+      kill_group(pid);
+      waitpid(pid, &status, 0);
+      return;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+}
+
+// USB speaker boot script used to leave Pulse at 80%. NAME clips must be
+// heard across the room: unmute, 100% sink, then ffplay -volume 100.
+void set_output_max() {
+  wait_spawned(spawn_argv({"/usr/bin/pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"}), 1.0);
+  wait_spawned(
+      spawn_argv({"/usr/bin/pactl", "set-sink-volume", "@DEFAULT_SINK@", "100%"}), 1.0);
+}
+
 bool file_exists(const std::string &path) {
   struct stat st {};
   return !path.empty() && stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+bool looks_like_mp3(const std::string &path) {
+  if (path.size() < 4) {
+    return false;
+  }
+  const char *e = path.c_str() + path.size() - 4;
+  return e[0] == '.' && (e[1] == 'm' || e[1] == 'M') && (e[2] == 'p' || e[2] == 'P') &&
+         e[3] == '3';
 }
 
 class WavPlayer {
@@ -145,7 +183,22 @@ class WavPlayer {
 
  private:
   void worker() {
-    const pid_t pid = spawn_argv({"/usr/bin/aplay", "-q", "-D", "pulse", wav_});
+    // aplay is wav-only. NAME clips are Peter's mp3s (call-savelij /
+    // call-kitten); play those with ffplay. Wav still goes to pulse aplay.
+    // -volume 100 is ffplay's max (0–100). Pulse sink is also forced to 100%.
+    set_output_max();
+    pid_t pid = -1;
+    if (looks_like_mp3(wav_)) {
+      pid = spawn_argv({"/usr/bin/ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                        "-volume", "100", wav_});
+    }
+    if (pid <= 0) {
+      pid = spawn_argv({"/usr/bin/aplay", "-q", "-D", "pulse", wav_});
+    }
+    if (pid <= 0) {
+      pid = spawn_argv({"/usr/bin/ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                        "-volume", "100", wav_});
+    }
     if (pid <= 0) {
       running_.store(false);
       finished_.store(true);
@@ -226,6 +279,7 @@ class MashaHunterNode : public rclcpp::Node {
     pose_max_age_s_ = declare_parameter<double>("pose_max_age", 0.40);
     cfg.follow_max_s = declare_parameter<double>("follow_max_s", 60.0);
     cfg.search_timeout_s = declare_parameter<double>("search_timeout_s", 20.0);
+    cfg.name_timeout_s = declare_parameter<double>("name_timeout_s", 5.0);
     cfg.vx_max = declare_parameter<double>("vx_max", 0.12);
     cfg.vy_max = declare_parameter<double>("vy_max", 0.08);
     cfg.wz_max = declare_parameter<double>("wz_max", 0.30);
@@ -268,16 +322,14 @@ class MashaHunterNode : public rclcpp::Node {
     gaze_id22_ = rest_.id22;
 
     if (voice_dir_.empty()) {
-      try {
-        const auto xf = ament_index_cpp::get_package_share_directory("xf_mic_asr_offline");
-        voice_dir_ = xf + "/feedback_voice/english";
-      } catch (const std::exception &) {
-        voice_dir_ = "/home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english";
-      }
+      // src, not install/share: Peter copies call-*.mp3 into the package tree.
+      voice_dir_ = "/home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english";
     }
 
-    saveli_wav_ = declare_parameter<std::string>("saveli_wav", voice_dir_ + "/saveli.wav");
-    cat_wav_ = declare_parameter<std::string>("cat_wav", voice_dir_ + "/cat.wav");
+    saveli_wav_ =
+        declare_parameter<std::string>("saveli_wav", voice_dir_ + "/call-savelij.mp3");
+    cat_wav_ = declare_parameter<std::string>("cat_wav", voice_dir_ + "/call-kitten.mp3");
+    name_play_timeout_s_ = declare_parameter<double>("name_play_timeout_s", 8.0);
 
     saveli_ = std::make_unique<SaveliSource>(saveli_tag_id_, saveli_wav_);
     saveli_->set_enabled(target_enabled("saveli"));
@@ -361,6 +413,9 @@ class MashaHunterNode : public rclcpp::Node {
                 hunter_.config().enable_crab ? "true" : "false",
                 hunter_.config().enable_wander ? "true" : "false", enabled_targets_.size(),
                 follow_gait_select_, saveli_tag_frame_.c_str(), apriltag_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "NAME saveli=%s (%s) cat=%s (%s)", saveli_wav_.c_str(),
+                file_exists(saveli_wav_) ? "ok" : "MISSING", cat_wav_.c_str(),
+                file_exists(cat_wav_) ? "ok" : "MISSING");
   }
 
   ~MashaHunterNode() override { emergency_stop(); }
@@ -656,7 +711,8 @@ class MashaHunterNode : public rclcpp::Node {
 
     if (play) {
       std::string wav = hit ? hit->spoken_wav : saveli_wav_;
-      player_.play_once(wav, 3.0);
+      RCLCPP_INFO(get_logger(), "NAME play %s", wav.c_str());
+      player_.play_once(wav, name_play_timeout_s_);
     }
 
     apply_legs(out);
@@ -887,6 +943,7 @@ class MashaHunterNode : public rclcpp::Node {
   std::string voice_dir_;
   std::string saveli_wav_;
   std::string cat_wav_;
+  double name_play_timeout_s_{8.0};
   std::vector<std::string> enabled_targets_;
   int saveli_tag_id_{0};
   int follow_gait_select_{15};
