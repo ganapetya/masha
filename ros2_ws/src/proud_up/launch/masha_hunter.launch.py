@@ -16,8 +16,11 @@ def _launch_setup(context, *args, **kwargs):
     params_file = LaunchConfiguration('params_file').perform(context)
     apriltag_params = LaunchConfiguration('apriltag_params').perform(context)
     enable_walk = _as_bool(LaunchConfiguration('enable_walk').perform(context))
+    enable_crab = _as_bool(LaunchConfiguration('enable_crab').perform(context))
     dry_run = _as_bool(LaunchConfiguration('dry_run').perform(context))
     enabled_targets = LaunchConfiguration('enabled_targets').perform(context)
+    vx_max = float(LaunchConfiguration('vx_max').perform(context))
+    vy_max = float(LaunchConfiguration('vy_max').perform(context))
 
     target_list = [t.strip() for t in enabled_targets.split(',') if t.strip()]
     hunter = Node(
@@ -29,8 +32,11 @@ def _launch_setup(context, *args, **kwargs):
             params_file,
             {
                 'enable_walk': enable_walk,
+                'enable_crab': enable_crab,
                 'dry_run': dry_run,
                 'enabled_targets': target_list,
+                'vx_max': vx_max,
+                'vy_max': vy_max,
             },
         ],
     )
@@ -107,6 +113,21 @@ def generate_launch_description():
             'enable_walk',
             default_value='false',
             description='If false, HUNT/NAME only: log Twist, do not publish cmd_vel',
+        ),
+        DeclareLaunchArgument(
+            'enable_crab',
+            default_value='true',
+            description='If true, side offset uses vy (crab) when |bearing|<15 deg',
+        ),
+        DeclareLaunchArgument(
+            'vx_max',
+            default_value='0.12',
+            description='Forward cap m/s (voice go-forward is 0.12)',
+        ),
+        DeclareLaunchArgument(
+            'vy_max',
+            default_value='0.08',
+            description='Crab cap m/s',
         ),
         DeclareLaunchArgument(
             'dry_run',

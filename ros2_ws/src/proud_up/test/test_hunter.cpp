@@ -254,3 +254,50 @@ TEST(Hunter, PickPrefersStickyId) {
   ASSERT_TRUE(p.has_value());
   EXPECT_EQ(p->id, "cat");
 }
+
+TEST(Hunter, FollowMissCoastsTwistUntilLostTimeout) {
+  auto cfg = walk_cfg();
+  cfg.enable_crab = true;
+  cfg.lost_timeout = 1.5;
+  Hunter h(cfg);
+  h.start();
+  h.tick(0.0, saveli_at(0.80, 0.12), 2.0, true);
+  h.notify_name_done();
+  auto o = h.tick(0.3, saveli_at(0.80, 0.12), 2.0, true);
+  if (o.legs == LegCommandKind::SelectGait15) {
+    o = h.tick(0.35, saveli_at(0.80, 0.12), 2.0, true);
+  }
+  ASSERT_EQ(o.phase, HunterPhase::Follow);
+  ASSERT_EQ(o.legs, LegCommandKind::Twist);
+  const double vy = o.twist.vy;
+  EXPECT_NE(vy, 0.0);
+
+  // 0.2 s miss: stay in Follow and keep the last crab Twist so the
+  // walk watchdog does not stand the legs.
+  o = h.tick(0.55, std::nullopt, 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_EQ(o.legs, LegCommandKind::Twist);
+  EXPECT_NEAR(o.twist.vy, vy, 1e-12);
+  EXPECT_FALSE(o.pan_head);
+
+  o = h.tick(1.90, std::nullopt, 2.0, true);  // 1.55 s since last hit
+  EXPECT_EQ(o.phase, HunterPhase::Hunt);
+  EXPECT_EQ(o.legs, LegCommandKind::Halt);
+  EXPECT_TRUE(o.pan_head);
+}
+
+TEST(Hunter, NotifyHaltedReselectsGait) {
+  Hunter h(walk_cfg());
+  h.start();
+  h.tick(0.0, saveli_at(1.20, 0.0), 2.0, true);
+  h.notify_name_done();
+  auto o = h.tick(0.3, saveli_at(1.20, 0.0), 2.0, true);
+  if (o.legs == LegCommandKind::SelectGait15) {
+    o = h.tick(0.35, saveli_at(1.20, 0.0), 2.0, true);
+  }
+  ASSERT_EQ(o.legs, LegCommandKind::Twist);
+  h.notify_halted();
+  o = h.tick(0.40, saveli_at(1.20, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_EQ(o.legs, LegCommandKind::SelectGait15);
+}

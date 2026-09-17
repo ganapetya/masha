@@ -132,11 +132,16 @@ void Hunter::stop() {
   gait15_sent_ = false;
   lidar_latched_ = false;
   wander_kind_ = 0;
+  last_twist_ = {};
   enter(HunterPhase::Idle, now_);
 }
 
 void Hunter::notify_name_done() {
   name_playing_ = false;
+}
+
+void Hunter::notify_halted() {
+  gait15_sent_ = false;
 }
 
 void Hunter::enter(HunterPhase p, double now_s) {
@@ -146,6 +151,7 @@ void Hunter::enter(HunterPhase p, double now_s) {
     gait15_sent_ = false;
     have_prev_e_ = false;
     crab_ = false;
+    last_twist_ = {};
   }
   if (p == HunterPhase::Follow) {
     follow_t0_ = now_s;
@@ -380,11 +386,31 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     o.phase = HunterPhase::Follow;
     o.pan_head = false;
     if (!hit) {
-      o.legs = LegCommandKind::None;
+      // Brief miss (duplicate prune, motion blur). Hold last Twist so
+      // the 0.30 s walk watchdog does not stand the legs, and so Hunt
+      // pan does not start. Lost after lost_timeout still goes Hunt.
+      o.twist = last_twist_;
+      o.crab = crab_;
+      if (!cfg_.enable_walk) {
+        o.legs = LegCommandKind::None;
+        return o;
+      }
+      if (twist_is_zero(last_twist_)) {
+        o.legs = LegCommandKind::Halt;
+        gait15_sent_ = false;
+        return o;
+      }
+      if (!gait15_sent_) {
+        o.legs = LegCommandKind::SelectGait15;
+        gait15_sent_ = true;
+        return o;
+      }
+      o.legs = LegCommandKind::Twist;
       return o;
     }
 
     const TwistBody t = follow_twist(hit->pose, dt);
+    last_twist_ = t;
     o.twist = t;
     o.crab = crab_;
     if (!cfg_.enable_walk) {

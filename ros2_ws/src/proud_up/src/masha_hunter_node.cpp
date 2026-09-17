@@ -217,19 +217,20 @@ class MashaHunterNode : public rclcpp::Node {
 
     HunterConfig cfg;
     cfg.enable_walk = declare_parameter<bool>("enable_walk", false);
-    cfg.enable_crab = declare_parameter<bool>("enable_crab", false);
+    cfg.enable_crab = declare_parameter<bool>("enable_crab", true);
     cfg.enable_wander = declare_parameter<bool>("enable_wander", false);
     cfg.r_target = declare_parameter<double>("r_target", 0.80);
     cfg.d_stop = declare_parameter<double>("d_stop", 0.55);
     cfg.d_go = declare_parameter<double>("d_go", 0.70);
-    cfg.lost_timeout = declare_parameter<double>("lost_timeout", 0.5);
+    cfg.lost_timeout = declare_parameter<double>("lost_timeout", 1.5);
+    pose_max_age_s_ = declare_parameter<double>("pose_max_age", 0.40);
     cfg.follow_max_s = declare_parameter<double>("follow_max_s", 60.0);
     cfg.search_timeout_s = declare_parameter<double>("search_timeout_s", 20.0);
-    cfg.vx_max = declare_parameter<double>("vx_max", 0.05);
-    cfg.vy_max = declare_parameter<double>("vy_max", 0.04);
+    cfg.vx_max = declare_parameter<double>("vx_max", 0.12);
+    cfg.vy_max = declare_parameter<double>("vy_max", 0.08);
     cfg.wz_max = declare_parameter<double>("wz_max", 0.30);
-    cfg.kp_x = declare_parameter<double>("kp_x", 0.35);
-    cfg.kd_x = declare_parameter<double>("kd_x", 0.05);
+    cfg.kp_x = declare_parameter<double>("kp_x", 0.60);
+    cfg.kd_x = declare_parameter<double>("kd_x", 0.08);
     cfg.kp_y = declare_parameter<double>("kp_y", 0.50);
     cfg.kd_y = declare_parameter<double>("kd_y", 0.05);
     cfg.kp_th = declare_parameter<double>("kp_th", 1.20);
@@ -529,7 +530,12 @@ class MashaHunterNode : public rclcpp::Node {
       }
       auto tf = tf_buffer_.lookupTransform(base_frame_, tag_frame, tf2::TimePointZero);
       const double age = (now() - rclcpp::Time(tf.header.stamp)).seconds();
-      if (age > hunter_.config().lost_timeout) {
+      const double max_age = pose_max_age_s_ > 0.05 ? pose_max_age_s_ : 0.40;
+      if (age > max_age) {
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "Saveli TF stale (%.2f s > %.2f). Duplicate id-0 or tag left the image.",
+            age, max_age);
         return std::nullopt;
       }
       in.have_saveli_pose = true;
@@ -620,8 +626,24 @@ class MashaHunterNode : public rclcpp::Node {
       out = hunter_.tick(t, hit, d_min, pan_done, left_open, right_open);
       play = out.play_name;
       if (out.phase == HunterPhase::Hunt && prev != HunterPhase::Hunt) {
-        hunt_pan_t0_ = t;
         pan_sweep_done_ = false;
+        const double period = pan_period_s_ > 1.0 ? pan_period_s_ : 10.0;
+        // From Follow, start the sweep at the current pan. Snapping to
+        // pan_min (200) looks ~70° away and loses a tag that is still nearby.
+        if (prev == HunterPhase::Follow || prev == HunterPhase::Stopped) {
+          const float span = pan_max_ - pan_min_;
+          float u = 0.5f;
+          if (span > 1.0f) {
+            u = (gaze_id19_ - pan_min_) / span;
+            u = std::max(0.0f, std::min(1.0f, u));
+          }
+          hunt_pan_t0_ = t - static_cast<double>(0.5f * u) * period;
+          RCLCPP_WARN(get_logger(),
+                      "FOLLOW→HUNT lost (no fresh tag). Search from pan %.0f, not snap to min.",
+                      gaze_id19_);
+        } else {
+          hunt_pan_t0_ = t;
+        }
       }
       last_out_ = out;
       if (out.legs == LegCommandKind::Twist) {
@@ -664,10 +686,12 @@ class MashaHunterNode : public rclcpp::Node {
       tw.linear.x = out.twist.vx;
       tw.linear.y = out.twist.vy;
       tw.angular.z = out.twist.wz;
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                           "%stwist vx=%.3f vy=%.3f wz=%.3f crab=%s r=%.2f th=%.1f",
+                           dry_run_ ? "dry_run " : "", tw.linear.x, tw.linear.y, tw.angular.z,
+                           out.crab ? "true" : "false", out.r,
+                           out.theta * 180.0 / kHunterPi);
       if (dry_run_) {
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-                             "dry_run twist vx=%.3f vy=%.3f wz=%.3f (not sent)", tw.linear.x,
-                             tw.linear.y, tw.angular.z);
         return;
       }
       cmd_vel_pub_->publish(tw);
@@ -739,9 +763,11 @@ class MashaHunterNode : public rclcpp::Node {
       return;
     }
     char buf[256];
-    std::snprintf(buf, sizeof(buf), "%s r=%.2f th=%.1f dmin=%.2f left=%.0f %s",
-                  hunter_phase_name(out.phase), out.r, out.theta * 180.0 / kHunterPi, d_min,
-                  out.follow_left_s, out.wander_action);
+    std::snprintf(buf, sizeof(buf),
+                  "%s r=%.2f th=%.1f crab=%d vx=%.2f vy=%.2f dmin=%.2f left=%.0f %s",
+                  hunter_phase_name(out.phase), out.r, out.theta * 180.0 / kHunterPi,
+                  out.crab ? 1 : 0, out.twist.vx, out.twist.vy, d_min, out.follow_left_s,
+                  out.wander_action);
     cv::putText(cv->image, buf, {12, 28}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 255, 0}, 2);
     if (hit && hit->pose.has_pixel) {
       cv::circle(cv->image, {static_cast<int>(hit->pose.u), static_cast<int>(hit->pose.v)}, 8,
@@ -798,6 +824,7 @@ class MashaHunterNode : public rclcpp::Node {
         return;
       }
       walking_active_ = false;
+      hunter_.notify_halted();
       should_halt = true;
     }
     if (should_halt) {
@@ -873,6 +900,7 @@ class MashaHunterNode : public rclcpp::Node {
   double max_step_pulses_{8.0};
   double deadband_rad_{0.06};
   double walk_watchdog_s_{0.3};
+  double pose_max_age_s_{0.40};
   double hunt_pan_t0_{0.0};
   bool pan_sweep_done_{false};
   bool stopping_{false};

@@ -57,7 +57,7 @@ struct HunterConfig {
   double r_target{0.80};
   double d_stop{0.55};
   double d_go{0.70};
-  double lost_timeout{0.5};
+  double lost_timeout{1.5};  // Follow→Hunt; brief TF drops coast until then
   double follow_max_s{60.0};
   double search_timeout_s{20.0};
   double name_timeout_s{2.5};
@@ -157,6 +157,9 @@ class Hunter {
   void start();
   void stop();
   void notify_name_done();
+  // Walk watchdog (or any external halt) stood the legs. Next Twist
+  // must SelectGait15 again.
+  void notify_halted();
   void set_config(const HunterConfig &cfg) { cfg_ = cfg; }
   const HunterConfig &config() const { return cfg_; }
 
@@ -195,6 +198,7 @@ class Hunter {
   std::string sticky_id_;
   std::string last_named_id_;
   std::string pending_wav_;
+  TwistBody last_twist_{};
 };
 
 }  // namespace proud_up

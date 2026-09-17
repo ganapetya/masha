@@ -14,25 +14,31 @@ masha_hunter_node:
     saveli_tag_frame: saveli_tag
     saveli_tag_id: 0
 
-    # First bring-up: HUNT + NAME only. Turn walk on after G2 and H1.
+    # Walk still requires enable_walk:=true on launch. Crab and speed are on.
+    # vx_max 0.12 matches voice "go forward". kp_x 0.60 saturates that at ~1 m
+    # (e.x = 1.00 − 0.80). Tripod half-cycle at T=0.70 s is ~40 mm, stride cap.
     enabled_targets: [saveli]
     enable_walk: false
-    enable_crab: false
+    enable_crab: true
     enable_wander: false
     dry_run: false
 
     r_target: 0.80
     d_stop: 0.55
     d_go: 0.70
-    lost_timeout: 0.5
+    # Follow→Hunt only after this long with no fresh TF. Duplicate id-0
+    # frames used to drop TF and dump to head-search in 0.5 s.
+    lost_timeout: 1.5
+    # TF older than this is not a live hit (coast instead).
+    pose_max_age: 0.40
     walk_watchdog: 0.3
     follow_max_s: 60.0
     search_timeout_s: 20.0
-    vx_max: 0.05
-    vy_max: 0.04
+    vx_max: 0.12
+    vy_max: 0.08
     wz_max: 0.30
-    kp_x: 0.35
-    kd_x: 0.05
+    kp_x: 0.60
+    kd_x: 0.08
     kp_y: 0.50
     kd_y: 0.05
     kp_th: 1.20
