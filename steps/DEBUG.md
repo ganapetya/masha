@@ -228,7 +228,33 @@ Binary gdb will attach to:
 
 ## 6. Layered debug (use in this order)
 
+How to plant a red dot:
+
+- **VS Code:** open the file on Masha (Remote-SSH), click the gutter left of the line number. F5 uses `launch.json`. Hover the red dot → **Edit Breakpoint** for a condition (use this on 20 Hz functions).
+- **gdb:** `break Namespace::Class::method` then `continue`. `info break` lists them. `delete 2` removes breakpoint 2.
+- Line numbers below are **Masha 2026-09-18** after the comment pass. If they drifted, search the **function name**.
+
+**Do not** put an unconditional breakpoint on a 20 Hz function (`control_tick_inner`, `Hunter::tick`, `apply_legs`) while `enable_walk:=true`. The timer stops; last Twist may keep walking. Walk **off**, or use a **condition** (`hit.has_value()`, `out.play_name`).
+
+Symptom → first stop (read this table, then the layer):
+
+| What you see | Layer | Break / watch here |
+|---|---|---|
+| gtest FAIL on Halt / crab / PD | 1 | the failing `TEST` + `Hunter::tick` |
+| No `/masha_hunter_node` | 2 | no breakpoint — launch log |
+| Hunt forever, empty detections | 2 then 4 | `saveli_from_tf` |
+| Tag in rqt, still Hunt | 4 | `saveli_from_tf` (stale TF) then `tick` Hunt+hit |
+| NAME silent | 3 then 4 | log `NAME play` / `MISSING`; `play_once` |
+| Named, never Follow | 4 | `notify_name_done` / `tick` Name branch |
+| Twist in log, no `cmd_vel` | 4 | `apply_legs` (`enable_walk` / `dry_run`) |
+| `cmd_vel` but legs idle | 5 | `StepController.cmd_vel` (`cmd_gait` must be 5) |
+| No crab (`linear.y=0`) | 1 then 4 | `follow_twist` |
+| Sudden stand | 4 | `halt_legs` / `watchdog_tick` |
+| SIGSEGV at start | 4 | constructor; do **not** subscribe `apriltag_msgs` |
+
 ### Layer 1 — policy, no robot (C++ tests)
+
+**Breakpoints: yes. Prefer this layer.** No ROS, no legs. You debug `Hunter::tick` with fake poses.
 
 ```bash
 cd ~/ros2_ws
@@ -237,7 +263,7 @@ source install/setup.zsh
 colcon test --packages-select proud_up --event-handlers console_direct+
 ```
 
-`src/proud_up/test/test_hunter.cpp` calls `Hunter::tick()` with fake `TargetHit` poses. Typical sequence in a test (same as the live node):
+`src/proud_up/test/test_hunter.cpp` calls `Hunter::tick()` with fake `TargetHit` poses. Typical sequence (same as the live node):
 
 ```
 h.start()                          Idle → Hunt
@@ -246,9 +272,40 @@ h.notify_name_done()
 h.tick(...)                        Follow: SelectGait15 then Twist
 ```
 
-If Halt/crab/PD is wrong, it fails **here**. No camera, no legs. Cheapest C++ debugger.
+If Halt/crab/PD is wrong, it fails **here**.
+
+**Where to set the breakpoint**
+
+| Symptom / question | File | Function | Line (now) | Inspect when it hits |
+|---|---|---|---|---|
+| Which test failed? | `src/proud_up/test/test_hunter.cpp` | the `TEST(Hunter, …)` that failed | 64+ | step into `h.tick` |
+| Phase / Halt vs Twist | `src/proud_up/src/hunter.cpp` | `Hunter::tick` | 296 | `phase_`, `hit`, `o.legs`, `o.twist` |
+| Hunt → Name vs skip NAME | same | `Hunter::tick` Hunt `if (hit)` | 339 | `skip_name`, `named_this_lock_` |
+| vx / wz / crab | same | `Hunter::follow_twist` | 192 | `e.x`, `e.y`, `e.theta`, `crab_`, `t.vy` |
+| Sticky vs yaml order | same | `pick_target` | 114 | `sticky_id`, `h->id` |
+| LiDAR stop chatter | same | `Hunter::tick` Follow `d_stop`/`d_go` | 399 | `d_min`, `lidar_latched_`, `phase_` |
+| Saveli plug rejects tag | `src/proud_up/src/target_saveli.cpp` | `SaveliSource::detect` | 14 | `in.have_saveli_pose`, `in.tag_id` |
+
+Run **one** test under gdb (VS Code: open `test_hunter.cpp`, breakpoint on the `TEST` line, debug the `test_hunter` binary — or gdb):
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.zsh
+# after colcon build --packages-select proud_up
+gdb --args ./build/proud_up/test_hunter \
+  --gtest_filter=Hunter.RangeErrorCommandsForwardTwist
+(gdb) break proud_up::Hunter::tick
+(gdb) break proud_up::Hunter::follow_twist
+(gdb) run
+```
+
+Useful filters: `Hunter.DeadbandHaltsNotZeroTwist`, `Hunter.CrabGateUsesYNotThetaAlone`, `Hunter.FollowMissCoastsTwistUntilLostTimeout`.
+
+Do **not** launch the hunter node for Layer 1.
 
 ### Layer 2 — ROS graph, no debugger
+
+**Breakpoints: none.** The “breakpoint” is a `ros2 topic echo` / `tf2_echo`. If you stop in gdb here you have skipped the cheap check.
 
 Slim bringup stays up. Do **not** run `~/.stop_ros.sh`. Do **not** also launch `follow_the_cat`, `masha_interaction` FOLLOW, joystick, Nav2, or a second `/controller/cmd_vel` writer.
 
@@ -298,15 +355,75 @@ How to read it:
 | `enable_walk` false | Twist logged only; no `cmd_vel` |
 | Overlay `hunt` forever | No fresh TF (stale pose is not a hit) |
 
+If Layer 2 already answers the question, **stop**. Do not open gdb yet.
+
+**If you still want a one-shot C++ stop after the graph looks wrong:** `on_start` (fires once per `~/start`). Not `control_tick`.
+
 ### Layer 3 — logs in the node
 
-`RCLCPP_INFO` / `RCLCPP_WARN` / `_THROTTLE` in `masha_hunter_node.cpp` are the live trace. First line after launch must show `enable_walk=… enable_crab=…`. NAME paths print `ok` or `MISSING`.
+**Breakpoints: none.** The log line *is* the breakpoint. Read the launch terminal; then if you must stop in the editor, break on that same `RCLCPP_*` line (it fires at the same moment as the print).
 
-`enable_walk:=false` is the debug build for wiring: you still see Twist in the log.
+`enable_walk:=false` is the debug build for wiring: Twist is logged, `cmd_vel` is not published.
+
+| Log text | File | Function | Line (now) | Meaning |
+|---|---|---|---|---|
+| `masha_hunter enable_walk=…` | `masha_hunter_node.cpp` | constructor | 507 | Node is up. If `enable_walk=false`, no `cmd_vel`. |
+| `NAME saveli=… (MISSING)` | same | constructor | 515 | Clip path wrong; Name will time out with no sound. |
+| `start: HUNT (head sweep)` | same | `on_start` | 1062 | `~/start` reached the node. Break here if this never prints. |
+| `no Saveli TF yet` | same | `saveli_from_tf` | 697 | Tag not in view, or frame not `saveli_tag` / `tag36h11:0`. |
+| `Saveli TF stale` | same | `saveli_from_tf` | 716 | Last TF older than `pose_max_age` (0.40 s). Not a hit. |
+| `NAME play …` | same | `control_tick_inner` | 843 | Policy asked for the clip. Next stop: `WavPlayer::play_once`. |
+| `twist vx=… vy=… crab=` | same | `apply_legs` | 878 | Policy Twist. If this prints and `cmd_vel` is empty, `dry_run` or walk still off. |
+| `FOLLOW→HUNT lost` | same | `control_tick_inner` | 825 | Lost lock; pan continues from current servo 19. |
+| `walk watchdog` | same | `watchdog_tick` | 1040 | No `cmd_vel` for 0.3 s; Traveling stand. |
+| `detect_tick:` / `control_tick:` exception | same | wrappers | 573 / 742 | OpenCV / TF threw; node stays up. |
 
 ### Layer 4 — gdb on the C++ node
 
-Only after RelWithDebInfo (§5.4). **Walk off**, or after `~/stop`. A breakpoint in `control_tick()` freezes the 20 Hz timer: last Twist may keep walking, or the walk watchdog stands the legs. Do not gdb Follow with `enable_walk:=true` until Halt is proven.
+**Breakpoints: yes, on the node, walk off.** Only after RelWithDebInfo (§5.4). A breakpoint in `control_tick()` freezes the 20 Hz timer: last Twist may keep walking, or the walk watchdog stands the legs. Do not gdb Follow with `enable_walk:=true` until Halt is proven.
+
+**First three stops (do these before hunting a 20 Hz function)**
+
+| Order | File | Function | Line (now) | Why this one |
+|---|---|---|---|---|
+| 1 | `src/proud_up/src/masha_hunter_node.cpp` | `on_start` | 1048 | Fires **once** per `~/start`. Confirms the service reached C++. Inspect `enable_walk`. |
+| 2 | same | `saveli_from_tf` | 688 | Every control tick, but return early if no TF. Inspect `tag_frame`, `age`, `in.have_saveli_pose`. Condition: leave unconditional only with walk off. |
+| 3 | `src/proud_up/src/hunter.cpp` | `Hunter::tick` | 296 | The policy. Inspect `phase_`, `hit`, `o.legs`, `o.play_name`. **Condition** `hit.has_value()` so empty Hunt ticks do not stop you 20 times a second. |
+
+**Then pick by symptom**
+
+| Symptom | File | Function | Line (now) | Inspect |
+|---|---|---|---|---|
+| Wrong / missing TF name | `masha_hunter_node.cpp` | `saveli_tf_frame` | 667 | return `saveli_tag` vs `tag36h11:0` vs empty |
+| Cat pixel, no base pose | same | `fill_cat_base_pose` | 635 | `hit.range_m`, `base.point.x/y` |
+| YOLO never runs | same | `detect_tick_inner` | 582 | `run_cat`, `image` — no-op if cat not in `enabled_targets` |
+| Head sweep wrong | same | `apply_head` | 896 | `out.pan_head`, `arm.id19`, `elapsed` |
+| Gaze in Follow (pixel targets) | same | `apply_head` Follow branch | 920 | `gaze_id19_`, `err` |
+| No `cmd_vel` | same | `apply_legs` | 856 | `out.legs`, `enable_walk`, `dry_run_` |
+| Gait 15 never sent | same | `select_gait15` | 983 | should run **once** per walk bout, before first Twist |
+| Stand (gait 0 then -2) | same | `halt_legs` | 1000 | who called it: Idle, lost, watchdog, `~/stop` |
+| Watchdog stand | same | `watchdog_tick` | 1021 | `walking_active_`, time since `last_walk_cmd_at_` |
+| NAME clip | same | `WavPlayer::play_once` | 229 | `wav`, `file_exists` |
+| Hunt → Name | `hunter.cpp` | `Hunter::tick` | 339 | `skip_name`, `o.play_name` |
+| Name → Follow | same | `Hunter::tick` Name | 368 | `name_playing_`, `notify_name_done` |
+| Follow PD / crab | same | `Hunter::follow_twist` | 192 | `e`, `t.vx/vy/wz`, `crab_` |
+| Follow → Hunt at 60 s | same | `Hunter::tick` `left <= 0` | 386 | `follow_t0_` |
+| LiDAR Stopped | same | `Hunter::tick` `d_min < d_stop` | 399 | `d_min` |
+| Coast on brief TF miss | same | `Hunter::tick` `if (!hit)` in Follow | 436 | `o.twist == last_twist_`, not Halt yet |
+
+gdb names (anonymous-namespace helpers need the file, not a pretty `MashaHunterNode::` if the compiler inlined; methods below are the class):
+
+```
+(gdb) break MashaHunterNode::on_start
+(gdb) break MashaHunterNode::saveli_from_tf
+(gdb) break proud_up::Hunter::tick
+(gdb) break proud_up::Hunter::follow_twist
+(gdb) break MashaHunterNode::apply_legs
+(gdb) condition 3 hit.has_value()
+(gdb) continue
+```
+
+When `tick` hits: `p phase_`, `p hit.has_value()`, `p o.legs`, `p o.twist.vx`. Step **into** `follow_twist` only after `phase_` is Follow.
 
 **A. Run the node under gdb** (launch file not involved; you must pass params yourself or use yaml):
 
@@ -348,7 +465,7 @@ Put it back to `1` when finished.
 
 **C. VS Code F5 (after extensions in §5.3)**
 
-Create `~/ros2_ws/.vscode/launch.json` on Masha (paste below). Then open `masha_hunter_node.cpp`, set a breakpoint, **Run and Debug → gdb hunter (walk off)**.
+Create `~/ros2_ws/.vscode/launch.json` on Masha (paste below). Open `masha_hunter_node.cpp`, red-dot **`on_start` (line 1048)** first — not `control_tick`. **Run and Debug → gdb hunter (walk off)**. Call `~/start` from another terminal; it should stop once. Then add `saveli_from_tf` / `Hunter::tick` with a condition.
 
 ```json
 {
@@ -416,14 +533,25 @@ A `c_cpp_properties.json` that uses the compile_commands symlink:
 
 ### Layer 5 — Python nodes (controller, bringup, app)
 
+**Breakpoints: yes, on the Python node, not the launch file.** Use this when Layer 4 already publishes `cmd_vel` / Traveling but the legs do not match.
+
 Launch files (`*.launch.py`) are not the bug. Debug the **node** they start.
 
 Find the installed script:
 
 ```bash
 ros2 pkg executables controller
-which move_controller   # example; name from the table
 ```
+
+**Where to set the breakpoint (hunter → legs)**
+
+| Symptom | File | Function | Line (now) | Inspect |
+|---|---|---|---|---|
+| Twist arrives? | `src/driver/controller/controller/move_controller.py` | `cmd_vel_callback` | 194 | `msg.linear.x/y`, `msg.angular.z` after the clamp (vx cap 0.12, vy cap **0.10**) |
+| Generator rebuilt? | `src/driver/controller/controller/step_controller.py` | `cmd_vel` | 422 | `self.cmd_gait` — must be **5** after hunter’s gait=15. `linear_x` is mm/s (`*1000`) |
+| gait=15 ignored as walk | same | `set_step_mode` | 482 | `gait == 15` branch sets `cmd_gait = 5` and **returns without walking**. Next `cmd_vel` uses `FollowGaitGenerator` |
+| 50 Hz loop using stale generator | same | `loop` | 124 | `self.cmd_gait`, current generator type |
+| Launch args not applied | `src/proud_up/launch/masha_hunter.launch.py` | `_launch_setup` | 36 | **Do not** step this for Follow bugs. Print `enable_walk` if the node came up with the wrong flag. |
 
 **pdb:**
 
@@ -433,6 +561,8 @@ source ~/ros2_ws/install/setup.zsh
 source ~/ros2_ws/.typerc
 python3 -m pdb $(ros2 pkg prefix controller)/lib/controller/move_controller
 ```
+
+In pdb: `b step_controller.py:422` then `c`. Same idea in VS Code: open the **source** file under `src/driver/controller/…` (not a copy in `install/`), red-dot those lines, attach to the running `move_controller` process.
 
 **VS Code Python** (after `debugpy`): a launch config needs `ROS_DOMAIN_ID=27` and the same `source` environment. Without domain 27 you attach to a silent graph.
 
@@ -468,6 +598,8 @@ On **Masha** (Remote-SSH terminal):
 8. Optional: add `.vscode/launch.json` from §6 layer 4C
 
 Then debug in this order: **gtest → topic/TF/overlay → logs → gdb (walk off) → Python pdb**.
+
+First C++ red dot on a live node: `on_start`. First Python red dot if `cmd_vel` is live but legs are not: `StepController.cmd_vel`.
 
 ---
 
