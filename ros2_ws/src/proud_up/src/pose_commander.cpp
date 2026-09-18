@@ -12,6 +12,7 @@ servo_controller_msgs::msg::ServosPosition make_arm_command(const ArmPulses &pos
   msg.duration = pose.duration_s;
   msg.position_unit = "pulse";
 
+  // Always send all six. Sending only 19/22 lets the other joints drift.
   const std::pair<uint16_t, float> joints[] = {
       {19, pose.id19}, {20, pose.id20}, {21, pose.id21},
       {22, pose.id22}, {23, pose.id23}, {24, pose.id24},

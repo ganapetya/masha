@@ -1,3 +1,13 @@
+// Policy tests — no ROS, no robot. Each TEST constructs a Hunter, calls
+// start() then tick() with hand-made TargetHit poses, and checks the
+// phase / LegCommandKind / Twist. If a comment in hunter.cpp and a test
+// here disagree, the test is the contract.
+//
+// Typical sequence a test uses (mirrors the live node):
+//   h.start()                         Idle → Hunt
+//   h.tick(t, saveli_at(x,y), d_min)  Hunt → Name (play_name)
+//   h.notify_name_done()              Name → Follow on the next tick
+//   h.tick(...)                       Follow: SelectGait15 then Twist
 #include <cmath>
 #include <limits>
 #include <vector>

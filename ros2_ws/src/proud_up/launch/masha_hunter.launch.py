@@ -1,3 +1,24 @@
+"""Launch the spider hunter on Masha.
+
+Order of operations (what ROS 2 actually starts):
+
+  1. generate_launch_description() declares arguments and an OpaqueFunction.
+  2. OpaqueFunction runs _launch_setup *after* substitutions are resolved,
+     so we can parse enable_walk as a real bool (LaunchConfiguration is a
+     string until .perform(context)).
+  3. Always start masha_hunter_node. Parameter merge order:
+       yaml file  →  then the extra dict (enable_walk, crab, vx_max, …).
+     Later entries win. That is why launch args override masha_hunter.yaml.
+  4. If enabled_targets contains "saveli", also start apriltag_ros inside
+     a component_container. That node publishes TF child saveli_tag.
+     Do NOT also launch vendor apriltag_recognition — two detectors fight.
+
+The hunter node stays Idle until:
+  ros2 service call /masha_hunter_node/start std_srvs/srv/Trigger
+
+Launch args do not hot-reload. Ctrl-C, then relaunch.
+"""
+
 import os
 
 from ament_index_python.packages import get_package_share_directory
@@ -13,6 +34,8 @@ def _as_bool(value: str) -> bool:
 
 
 def _launch_setup(context, *args, **kwargs):
+    # .perform(context) turns a LaunchConfiguration into a Python string
+    # *now*, at launch time. The Node() below then gets real bools/floats.
     params_file = LaunchConfiguration('params_file').perform(context)
     apriltag_params = LaunchConfiguration('apriltag_params').perform(context)
     enable_walk = _as_bool(LaunchConfiguration('enable_walk').perform(context))
@@ -25,12 +48,12 @@ def _launch_setup(context, *args, **kwargs):
     target_list = [t.strip() for t in enabled_targets.split(',') if t.strip()]
     hunter = Node(
         package='proud_up',
-        executable='masha_hunter_node',
+        executable='masha_hunter_node',  # CMake target installed to lib/proud_up/
         name='masha_hunter_node',
         output='screen',
         parameters=[
-            params_file,
-            {
+            params_file,  # first: yaml defaults
+            {             # second: launch args win on these keys
                 'enable_walk': enable_walk,
                 'enable_crab': enable_crab,
                 'dry_run': dry_run,
@@ -72,6 +95,8 @@ def _launch_setup(context, *args, **kwargs):
                             },
                         ],
                         remappings=[
+                            # Relative and absolute names: the plugin has
+                            # subscribed as both depending on distro/overlay.
                             ('image', '/depth_cam/rgb/image_raw'),
                             ('/image', '/depth_cam/rgb/image_raw'),
                             ('camera_info', '/depth_cam/rgb/camera_info'),

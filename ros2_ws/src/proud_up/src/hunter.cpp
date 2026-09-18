@@ -8,6 +8,8 @@
 namespace proud_up {
 namespace {
 
+// Partial sort: put the middle element in place, leave the rest unordered.
+// Cheaper than std::sort when we only need the median.
 double median_or_zero(std::vector<double> *v) {
   if (v->empty()) {
     return 0.0;
@@ -35,6 +37,12 @@ const char *hunter_phase_name(HunterPhase p) {
   return "unknown";
 }
 
+// Polar + Cartesian errors in base_link.
+// Example: Saveli at (x=1.00, y=0.20), r_target=0.80
+//   r     = 1.02 m
+//   theta = +11°  (left of the nose)
+//   e.x   = +0.20 m  → command +vx (walk forward)
+//   e.y   = +0.20 m  → if crab latched, command +vy (sidestep left)
 FollowErrors errors_from_pose(const PoseInBase &p, double r_target) {
   FollowErrors e;
   e.r = std::hypot(p.x, p.y);
@@ -48,6 +56,8 @@ double clamp_val(double v, double lo, double hi) {
   return std::max(lo, std::min(hi, v));
 }
 
+// One-axis PD. Derivative damps overshoot (Masha's mass + gait delay).
+// Deadband first: a 2 cm error must not keep the legs shuffling.
 double pd_axis(double e, double e_dot, double kp, double kd, double deadband, double limit) {
   if (std::fabs(e) < deadband) {
     return 0.0;
@@ -55,6 +65,9 @@ double pd_axis(double e, double e_dot, double kp, double kd, double deadband, do
   return clamp_val(kp * e + kd * e_dot, -limit, limit);
 }
 
+// Project each LD19 return into base_link, keep the front 90° sector.
+// The scan is in the lidar frame; lidar_x (~10 cm) is the mount offset
+// so "0.55 m in front of Masha" is not "0.55 m in front of the puck".
 LidarSector lidar_front(const ScanView &scan, const HunterConfig &cfg) {
   LidarSector out;
   out.d_min = std::numeric_limits<double>::infinity();
@@ -95,6 +108,9 @@ LidarSector lidar_front(const ScanView &scan, const HunterConfig &cfg) {
   return out;
 }
 
+// Priority: (1) the target we already named this lock, (2) yaml
+// enabled_targets order, (3) any hit. std::optional: empty = "no detection
+// this tick", not a default-constructed TargetHit with zeros.
 std::optional<TargetHit> pick_target(const std::vector<std::optional<TargetHit>> &hits,
                                      const std::string &sticky_id,
                                      const std::vector<std::string> &order) {
@@ -122,6 +138,8 @@ std::optional<TargetHit> pick_target(const std::vector<std::optional<TargetHit>>
 
 Hunter::Hunter(HunterConfig cfg) : cfg_(std::move(cfg)) {}
 
+// now_ is 0 until the first tick. Hunt pan timing lives in the node
+// (hunt_pan_t0_), not here — the policy only cares about the phase.
 void Hunter::start() {
   enter(HunterPhase::Hunt, now_);
 }
@@ -144,6 +162,9 @@ void Hunter::notify_halted() {
   gait15_sent_ = false;
 }
 
+// Centralize "what resets when a phase begins". Leaving Follow must
+// forget gait15 and the PD history, otherwise the next Follow inherits
+// a stale e_dot and the legs lurch.
 void Hunter::enter(HunterPhase p, double now_s) {
   phase_ = p;
   phase_t_ = now_s;
@@ -161,6 +182,13 @@ void Hunter::enter(HunterPhase p, double now_s) {
   }
 }
 
+// Follow law, body frame:
+//   1. Face the target (wz from bearing θ).
+//   2. Close the range error (vx from x - r_target).
+//   3. If already roughly facing it AND offset to the side, crab (vy)
+//      instead of spinning. Hysteresis (y_on / y_off) stops chatter.
+// Crab with wz still at full gain would yaw while sliding — the 0.3
+// scale keeps the nose on Saveli without fighting the sidestep.
 TwistBody Hunter::follow_twist(const PoseInBase &pose, double dt) {
   const FollowErrors e = errors_from_pose(pose, cfg_.r_target);
   double ex_dot = 0.0;
@@ -198,6 +226,9 @@ TwistBody Hunter::follow_twist(const PoseInBase &pose, double dt) {
   return t;
 }
 
+// Hunt default is stand + pan the head. Wander (yaml, default off) adds
+// a slow walk into open space. Wall: halt, finish the pan, stand one
+// extra tick, SelectGait15, then yaw toward the more-open side.
 HunterOutput Hunter::hunt_motion(double d_min, bool pan_sweep_done, double left_open,
                                  double right_open) {
   HunterOutput o;
@@ -253,6 +284,15 @@ HunterOutput Hunter::hunt_motion(double d_min, bool pan_sweep_done, double left_
   return o;
 }
 
+// One 50 ms step. Branch order is the logic — read top to bottom:
+//
+//   1. Stamp last_hit_t_ / sticky_id if we have a pose this tick.
+//   2. Idle: halt, return. start() is the only way out.
+//   3. lost = no hit for lost_timeout (1.5 s). Brief TF gaps are NOT lost.
+//   4. Hunt: maybe skip NAME (already named this lock), else NAME or wander.
+//   5. Name: freeze until notify_name_done() or name_timeout_s.
+//   6. Follow / Stopped: 60 s cap, LiDAR hysteresis, coast on a brief miss,
+//      else PD Twist. Zero Twist → Halt, never publish Twist{0,0,0}.
 HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, double d_min,
                           bool pan_sweep_done, double left_open, double right_open) {
   now_ = now_s;
@@ -285,6 +325,8 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
   }
 
   if (phase_ == HunterPhase::Hunt) {
+    // After the 60 s Follow cap we force one full pan before locking
+    // again, otherwise a tag still in view would instantly re-Follow.
     if (ignore_until_sweep_ && !pan_sweep_done) {
       o = hunt_motion(d_min, pan_sweep_done, left_open, right_open);
       o.sticky_id = sticky_id_;
@@ -295,6 +337,8 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       ignore_until_sweep_ = false;
     }
     if (hit) {
+      // Skip NAME if we already called this lock, or we named the same
+      // id in the last search_timeout_s (lost-and-found, do not shout again).
       const bool skip_name =
           named_this_lock_ ||
           (hit->id == last_named_id_ && (now_s - last_named_t_) < cfg_.search_timeout_s);
@@ -325,6 +369,8 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     o.phase = HunterPhase::Name;
     o.legs = LegCommandKind::Halt;
     o.pan_head = false;
+    // name_playing_ is cleared by notify_name_done() from the node when
+    // ffplay exits. The timeout is the safety net if the clip is missing.
     if (!name_playing_ || (now_s - phase_t_) >= cfg_.name_timeout_s) {
       name_playing_ = false;
       enter(HunterPhase::Follow, now_s);
@@ -348,6 +394,8 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       return o;
     }
 
+    // Hysteresis: enter Stopped at d_stop, leave only after d_go. Without
+    // it, a return at 0.55 m would chatter Halt/Twist every other tick.
     if (std::isfinite(d_min) && d_min < cfg_.d_stop) {
       lidar_latched_ = true;
       enter(HunterPhase::Stopped, now_s);
@@ -417,6 +465,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       o.legs = LegCommandKind::None;
       return o;
     }
+    // Inside deadband: stand. Next non-zero Twist must SelectGait15 again.
     if (twist_is_zero(t)) {
       o.legs = LegCommandKind::Halt;
       gait15_sent_ = false;

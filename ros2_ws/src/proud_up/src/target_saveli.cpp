@@ -5,6 +5,12 @@ namespace proud_up {
 SaveliSource::SaveliSource(int tag_id, std::string spoken_wav)
     : tag_id_(tag_id), spoken_wav_(std::move(spoken_wav)) {}
 
+// The node already looked up T_base_tag. This plug only packages that
+// pose into a TargetHit. No OpenCV, no TF — so gtest can call it with
+// a fake DetectInput and never spin a node.
+//
+// std::move on spoken_wav in the ctor: we steal the string instead of
+// copying. After the caller's temporary dies, we still own the path.
 std::optional<TargetHit> SaveliSource::detect(const DetectInput &in) {
   if (!enabled_ || !in.have_saveli_pose) {
     return std::nullopt;

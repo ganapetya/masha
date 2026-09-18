@@ -1,5 +1,15 @@
+# Parameters for /masha_hunter_node. ROS 2 bind order (later wins):
+#   1. declare_parameter defaults in masha_hunter_node.cpp
+#   2. this yaml (loaded by masha_hunter.launch.py)
+#   3. launch extra dict: enable_walk, enable_crab, vx_max, vy_max,
+#      dry_run, enabled_targets
+#
+# Nodes do not hot-reload this file. Restart the launch after edits.
+#
+# Names under ros__parameters must match declare_parameter("…") exactly.
 masha_hunter_node:
   ros__parameters:
+    # Camera / LiDAR / TF frame names. Must match slim bringup.
     image_topic: /depth_cam/rgb/image_raw
     camera_info_topic: /depth_cam/rgb/camera_info
     depth_topic: /depth_cam/depth/image_raw
@@ -23,6 +33,7 @@ masha_hunter_node:
     enable_wander: false
     dry_run: false
 
+    # Follow standoff and LiDAR hysteresis (metres). d_go > d_stop on purpose.
     r_target: 0.80
     d_stop: 0.55
     d_go: 0.70
@@ -34,6 +45,8 @@ masha_hunter_node:
     walk_watchdog: 0.3
     follow_max_s: 60.0
     search_timeout_s: 20.0
+    # PD: u = clamp(kp*e + kd*e_dot, ±*_max). kp_x 0.60 * 0.20 m error = 0.12
+    # which saturates vx_max — that is intentional at ~1 m range.
     vx_max: 0.12
     vy_max: 0.08
     wz_max: 0.30

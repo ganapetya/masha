@@ -1,18 +1,83 @@
 // masha_hunter_node — spider hunter on Masha (Jetson Orin NX, ROS 2 Humble).
 //
-// Policy lives in hunter.hpp (no ROS). This file is the wiring:
-// sensors, TF, arm pan, Traveling halt, aplay worker, overlay.
+// Two-layer design (this is the C++ lesson the tests rely on):
 //
-//   IDLE --~/start--> HUNT --hit--> NAME --mp3--> FOLLOW (≤60 s)
-//                         ^                         |
-//                         +-- lost / timeout / LiDAR +
+//   hunter.hpp / hunter.cpp   — the BRAIN. No rclcpp. tick() in, Halt/Twist out.
+//   THIS FILE                 — the BODY. Topics, TF, servos, audio, overlay.
 //
-// Do not launch follow_the_cat_node, masha_interaction FOLLOW, lidar_app,
-// Nav2, or analog joystick at the same time. Two writers on
-// /controller/cmd_vel and on servos 19/22 fight.
+// gtest calls Hunter::tick() with fake numbers. The policy does not need
+// a robot, a camera, or this node to be proven. This file only *wires*
+// live sensors into that same tick().
 //
-// Threads: image/scan callbacks only store pointers. Detect (YOLO) and
-// control (PID + publish) run on timers. Never OpenCV or aplay on DDS.
+// Phase machine (owned by Hunter, executed here):
+//
+//   IDLE --~/start--> HUNT --hit--> NAME --mp3 done--> FOLLOW (≤60 s)
+//                         ^                              |
+//                         +-- lost / 60 s / LiDAR STOPPED +
+//
+// ---------------------------------------------------------------------------
+// Order of operations — process lifetime
+// ---------------------------------------------------------------------------
+//
+//  1. `ros2 launch proud_up masha_hunter.launch.py` starts this executable.
+//     If enabled_targets contains "saveli", the launch file ALSO starts
+//     apriltag_ros as a composable node (AprilTagNode). That other node
+//     publishes TF child `saveli_tag`. This node never runs the detector.
+//  2. main() → rclcpp::init → construct MashaHunterNode → executor.spin().
+//     spin() is the ROS 2 event loop. It never returns until Ctrl-C.
+//  3. The constructor DECLARES parameters and CREATES pubs/subs/services/
+//     timers. It does NOT start hunting. Phase stays Idle until ~/start.
+//     (declare_parameter is how ROS 2 binds yaml + launch args to C++.)
+//  4. Operator:  ros2 service call /masha_hunter_node/start std_srvs/srv/Trigger
+//     → on_start() → hunter_.start() → phase Hunt, head begins to sweep.
+//  5. Every 50 ms, control_tick() copies the latest sensors, calls
+//     Hunter::tick(), then publishes legs / head / overlay.
+//  6. ~/stop or Ctrl-C → emergency_stop(): halt legs with Traveling
+//     (gait 0 then -2), kill audio, freeze policy in Idle.
+//     Zero Twist on /controller/cmd_vel is NOT a halt — it starts a gait
+//     in place. That is why we never publish Twist{0,0,0} as a stop.
+//
+// ---------------------------------------------------------------------------
+// Order of operations — one control_tick (20 Hz)
+// ---------------------------------------------------------------------------
+//
+//  A. Short mutex: copy latest scan / image / camera_info / cat_hit pointers.
+//     Shared_ptr copy is cheap (refcount). We do NOT copy image bytes here.
+//  B. LiDAR: lidar_front() walks /scan ranges → d_min, left/right openness.
+//  C. Cat (optional): if YOLO already found a pixel, fill_cat_base_pose()
+//     turns (u,v,depth) into (x,y) in base_link via TF camera→base.
+//  D. Saveli: saveli_from_tf() looks up T_base_tag. Stale TF is not a hit.
+//  E. pick_target(): sticky id (who we already named) wins; else yaml order.
+//  F. If the NAME clip just finished, hunter_.notify_name_done().
+//  G. hunter_.tick(...) — THE policy. Returns HunterOutput.
+//  H. Hunt entered from Follow: start the pan sweep at the *current* pan.
+//     Snapping servo 19 to pan_min (200) looks ~70° away and loses the tag.
+//  I. play_name → WavPlayer worker thread (ffplay). Never aplay on this timer.
+//  J. apply_legs()  → Halt (Traveling) / SelectGait15 / Twist (cmd_vel)
+//  K. apply_head()  → Hunt: triangle pan. Follow+pixel: integrate_gaze. Else hold.
+//  L. publish_overlay() → ~/image_result (rqt / foxglove).
+//
+// ---------------------------------------------------------------------------
+// Threads — why MultiThreadedExecutor and callback groups
+// ---------------------------------------------------------------------------
+//
+// One ROS 2 executor thread cannot do YOLO (tens of ms) AND keep 20 Hz
+// cmd_vel. If OpenCV ran inside on_image(), LaserScan would pile up and
+// the walk watchdog would stand the legs.
+//
+//   image_cb_group_     DDS callbacks: store the latest shared_ptr, return.
+//   detect_cb_group_    50 ms timer: YOLO for the cat plug (no-op if cat off).
+//   control_cb_group_   50 ms timer: TF + tick + publish.
+//   watchdog_cb_group_  100 ms: if cmd_vel went silent, stand the legs.
+//   service_cb_group_   ~/start and ~/stop (so start is not blocked by YOLO).
+//
+// MutuallyExclusive *inside* a group: at most one callback of that group
+// runs at a time. Different groups CAN run in parallel — that is why
+// mutex_ exists. Image callbacks never call OpenCV, TF, or Hunter.
+//
+// Do not also launch follow_the_cat_node, masha_interaction FOLLOW,
+// lidar_app, Nav2, or analog joystick. Two writers on /controller/cmd_vel
+// and on servos 19/22 fight.
 
 #include <algorithm>
 #include <atomic>
@@ -57,6 +122,7 @@
 #include "proud_up/pose_commander.hpp"
 #include "proud_up/target_source.hpp"
 
+// posix_spawnp reads the process environment (PATH, Pulse sink, …).
 extern char **environ;
 
 using namespace std::chrono_literals;
@@ -64,6 +130,10 @@ using namespace std::chrono_literals;
 namespace proud_up {
 namespace {
 
+// Fork a child in its own process group so killpg() can stop ffplay AND
+// any decoder it spawned. posix_spawnp (not std::system) so we keep the
+// pid. argv pointers must stay valid until posix_spawnp returns — they
+// alias the std::string c_str() of `args`, which is still in scope.
 pid_t spawn_argv(const std::vector<std::string> &args) {
   if (args.empty()) {
     return -1;
@@ -90,6 +160,8 @@ pid_t spawn_argv(const std::vector<std::string> &args) {
   return pid;
 }
 
+// SIGTERM, 80 ms grace, then SIGKILL. kill(..., 0) is a liveness probe
+// (signal 0 never delivers); errno ESRCH means the child already exited.
 void kill_group(pid_t pid) {
   if (pid <= 0) {
     return;
@@ -147,6 +219,9 @@ bool looks_like_mp3(const std::string &path) {
          e[3] == '3';
 }
 
+// NAME clips run on a worker thread so control_tick stays 20 Hz.
+// Atomics (stop_ / running_ / finished_ / pid_) are the only shared
+// state with the timer thread — no mutex on the hot path.
 class WavPlayer {
  public:
   ~WavPlayer() { stop(); }
@@ -235,6 +310,8 @@ class WavPlayer {
   std::atomic<pid_t> pid_{0};
 };
 
+// TF rotation is a quaternion. getRPY is ZYX Euler; yaw is rotation
+// about +Z (up) — that is the heading we feed into PoseInBase::yaw.
 double yaw_from_quat(const geometry_msgs::msg::Quaternion &q) {
   tf2::Quaternion tq(q.x, q.y, q.z, q.w);
   double roll = 0.0;
@@ -248,6 +325,18 @@ double yaw_from_quat(const geometry_msgs::msg::Quaternion &q) {
 
 class MashaHunterNode : public rclcpp::Node {
  public:
+  // Member-initializer list runs BEFORE the constructor body:
+  //   Node("masha_hunter_node")  ROS graph name; ~/start → /masha_hunter_node/start
+  //   tf_buffer_(get_clock())    uses this node's clock (sim-time ready)
+  //   tf_listener_(tf_buffer_)   background subscriber to /tf and /tf_static
+  //
+  // Constructor body order (do not reorder casually):
+  //   1. declare_parameter — yaml + launch args bind here
+  //   2. build HunterConfig, construct hunter_
+  //   3. arm rest pose + pan limits
+  //   4. TargetSource plugs (Saveli always, Cat only if enabled)
+  //   5. callback groups, then publishers, then subscriptions, then services
+  //   6. timers last — they can fire as soon as the executor spins
   MashaHunterNode() : Node("masha_hunter_node"), tf_buffer_(get_clock()), tf_listener_(tf_buffer_) {
     image_topic_ = declare_parameter<std::string>("image_topic", "/depth_cam/rgb/image_raw");
     camera_info_topic_ =
@@ -264,6 +353,7 @@ class MashaHunterNode : public rclcpp::Node {
     saveli_tag_frame_ = declare_parameter<std::string>("saveli_tag_frame", "saveli_tag");
     voice_dir_ = declare_parameter<std::string>("voice_dir", "");
 
+    // Launch extra dict overrides yaml, yaml overrides these C++ defaults.
     enabled_targets_ = declare_parameter<std::vector<std::string>>("enabled_targets", {"saveli"});
     saveli_tag_id_ = declare_parameter<int>("saveli_tag_id", 0);
     dry_run_ = declare_parameter<bool>("dry_run", false);
@@ -296,6 +386,7 @@ class MashaHunterNode : public rclcpp::Node {
     walk_watchdog_s_ = declare_parameter<double>("walk_watchdog", 0.3);
     hunter_ = Hunter(cfg);
 
+    // Bus pulses are integers 0–1000; yaml is double so launch can override.
     rest_.id19 = static_cast<float>(declare_parameter<double>("arm_id19", 500.0));
     rest_.id20 = static_cast<float>(declare_parameter<double>("arm_id20", 810.0));
     rest_.id21 = static_cast<float>(declare_parameter<double>("arm_id21", 180.0));
@@ -331,11 +422,13 @@ class MashaHunterNode : public rclcpp::Node {
     cat_wav_ = declare_parameter<std::string>("cat_wav", voice_dir_ + "/call-kitten.mp3");
     name_play_timeout_s_ = declare_parameter<double>("name_play_timeout_s", 8.0);
 
+    // unique_ptr: exclusive ownership, destroyed with the node. Saveli
+    // is cheap (no DNN). Cat loads yolov8n.onnx — only construct if asked.
     saveli_ = std::make_unique<SaveliSource>(saveli_tag_id_, saveli_wav_);
     saveli_->set_enabled(target_enabled("saveli"));
 
     HumanDetectConfig cat_cfg;
-    cat_cfg.coco_class = 15;
+    cat_cfg.coco_class = 15;  // COCO: 0=person, 15=cat. Same ONNX file.
     cat_cfg.require_person_shape = false;
     cat_cfg.enable_face_fallback = false;
     cat_cfg.person_head_frac = 0.50;
@@ -356,17 +449,22 @@ class MashaHunterNode : public rclcpp::Node {
       cat_->set_enabled(true);
     }
 
+    // MutuallyExclusive = one callback of THIS group at a time.
+    // Separate groups so YOLO cannot stall cmd_vel or ~/start.
     image_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     detect_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     control_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     watchdog_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     service_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
+    // Queue depth 1: latest command wins. Depth 10 would replay stale Twists.
     servo_pub_ = create_publisher<servo_controller_msgs::msg::ServosPosition>(servo_topic_, 1);
     cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 1);
     traveling_pub_ = create_publisher<kinematics_msgs::msg::Traveling>(traveling_topic_, 1);
     image_pub_ = create_publisher<sensor_msgs::msg::Image>("~/image_result", 1);
 
+    // SensorDataQoS = BEST_EFFORT, keep-last 5. Camera/LiDAR must not
+    // block the publisher if this node is slow. RELIABLE would stall them.
     rclcpp::QoS sensor_qos = rclcpp::SensorDataQoS();
     rclcpp::SubscriptionOptions image_opts;
     image_opts.callback_group = image_cb_group_;
@@ -401,6 +499,7 @@ class MashaHunterNode : public rclcpp::Node {
                std::shared_ptr<std_srvs::srv::Trigger::Response> response) { on_stop(response); },
         rmw_qos_profile_services_default, service_cb_group_);
 
+    // Wall timers use steady time, not /clock. 50 ms = 20 Hz = control_dt.
     detect_timer_ = create_wall_timer(50ms, [this]() { detect_tick(); }, detect_cb_group_);
     control_timer_ = create_wall_timer(50ms, [this]() { control_tick(); }, control_cb_group_);
     watchdog_timer_ = create_wall_timer(100ms, [this]() { watchdog_tick(); }, watchdog_cb_group_);
@@ -420,6 +519,10 @@ class MashaHunterNode : public rclcpp::Node {
 
   ~MashaHunterNode() override { emergency_stop(); }
 
+  // Safe to call from destructor, on_shutdown, and exceptions. Halt the
+  // policy first (under mutex) so a concurrent control_tick sees stopping_
+  // and returns, then kill audio, then stand. Order matters: if we halt
+  // legs first, tick could publish Twist again before stopping_ is set.
   void emergency_stop() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -439,6 +542,11 @@ class MashaHunterNode : public rclcpp::Node {
 
   rclcpp::Time now() { return get_clock()->now(); }
 
+  // DDS callbacks: latest-wins. ConstSharedPtr is a refcounted pointer
+  // to the serialized image already in memory — we do not memcpy pixels
+  // here. lock_guard is RAII: mutex unlocks if this function returns OR
+  // throws. std::move transfers the pointer so the callback argument is
+  // empty after the assignment (the previous latest_image_ is released).
   void on_image(sensor_msgs::msg::Image::ConstSharedPtr msg) {
     std::lock_guard<std::mutex> lock(mutex_);
     latest_image_ = std::move(msg);
@@ -456,6 +564,8 @@ class MashaHunterNode : public rclcpp::Node {
     latest_scan_ = std::move(msg);
   }
 
+  // Swallow exceptions so one bad OpenCV frame cannot kill the node
+  // (and take ~/start with it). The executor would otherwise unwind.
   void detect_tick() {
     try {
       detect_tick_inner();
@@ -466,6 +576,9 @@ class MashaHunterNode : public rclcpp::Node {
     }
   }
 
+  // Cat plug only. Saveli pose is TF, looked up on the control timer —
+  // YOLO must not share that thread. Lock is held only while copying
+  // pointers; DNN runs unlocked so control_tick can still take mutex_.
   void detect_tick_inner() {
     sensor_msgs::msg::Image::ConstSharedPtr image;
     sensor_msgs::msg::Image::ConstSharedPtr depth;
@@ -500,6 +613,8 @@ class MashaHunterNode : public rclcpp::Node {
       } catch (const cv_bridge::Exception &) {
       }
     }
+    // Pointers into stack cv::Mat. CatSource::detect must finish before
+    // these go out of scope — it does; we do not store `in` on the node.
     DetectInput in;
     in.bgr = &cv->image;
     in.depth_mm = depth_mm.empty() ? nullptr : &depth_mm;
@@ -512,6 +627,11 @@ class MashaHunterNode : public rclcpp::Node {
     cat_hit_ = std::move(hit);
   }
 
+  // Pixel (u,v) is a DIRECTION, not a 3D point. Scale the unit ray by
+  // measured depth, then TF from camera optical frame into base_link:
+  //   p_base = T_base_camera * (ray * range_m)
+  // TimePointZero = "latest available transform", not the image stamp.
+  // That is slightly wrong under motion, but avoids waiting on TF.
   void fill_cat_base_pose(TargetHit &hit, sensor_msgs::msg::CameraInfo::ConstSharedPtr info) {
     if (!hit.pose.has_pixel || hit.range_m <= 0.05) {
       return;
@@ -562,6 +682,9 @@ class MashaHunterNode : public rclcpp::Node {
     return {};
   }
 
+  // Saveli hit = a FRESH TF child. We do not subscribe to
+  // apriltag_msgs: Humble vs the Jetson overlay ship different
+  // AprilTagDetection layouts; the wrong one SIGSEGVs this node.
   std::optional<TargetHit> saveli_from_tf() {
     if (!saveli_ || !saveli_->enabled()) {
       return std::nullopt;
@@ -584,6 +707,9 @@ class MashaHunterNode : public rclcpp::Node {
         return std::nullopt;
       }
       auto tf = tf_buffer_.lookupTransform(base_frame_, tag_frame, tf2::TimePointZero);
+      // lookupTransform returns the last published pose even after the
+      // tag left the image. Age > pose_max_age means "coast, do not treat
+      // this as a live hit" — otherwise Follow never goes lost.
       const double age = (now() - rclcpp::Time(tf.header.stamp)).seconds();
       const double max_age = pose_max_age_s_ > 0.05 ? pose_max_age_s_ : 0.40;
       if (age > max_age) {
@@ -619,6 +745,7 @@ class MashaHunterNode : public rclcpp::Node {
     }
   }
 
+  // See the file header for A–L. This function is the 20 Hz heartbeat.
   void control_tick_inner() {
     sensor_msgs::msg::LaserScan::ConstSharedPtr scan;
     sensor_msgs::msg::Image::ConstSharedPtr image;
@@ -659,6 +786,7 @@ class MashaHunterNode : public rclcpp::Node {
     if (cat_hit && !cat_hit->pose_in_base) {
       fill_cat_base_pose(*cat_hit, info);
     }
+    // Both slots always present (maybe empty). pick_target walks them.
     std::vector<std::optional<TargetHit>> hits;
     hits.push_back(saveli_from_tf());
     hits.push_back(cat_hit);
@@ -678,6 +806,7 @@ class MashaHunterNode : public rclcpp::Node {
       if (player_.finished() && hunter_.phase() == HunterPhase::Name) {
         hunter_.notify_name_done();
       }
+      // Policy. hit / d_min / pan_done are already in library types.
       out = hunter_.tick(t, hit, d_min, pan_done, left_open, right_open);
       play = out.play_name;
       if (out.phase == HunterPhase::Hunt && prev != HunterPhase::Hunt) {
@@ -720,6 +849,10 @@ class MashaHunterNode : public rclcpp::Node {
     publish_overlay(out, hit, d_min, image);
   }
 
+  // Map LegCommandKind → ROS messages. One kind per tick:
+  //   Halt         → Traveling 0 then -2, once (not every 50 ms)
+  //   SelectGait15 → Traveling gait=15 so the controller's cmd_gait = 5
+  //   Twist        → /controller/cmd_vel  (skipped if enable_walk=false)
   void apply_legs(const HunterOutput &out) {
     if (out.legs == LegCommandKind::Halt) {
       // Idle/Hunt halt every 50 ms would spam gait=0/-2. Once is a stand.
@@ -754,6 +887,12 @@ class MashaHunterNode : public rclcpp::Node {
     }
   }
 
+  // Three head modes, in this order:
+  //   Hunt (pan_head)  triangle sweep on servo 19, tilt held at rest
+  //   Follow + pixel   integrate_gaze: small step toward the box centre
+  //   else             hold the last pan/tilt (Name, Stopped, TF-only Saveli)
+  // duration_s = 0.08 ≈ one control period, so the bus tracks the triangle
+  // instead of blending a 1 s move toward a pan that has already changed.
   void apply_head(const HunterOutput &out, const std::optional<TargetHit> &hit,
                   sensor_msgs::msg::CameraInfo::ConstSharedPtr info) {
     ArmPulses arm = rest_;
@@ -762,6 +901,8 @@ class MashaHunterNode : public rclcpp::Node {
       const double t = now().seconds();
       const double elapsed = t - hunt_pan_t0_;
       const double period = pan_period_s_ > 1.0 ? pan_period_s_ : 10.0;
+      // Triangle: 0→0.5 goes pan_min→pan_max, 0.5→1.0 comes back.
+      // fmod keeps sweeping if Hunt lasts more than one period.
       const double phase = std::fmod(std::max(0.0, elapsed) / period, 1.0);
       float id19 = rest_.id19;
       if (phase < 0.5) {
@@ -805,6 +946,8 @@ class MashaHunterNode : public rclcpp::Node {
     servo_pub_->publish(make_arm_command(arm));
   }
 
+  // Debug image on ~/image_result. toCvCopy makes our own BGR so we
+  // can draw without mutating the camera's shared buffer.
   void publish_overlay(const HunterOutput &out, const std::optional<TargetHit> &hit, double d_min,
                        sensor_msgs::msg::Image::ConstSharedPtr image) {
     if (!image || image->data.empty() || image->width == 0 || image->height == 0) {
@@ -834,6 +977,9 @@ class MashaHunterNode : public rclcpp::Node {
     image_pub_->publish(*cv->toImageMsg());
   }
 
+  // gait=15 is the *select* code. The controller then runs cmd_gait=5
+  // (omnidirectional tripod — the map in follow_gait.cpp). Must be sent
+  // once per walk bout, before the first Twist, or cmd_vel is ignored.
   void select_gait15() {
     if (dry_run_) {
       RCLCPP_INFO(get_logger(), "dry_run Traveling gait=%d (not sent)", follow_gait_select_);
@@ -848,6 +994,9 @@ class MashaHunterNode : public rclcpp::Node {
     traveling_pub_->publish(sel);
   }
 
+  // Vendor halt: gait 0 stops the generator, gait -2 is the stand pose.
+  // interrupt=true aborts the current half-cycle instead of finishing it.
+  // Publishing both back-to-back is how Masha's other apps stand too.
   void halt_legs() {
     walking_active_ = false;
     last_applied_legs_ = LegCommandKind::Halt;
@@ -866,6 +1015,9 @@ class MashaHunterNode : public rclcpp::Node {
     traveling_pub_->publish(stand);
   }
 
+  // If Follow is supposed to be walking but cmd_vel went silent (node
+  // stall, exception, enable_walk flipped), stand. Zero Twist would
+  // march in place — that is the bug this exists to prevent.
   void watchdog_tick() {
     bool should_halt = false;
     {
@@ -891,6 +1043,8 @@ class MashaHunterNode : public rclcpp::Node {
     }
   }
 
+  // Trigger has empty Request. We only fill Response.{success, message}.
+  // Halt first so a leftover Follow Twist cannot keep walking into Hunt.
   void on_start(std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
     halt_legs();
     {
@@ -915,6 +1069,8 @@ class MashaHunterNode : public rclcpp::Node {
       stopping_ = true;
       hunter_.stop();
     }
+    // player_.stop() joins the ffplay thread — do it outside the mutex
+    // so control_tick is not blocked for the length of the clip.
     player_.stop();
     halt_legs();
     send_rest();
@@ -929,6 +1085,7 @@ class MashaHunterNode : public rclcpp::Node {
     servo_pub_->publish(make_arm_command(rest_));
   }
 
+  // --- parameters (copied out of yaml / launch; not live-reloaded) ---
   std::string image_topic_;
   std::string camera_info_topic_;
   std::string depth_topic_;
@@ -958,25 +1115,26 @@ class MashaHunterNode : public rclcpp::Node {
   double deadband_rad_{0.06};
   double walk_watchdog_s_{0.3};
   double pose_max_age_s_{0.40};
-  double hunt_pan_t0_{0.0};
-  bool pan_sweep_done_{false};
-  bool stopping_{false};
-  bool walking_active_{false};
+  double hunt_pan_t0_{0.0};          // ROS time when the current Hunt sweep started
+  bool pan_sweep_done_{false};       // one full triangle completed (wander gate)
+  bool stopping_{false};             // set by ~/stop / emergency; ticks no-op
+  bool walking_active_{false};       // watchdog only runs while this is true
   LegCommandKind last_applied_legs_{LegCommandKind::None};
-  float gaze_id19_{500.0f};
-  float gaze_id22_{150.0f};
-  ArmPulses rest_;
-  PulseMapping pulse_map_;
-  Hunter hunter_;
+  float gaze_id19_{500.0f};          // last commanded pan (integrator state)
+  float gaze_id22_{150.0f};          // last commanded tilt
+  ArmPulses rest_;                   // hunter pose: arm out, camera forward-down
+  PulseMapping pulse_map_;           // optical yaw/pitch → servo ticks
+  Hunter hunter_;                    // the ROS-free policy object
   HunterOutput last_out_;
   std::unique_ptr<SaveliSource> saveli_;
   std::unique_ptr<CatSource> cat_;
-  std::optional<TargetHit> cat_hit_;
+  std::optional<TargetHit> cat_hit_;  // written by detect_tick, read by control
   WavPlayer player_;
-  std::mutex mutex_;
-  tf2_ros::Buffer tf_buffer_;
+  std::mutex mutex_;                  // guards latest_* + hunter_ + cat_hit_
+  tf2_ros::Buffer tf_buffer_;         // declared before listener (init order)
   tf2_ros::TransformListener tf_listener_;
   rclcpp::Time last_walk_cmd_at_{0, 0, RCL_ROS_TIME};
+  // Latest-wins slots. Callbacks overwrite; timers copy the pointer out.
   sensor_msgs::msg::Image::ConstSharedPtr latest_image_;
   sensor_msgs::msg::Image::ConstSharedPtr latest_depth_;
   sensor_msgs::msg::CameraInfo::ConstSharedPtr latest_info_;
@@ -1004,18 +1162,23 @@ class MashaHunterNode : public rclcpp::Node {
 }  // namespace proud_up
 
 int main(int argc, char **argv) {
+  // Parses ROS args (--ros-args -p enable_walk:=true …) then our argc.
   rclcpp::init(argc, argv);
   try {
     auto node = std::make_shared<proud_up::MashaHunterNode>();
+    // weak_ptr so the shutdown hook cannot keep the node alive after
+    // node.reset() — that would be a shared_ptr cycle.
     std::weak_ptr<proud_up::MashaHunterNode> weak = node;
     rclcpp::on_shutdown([weak]() {
       if (auto n = weak.lock()) {
         n->emergency_stop();
       }
     });
+    // MultiThreaded: callback groups run in parallel. SingleThreaded
+    // would serialize YOLO and cmd_vel on one thread.
     rclcpp::executors::MultiThreadedExecutor exec;
     exec.add_node(node);
-    exec.spin();
+    exec.spin();  // blocks until Ctrl-C / rclcpp::shutdown
     node->emergency_stop();
     node.reset();
   } catch (const std::exception &e) {

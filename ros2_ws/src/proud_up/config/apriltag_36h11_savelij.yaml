@@ -1,4 +1,8 @@
-# Saveli plug for apriltag_ros (AprilTagNode).
+# Saveli plug for apriltag_ros (AprilTagNode), started by masha_hunter.launch.py.
+# The hunter node does NOT subscribe to detections — it looks up TF child
+# saveli_tag in base_link. If tag_frames is ignored, that child is named
+# tag36h11:0 instead; saveli_tf_frame() in the node accepts both.
+#
 # Print: black 36h11 square on a WHITE card. The white margin around the
 # black square is the quiet zone (required). size: is the BLACK square
 # only, 60 mm; do not include the white margin in that number.

@@ -69,7 +69,9 @@ target_include_directories(follow_gait PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
-# Hunter policy + target plugs. No rclcpp in hunter.cpp.
+# Hunter policy + target plugs. No rclcpp in hunter.cpp — gtest links
+# this library and calls Hunter::tick() with fake poses. The ROS node
+# (masha_hunter_node) is a separate executable that *uses* this library.
 add_library(hunter STATIC
   src/hunter.cpp
   src/target_saveli.cpp
@@ -137,6 +139,8 @@ target_link_libraries(follow_the_cat_node
   ${OpenCV_LIBS}
 )
 
+# Wiring executable: sensors, TF, servos, audio. Links hunter (policy)
+# + follow_the_cat (YOLO + pinhole + gaze) + proud_up_core (arm pulses).
 add_executable(masha_hunter_node src/masha_hunter_node.cpp)
 target_include_directories(masha_hunter_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
