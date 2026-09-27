@@ -3,7 +3,8 @@
 // Two-layer design (this is the C++ lesson the tests rely on):
 //
 //   hunter.hpp / hunter.cpp   — the BRAIN. No rclcpp. tick() in, Halt/Twist out.
-//   THIS FILE                 — the BODY. Topics, TF, servos, audio, overlay.
+//   audio_player.hpp          — the SPEAKER. Worker thread, aplay, ffplay.
+//   THIS FILE                 — the BODY. Topics, TF, servos, overlay.
 //
 // gtest calls Hunter::tick() with fake numbers. The policy does not need
 // a robot, a camera, or this node to be proven. This file only *wires*
@@ -56,7 +57,7 @@
 //  G. hunter_.tick(...) — THE policy. Returns HunterOutput.
 //  H. Hunt entered from Follow: start the pan sweep at the *current* pan.
 //     Snapping servo 19 to pan_min (200) looks ~70° away and loses the tag.
-//  I. play_name → WavPlayer worker thread (ffplay). Never aplay on this timer.
+//  I. play_name → AudioPlayer::play_once. This timer never spawns aplay.
 //  J. apply_legs()  → Halt (Traveling) / SelectGait15 / Twist (cmd_vel)
 //  K. apply_head()  → Hunt: triangle pan. Follow+pixel: integrate_gaze. Else hold.
 //  L. publish_overlay() → ~/image_result (rqt / foxglove).
@@ -84,21 +85,13 @@
 // and on servos 19/22 fight.
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
-#include <csignal>
-#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <spawn.h>
 #include <string>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <thread>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -121,217 +114,16 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
+#include "proud_up/audio_player.hpp"
 #include "proud_up/follow_the_cat.hpp"
 #include "proud_up/hunter.hpp"
 #include "proud_up/pose_commander.hpp"
 #include "proud_up/target_source.hpp"
 
-// posix_spawnp reads the process environment (PATH, Pulse sink, …).
-extern char **environ;
-
 using namespace std::chrono_literals;
 
 namespace proud_up {
 namespace {
-
-// Fork a child in its own process group so killpg() can stop ffplay AND
-// any decoder it spawned. posix_spawnp (not std::system) so we keep the
-// pid. argv pointers must stay valid until posix_spawnp returns — they
-// alias the std::string c_str() of `args`, which is still in scope.
-pid_t spawn_argv(const std::vector<std::string> &args) {
-  if (args.empty()) {
-    return -1;
-  }
-  std::vector<char *> argv;
-  argv.reserve(args.size() + 1);
-  for (const auto &a : args) {
-    argv.push_back(const_cast<char *>(a.c_str()));
-  }
-  argv.push_back(nullptr);
-  posix_spawn_file_actions_t actions;
-  posix_spawnattr_t attr;
-  posix_spawn_file_actions_init(&actions);
-  posix_spawnattr_init(&attr);
-  posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
-  posix_spawnattr_setpgroup(&attr, 0);
-  pid_t pid = -1;
-  const int rc = posix_spawnp(&pid, argv[0], &actions, &attr, argv.data(), environ);
-  posix_spawnattr_destroy(&attr);
-  posix_spawn_file_actions_destroy(&actions);
-  if (rc != 0) {
-    return -1;
-  }
-  return pid;
-}
-
-// SIGTERM, 80 ms grace, then SIGKILL. kill(..., 0) is a liveness probe
-// (signal 0 never delivers); errno ESRCH means the child already exited.
-void kill_group(pid_t pid) {
-  if (pid <= 0) {
-    return;
-  }
-  if (killpg(pid, SIGTERM) != 0) {
-    kill(pid, SIGTERM);
-  }
-  std::this_thread::sleep_for(80ms);
-  if (killpg(pid, 0) == 0 || kill(pid, 0) == 0) {
-    killpg(pid, SIGKILL);
-    kill(pid, SIGKILL);
-  }
-}
-
-void wait_spawned(pid_t pid, double timeout_s) {
-  if (pid <= 0) {
-    return;
-  }
-  const auto start = std::chrono::steady_clock::now();
-  while (true) {
-    int status = 0;
-    if (waitpid(pid, &status, WNOHANG) == pid) {
-      return;
-    }
-    const double elapsed =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    if (timeout_s > 0.0 && elapsed >= timeout_s) {
-      kill_group(pid);
-      waitpid(pid, &status, 0);
-      return;
-    }
-    std::this_thread::sleep_for(20ms);
-  }
-}
-
-// USB speaker boot script used to leave Pulse at 80%. NAME clips must be
-// heard across the room: unmute, 100% sink, then ffplay -volume 100.
-void set_output_max() {
-  wait_spawned(spawn_argv({"/usr/bin/pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"}), 1.0);
-  wait_spawned(
-      spawn_argv({"/usr/bin/pactl", "set-sink-volume", "@DEFAULT_SINK@", "100%"}), 1.0);
-}
-
-bool file_exists(const std::string &path) {
-  struct stat st {};
-  return !path.empty() && stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
-}
-
-bool looks_like_mp3(const std::string &path) {
-  if (path.size() < 4) {
-    return false;
-  }
-  const char *e = path.c_str() + path.size() - 4;
-  return e[0] == '.' && (e[1] == 'm' || e[1] == 'M') && (e[2] == 'p' || e[2] == 'P') &&
-         e[3] == '3';
-}
-
-// NAME clips run on a worker thread so control_tick stays 20 Hz.
-// Atomics (stop_ / running_ / finished_ / pid_) are the only shared
-// state with the timer thread — no mutex on the hot path.
-class WavPlayer {
- public:
-  ~WavPlayer() { stop(); }
-
-  void play_once(const std::string &wav, double timeout_s) {
-    stop();
-    if (!file_exists(wav)) {
-      finished_.store(true);
-      return;
-    }
-    stop_.store(false);
-    finished_.store(false);
-    running_.store(true);
-    wav_ = wav;
-    timeout_s_ = timeout_s;
-    th_ = std::thread([this]() { worker(); });
-  }
-
-  void stop() {
-    stop_.store(true);
-    const pid_t pid = pid_.load();
-    if (pid > 0) {
-      kill_group(pid);
-    }
-    if (th_.joinable()) {
-      th_.join();
-    }
-    pid_.store(0);
-    running_.store(false);
-  }
-
-  bool running() const { return running_.load(); }
-  bool finished() const { return finished_.load(); }
-
- private:
-  // ffplay -autoexit closes Pulse when the decoder hits EOF. The USB
-  // speaker still has the tail queued, and that tail is dropped — the
-  // clip starts, then the last syllable is missing. aplay drains the
-  // device before it exits. A short silence pad is what gets dropped if
-  // a later fallback still has to use ffplay.
-  std::string wav_for_aplay() {
-    if (!looks_like_mp3(wav_)) {
-      return wav_;
-    }
-    const std::string out = "/tmp/masha_hunter_name.wav";
-    const pid_t enc = spawn_argv({"/usr/bin/ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                                  "-i", wav_, "-af", "apad=pad_dur=0.6", "-ar", "44100", "-ac",
-                                  "2", out});
-    if (enc <= 0) {
-      return {};
-    }
-    wait_spawned(enc, 8.0);
-    if (!file_exists(out)) {
-      return {};
-    }
-    return out;
-  }
-
-  void worker() {
-    // NAME clips are mp3. Pulse sink is forced to 100% before the sample
-    // starts, or the first call after the speaker has suspended is quiet.
-    set_output_max();
-    const std::string wav = wav_for_aplay();
-    pid_t pid = -1;
-    if (!wav.empty()) {
-      pid = spawn_argv({"/usr/bin/aplay", "-q", "-D", "pulse", wav});
-    }
-    if (pid <= 0) {
-      pid = spawn_argv({"/usr/bin/ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                        "-volume", "100", "-af", "apad=pad_dur=0.8", wav_});
-    }
-    if (pid <= 0) {
-      running_.store(false);
-      finished_.store(true);
-      return;
-    }
-    pid_.store(pid);
-    const auto start = std::chrono::steady_clock::now();
-    while (!stop_.load()) {
-      int status = 0;
-      const pid_t r = waitpid(pid, &status, WNOHANG);
-      if (r == pid) {
-        break;
-      }
-      const double elapsed =
-          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-      if (timeout_s_ > 0.0 && elapsed >= timeout_s_) {
-        kill_group(pid);
-        waitpid(pid, &status, 0);
-        break;
-      }
-      std::this_thread::sleep_for(20ms);
-    }
-    pid_.store(0);
-    running_.store(false);
-    finished_.store(true);
-  }
-
-  std::thread th_;
-  std::string wav_;
-  double timeout_s_{3.0};
-  std::atomic<bool> stop_{false};
-  std::atomic<bool> running_{false};
-  std::atomic<bool> finished_{false};
-  std::atomic<pid_t> pid_{0};
-};
 
 // TF rotation is a quaternion. getRPY is ZYX Euler; yaw is rotation
 // about +Z (up) — that is the heading we feed into PoseInBase::yaw.
@@ -543,8 +335,9 @@ class MashaHunterNode : public rclcpp::Node {
                 hunter_.config().enable_wander ? "true" : "false", enabled_targets_.size(),
                 follow_gait_select_, saveli_tag_frame_.c_str(), apriltag_topic_.c_str());
     RCLCPP_INFO(get_logger(), "NAME saveli=%s (%s) cat=%s (%s) cat_silence=%.1fs",
-                saveli_wav_.c_str(), file_exists(saveli_wav_) ? "ok" : "MISSING", cat_wav_.c_str(),
-                file_exists(cat_wav_) ? "ok" : "MISSING", hunter_.config().cat_greet_silence_s);
+                saveli_wav_.c_str(), AudioPlayer::clip_exists(saveli_wav_) ? "ok" : "MISSING",
+                cat_wav_.c_str(), AudioPlayer::clip_exists(cat_wav_) ? "ok" : "MISSING",
+                hunter_.config().cat_greet_silence_s);
   }
 
   ~MashaHunterNode() override { emergency_stop(); }
@@ -1132,7 +925,7 @@ class MashaHunterNode : public rclcpp::Node {
       stopping_ = true;
       hunter_.stop();
     }
-    // player_.stop() joins the ffplay thread — do it outside the mutex
+    // player_.stop() joins the player thread — do it outside the mutex
     // so control_tick is not blocked for the length of the clip.
     player_.stop();
     halt_legs();
@@ -1195,7 +988,7 @@ class MashaHunterNode : public rclcpp::Node {
   double cat_hit_stamp_s_{0.0};       // ROS seconds of the last confirmed cat hit
   CatConfirmState cat_confirm_{};     // detect thread only (detect_cb_group_)
   double cat_track_gate_frac_{0.22};
-  WavPlayer player_;
+  AudioPlayer player_;
   std::mutex mutex_;                  // guards latest_* + hunter_ + cat_hit_
   tf2_ros::Buffer tf_buffer_;         // declared before listener (init order)
   tf2_ros::TransformListener tf_listener_;

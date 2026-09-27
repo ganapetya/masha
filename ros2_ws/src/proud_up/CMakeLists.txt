@@ -62,6 +62,17 @@ if(TARGET Eigen3::Eigen)
   target_link_libraries(follow_the_cat PUBLIC Eigen3::Eigen)
 endif()
 
+# One-shot clip player (aplay / ffplay on a worker thread). No rclcpp.
+# Hunter links this; another node can too. Pass AudioPlayerConfig when
+# the scratch wav or the Pulse boost should differ from the NAME clip.
+find_package(Threads REQUIRED)
+add_library(audio_player STATIC src/audio_player.cpp)
+target_include_directories(audio_player PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(audio_player PUBLIC Threads::Threads)
+
 # Variant-3 omnidirectional tripod map. No rclcpp — gtest links this alone.
 add_library(follow_gait STATIC src/follow_gait.cpp)
 target_include_directories(follow_gait PUBLIC
@@ -139,8 +150,9 @@ target_link_libraries(follow_the_cat_node
   ${OpenCV_LIBS}
 )
 
-# Wiring executable: sensors, TF, servos, audio. Links hunter (policy)
-# + follow_the_cat (YOLO + pinhole + gaze) + proud_up_core (arm pulses).
+# Wiring executable: sensors, TF, servos. Links hunter (policy)
+# + follow_the_cat (YOLO + pinhole + gaze) + proud_up_core (arm pulses)
+# + audio_player (NAME clips). This file does not spawn aplay.
 add_executable(masha_hunter_node src/masha_hunter_node.cpp)
 target_include_directories(masha_hunter_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -165,6 +177,7 @@ target_link_libraries(masha_hunter_node
   follow_gait
   follow_the_cat
   proud_up_core
+  audio_player
   ${OpenCV_LIBS}
 )
 

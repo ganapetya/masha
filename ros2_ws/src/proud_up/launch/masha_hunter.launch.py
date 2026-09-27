@@ -7,7 +7,7 @@ Order of operations (what ROS 2 actually starts):
      so we can parse enable_walk as a real bool (LaunchConfiguration is a
      string until .perform(context)).
   3. Always start masha_hunter_node. Parameter merge order:
-       yaml file  →  then the extra dict (enable_walk, crab, vx_max, …).
+       yaml file  →  then the extra dict (enable_walk, enable_wander, crab, vx_max, …).
      Later entries win. That is why launch args override masha_hunter.yaml.
   4. If enabled_targets contains "saveli", also start apriltag_ros inside
      a component_container. That node publishes TF child saveli_tag.
@@ -39,6 +39,7 @@ def _launch_setup(context, *args, **kwargs):
     params_file = LaunchConfiguration('params_file').perform(context)
     apriltag_params = LaunchConfiguration('apriltag_params').perform(context)
     enable_walk = _as_bool(LaunchConfiguration('enable_walk').perform(context))
+    enable_wander = _as_bool(LaunchConfiguration('enable_wander').perform(context))
     enable_crab = _as_bool(LaunchConfiguration('enable_crab').perform(context))
     dry_run = _as_bool(LaunchConfiguration('dry_run').perform(context))
     enabled_targets = LaunchConfiguration('enabled_targets').perform(context)
@@ -55,6 +56,7 @@ def _launch_setup(context, *args, **kwargs):
             params_file,  # first: yaml defaults
             {             # second: launch args win on these keys
                 'enable_walk': enable_walk,
+                'enable_wander': enable_wander,
                 'enable_crab': enable_crab,
                 'dry_run': dry_run,
                 'enabled_targets': target_list,
@@ -138,6 +140,12 @@ def generate_launch_description():
             'enable_walk',
             default_value='false',
             description='If false, HUNT/NAME only: log Twist, do not publish cmd_vel',
+        ),
+        DeclareLaunchArgument(
+            'enable_wander',
+            default_value='false',
+            description='Hunt body motion. Also needs enable_walk:=true. '
+                        'Open space: slow forward. Wall: yaw toward the open side.',
         ),
         DeclareLaunchArgument(
             'enable_crab',

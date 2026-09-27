@@ -1,8 +1,8 @@
 # Parameters for /masha_hunter_node. ROS 2 bind order (later wins):
 #   1. declare_parameter defaults in masha_hunter_node.cpp
 #   2. this yaml (loaded by masha_hunter.launch.py)
-#   3. launch extra dict: enable_walk, enable_crab, vx_max, vy_max,
-#      dry_run, enabled_targets
+#   3. launch extra dict: enable_walk, enable_wander, enable_crab, vx_max,
+#      vy_max, dry_run, enabled_targets
 #
 # Nodes do not hot-reload this file. Restart the launch after edits.
 #
@@ -24,7 +24,8 @@ masha_hunter_node:
     saveli_tag_frame: saveli_tag
     saveli_tag_id: 0
 
-    # Walk still requires enable_walk:=true on launch. Crab and speed are on.
+    # Walk still requires enable_walk:=true on launch. Wander is
+    # enable_wander:=true and still needs that walk flag. Crab and speed are on.
     # vx_max 0.12 matches voice "go forward". kp_x 0.60 saturates that at ~1 m
     # (e.x = 1.00 − 0.80). Tripod half-cycle at T=0.70 s is ~40 mm, stride cap.
     #
