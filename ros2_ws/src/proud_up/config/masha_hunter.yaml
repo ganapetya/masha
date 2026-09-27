@@ -80,6 +80,14 @@ masha_hunter_node:
     gaze_gain: 0.10
     max_step_pulses: 8.0
     deadband_rad: 0.06
+    # Last confirmed cat stays a hit this long. A 1 s drop resumed the
+    # head sweep and the sitting cat left the picture. Gaze uses only a
+    # detection younger than cat_fresh_s; an older pixel is held, not
+    # chased (a frozen error drives servo 19 to the stop). Once centred,
+    # the head stays until the box moves cat_relock_px.
+    cat_hold_s: 3.0
+    cat_fresh_s: 0.40
+    cat_relock_px: 80.0
 
     # Hunter pose. Tilt is id 22, not 23.
     # 150 = camera-forward (person height). Saveli is a low car; 117 is
@@ -97,7 +105,8 @@ masha_hunter_node:
     # Cat plug only (COCO 15). The live white cat scores about 0.30–0.64
     # (peak ~0.64). Kitchen / empty views stay under ~0.06. Two class-15
     # frames at or above this bar lock the cat; one empty frame does not
-    # drop it. The picture gate is the whole frame (the head is moving).
+    # drop it. The picture gate is the whole frame: the first sighting
+    # can be at the edge of a sweep. After that the head holds.
     person_conf: 0.25
     dnn_cuda: true
 

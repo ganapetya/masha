@@ -17,6 +17,7 @@ using proud_up::from_k_matrix;
 using proud_up::gaze_quaternion;
 using proud_up::GazeAngles;
 using proud_up::GazePulses;
+using proud_up::decide_head_focus;
 using proud_up::integrate_gaze;
 using proud_up::kPi;
 using proud_up::kTicksPerRadian;
@@ -186,6 +187,33 @@ TEST(FollowTheCat, IntegrateGazeStepsFromCurrentNotRest) {
   EXPECT_GT(next.id19, current.id19);
   EXPECT_NE(next.id19, 500.0f + static_cast<float>(0.2 * kTicksPerRadian));
   EXPECT_LE(next.id19 - current.id19, 18.0f + 1e-3f);
+}
+
+TEST(FollowTheCat, HeadFocusAimsThenHoldsAStillCat) {
+  // Off centre and not yet focused: turn the head onto the cat.
+  auto d = decide_head_focus(false, 0.40, 0.0, 0.06, 0.0, 80.0);
+  EXPECT_TRUE(d.gaze);
+  EXPECT_FALSE(d.latched);
+
+  // Inside the deadband: focus is done. A still cat must not move the head.
+  d = decide_head_focus(false, 0.02, -0.01, 0.06, 0.0, 80.0);
+  EXPECT_FALSE(d.gaze);
+  EXPECT_TRUE(d.latched);
+
+  // Box jitter, and even a leftover optical error, stays latched.
+  d = decide_head_focus(true, 0.20, 0.10, 0.06, 30.0, 80.0);
+  EXPECT_FALSE(d.gaze);
+  EXPECT_TRUE(d.latched);
+
+  // The cat walked across the picture: aim again.
+  d = decide_head_focus(true, 0.40, 0.0, 0.06, 120.0, 80.0);
+  EXPECT_TRUE(d.gaze);
+  EXPECT_FALSE(d.latched);
+
+  // She moved, but she is already on the optical axis: latch, do not scan.
+  d = decide_head_focus(true, 0.01, 0.0, 0.06, 120.0, 80.0);
+  EXPECT_FALSE(d.gaze);
+  EXPECT_TRUE(d.latched);
 }
 
 TEST(FollowTheCat, IntegrateGazeSlewLimit) {

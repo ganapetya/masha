@@ -482,6 +482,29 @@ GazePulses integrate_gaze(const GazePulses &current, const GazeAngles &err,
   return out;
 }
 
+HeadFocus decide_head_focus(bool latched, double yaw, double pitch, double deadband_rad,
+                            double pixel_shift_px, double relock_px) {
+  HeadFocus out;
+  const double band = (deadband_rad > 0.0) ? deadband_rad : 0.0;
+  const double relock = (relock_px > 0.0) ? relock_px : 0.0;
+  const bool centered = std::abs(yaw) <= band && std::abs(pitch) <= band;
+  if (!latched) {
+    out.gaze = !centered;
+    out.latched = centered;
+    return out;
+  }
+  // Already looking at her. A sitting cat jitters a few tens of pixels;
+  // that must not restart the pan. A real step across the picture does.
+  if (pixel_shift_px <= relock) {
+    out.gaze = false;
+    out.latched = true;
+    return out;
+  }
+  out.gaze = !centered;
+  out.latched = centered;
+  return out;
+}
+
 bool near_optical_axis(const GazeAngles &angles, double yaw_tol, double pitch_tol) {
   return std::abs(angles.yaw) <= yaw_tol && std::abs(angles.pitch) <= pitch_tol;
 }

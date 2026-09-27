@@ -294,6 +294,25 @@ GazePulses integrate_gaze(const GazePulses &current, const GazeAngles &err,
                           const PulseMapping &map, double gain, double max_step,
                           double deadband_rad);
 
+// Head servo once a cat is already in the picture. The hunt triangle must
+// not keep sweeping across a cat that is sitting still.
+//
+//   not latched, off centre  → gaze (one integrate_gaze step) until focused
+//   not latched, inside deadband → latch and hold
+//   latched, pixel shift ≤ relock_px → hold, even if the box jitters
+//   latched, pixel shift > relock_px → the cat moved; aim again, then latch
+//
+// pixel_shift_px is the distance from the pixel where we latched. Pass 0
+// when there is no latch yet. A latched head ignores optical error on
+// purpose: a still cat must not make servo 19 hunt.
+struct HeadFocus {
+  bool gaze{false};     // true: take one integrate_gaze step this tick
+  bool latched{false};  // true: republish the same pulses; do not scan
+};
+
+HeadFocus decide_head_focus(bool latched, double yaw, double pitch, double deadband_rad,
+                            double pixel_shift_px, double relock_px);
+
 float clamp_pulse(float value, float lo, float hi);
 float clamp_delta(float value, float max_abs);
 

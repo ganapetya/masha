@@ -59,7 +59,8 @@
 //     Snapping servo 19 to pan_min (200) looks ~70° away and loses the tag.
 //  I. play_name → AudioPlayer::play_once. This timer never spawns aplay.
 //  J. apply_legs()  → Halt (Traveling) / SelectGait15 / Twist (cmd_vel)
-//  K. apply_head()  → Hunt: triangle pan. Follow+pixel: integrate_gaze. Else hold.
+//  K. apply_head()  → Hunt with no cat: triangle pan.
+//     Cat pixel: gaze until centred, then hold. A still cat does not scan.
 //  L. publish_overlay() → ~/image_result (rqt / foxglove).
 //
 // ---------------------------------------------------------------------------
@@ -219,6 +220,15 @@ class MashaHunterNode : public rclcpp::Node {
     gaze_gain_ = declare_parameter<double>("gaze_gain", 0.10);
     max_step_pulses_ = declare_parameter<double>("max_step_pulses", 8.0);
     deadband_rad_ = declare_parameter<double>("deadband_rad", 0.06);
+    // YOLO on the white cat gaps for more than 1 s. Dropping the hit at
+    // 1 s resumed the head sweep, the cat left the picture, and the next
+    // sighting was another drive-by. Hold the last hit long enough to
+    // centre and keep walking; search again only after this.
+    cat_hold_s_ = declare_parameter<double>("cat_hold_s", 3.0);
+    // integrate_gaze on a pixel older than this never sees the error
+    // shrink (the image is frozen), so servo 19 runs to the stop.
+    cat_fresh_s_ = declare_parameter<double>("cat_fresh_s", 0.40);
+    cat_relock_px_ = declare_parameter<double>("cat_relock_px", 80.0);
     pulse_map_.yaw_sign = declare_parameter<double>("yaw_sign", -1.0);
     pulse_map_.pitch_sign = declare_parameter<double>("pitch_sign", 1.0);
     pulse_map_.pan_min = pan_min_;
@@ -599,17 +609,20 @@ class MashaHunterNode : public rclcpp::Node {
       cat_stamp_s = cat_hit_stamp_s_;
       prev = hunter_.phase();
     }
+    bool cat_fresh = false;
     if (cat_hit) {
-      // Longer than Saveli's pose_max_age. YOLO on the moving head often
-      // skips a few tenths of a second; 0.40 s made a visible cat go stale
-      // before the next good frame.
-      const double max_age = 1.0;
+      // Longer than Saveli's pose_max_age, and longer than one missed
+      // YOLO frame. The head must stay on the last cat while this lasts
+      // so a sitting cat is not scanned out of the picture.
+      const double max_age = cat_hold_s_ > 0.2 ? cat_hold_s_ : 3.0;
       const double age = now().seconds() - cat_stamp_s;
+      cat_fresh = cat_hit->id == "cat" && age <= cat_fresh_s_;
       if (age > max_age) {
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-                             "cat hit stale (%.2f s > %.2f). Coast, do not lock a ghost.", age,
-                             max_age);
+                             "cat hit stale (%.2f s > %.2f). Search again.", age, max_age);
         cat_hit.reset();
+        cat_fresh = false;
+        cat_head_latched_ = false;
         std::lock_guard<std::mutex> lock(mutex_);
         if (cat_hit_stamp_s_ == cat_stamp_s) {
           cat_hit_.reset();
@@ -701,7 +714,7 @@ class MashaHunterNode : public rclcpp::Node {
     }
 
     apply_legs(out);
-    apply_head(out, hit, info);
+    apply_head(out, hit, info, cat_fresh);
     publish_overlay(out, hit, d_min, image);
   }
 
@@ -743,17 +756,68 @@ class MashaHunterNode : public rclcpp::Node {
     }
   }
 
-  // Three head modes, in this order:
-  //   Hunt (pan_head)  triangle sweep on servo 19, tilt held at rest
-  //   Follow + pixel   integrate_gaze: small step toward the box centre
-  //   else             hold the last pan/tilt (Name, Stopped, TF-only Saveli)
-  // duration_s = 0.08 ≈ one control period, so the bus tracks the triangle
+  // Head modes, in this order:
+  //   Cat pixel   stop the triangle. Gaze until the box is centred, then
+  //               hold. A still cat does not rotate the head. A cat that
+  //               steps across the picture (cat_relock_px) is aimed again.
+  //   Hunt pan    triangle sweep on servo 19, tilt held at rest. Only when
+  //               there is no cat pixel — a visible cat must not be scanned.
+  //   else        hold the last pan/tilt (Saveli TF, coast with no pixel)
+  // duration_s = 0.08 ≈ one control period, so the bus tracks a sweep
   // instead of blending a 1 s move toward a pan that has already changed.
+  // cat_fresh is false when the pixel is older than cat_fresh_s_. Do not
+  // integrate that frozen error: the head would run to the pan stop.
   void apply_head(const HunterOutput &out, const std::optional<TargetHit> &hit,
-                  sensor_msgs::msg::CameraInfo::ConstSharedPtr info) {
+                  sensor_msgs::msg::CameraInfo::ConstSharedPtr info, bool cat_fresh) {
     ArmPulses arm = rest_;
     arm.duration_s = 0.08;
-    if (out.pan_head) {
+    const bool cat_seen = hit && hit->id == "cat" && hit->pose.has_pixel &&
+                          out.phase != HunterPhase::Idle;
+    const bool can_gaze = cat_seen && info && info->k.size() >= 9;
+    if (cat_seen && !can_gaze) {
+      // Cat is in the picture but this tick has no camera matrix. Hold.
+      // Do not start the hunt triangle.
+      arm.id19 = gaze_id19_;
+      arm.id22 = gaze_id22_;
+    } else if (can_gaze) {
+      CameraIntrinsics K = from_k_matrix(static_cast<int>(info->width),
+                                         static_cast<int>(info->height), info->k.data());
+      const Eigen::Vector3d ray = pixel_to_ray(hit->pose.u, hit->pose.v, K);
+      const GazeAngles err = ray_to_yaw_pitch(ray);
+      const double shift = cat_head_latched_
+                               ? std::hypot(hit->pose.u - cat_head_u_, hit->pose.v - cat_head_v_)
+                               : 0.0;
+      HeadFocus focus;
+      if (cat_fresh) {
+        focus = decide_head_focus(cat_head_latched_, err.yaw, err.pitch, deadband_rad_, shift,
+                                  cat_relock_px_);
+      } else {
+        // Remembered cat, no new frame. Hold the aim. Do not scan.
+        focus.gaze = false;
+        focus.latched = cat_head_latched_;
+      }
+      if (focus.latched && !cat_head_latched_) {
+        cat_head_u_ = hit->pose.u;
+        cat_head_v_ = hit->pose.v;
+        RCLCPP_INFO(get_logger(),
+                    "cat focused: head hold pan %.0f tilt %.0f. Still cat, not scanning.",
+                    gaze_id19_, gaze_id22_);
+      } else if (!focus.latched && cat_head_latched_) {
+        RCLCPP_INFO(get_logger(), "cat moved in the image (%.0f px): re-aim, then hold.",
+                    shift);
+      }
+      cat_head_latched_ = focus.latched;
+      if (focus.gaze) {
+        const GazePulses next =
+            integrate_gaze({gaze_id19_, gaze_id22_}, err, pulse_map_, gaze_gain_, max_step_pulses_,
+                           deadband_rad_);
+        gaze_id19_ = next.id19;
+        gaze_id22_ = next.id22;
+      }
+      arm.id19 = gaze_id19_;
+      arm.id22 = gaze_id22_;
+    } else if (out.pan_head) {
+      cat_head_latched_ = false;
       const double t = now().seconds();
       const double elapsed = t - hunt_pan_t0_;
       const double period = pan_period_s_ > 1.0 ? pan_period_s_ : 10.0;
@@ -773,19 +837,6 @@ class MashaHunterNode : public rclcpp::Node {
       if (elapsed >= period) {
         pan_sweep_done_ = true;
       }
-    } else if (out.phase == HunterPhase::Follow && hit && hit->pose.has_pixel && info &&
-               info->k.size() >= 9) {
-      CameraIntrinsics K = from_k_matrix(static_cast<int>(info->width),
-                                         static_cast<int>(info->height), info->k.data());
-      const Eigen::Vector3d ray = pixel_to_ray(hit->pose.u, hit->pose.v, K);
-      const GazeAngles err = ray_to_yaw_pitch(ray);
-      const GazePulses next =
-          integrate_gaze({gaze_id19_, gaze_id22_}, err, pulse_map_, gaze_gain_, max_step_pulses_,
-                         deadband_rad_);
-      gaze_id19_ = next.id19;
-      gaze_id22_ = next.id22;
-      arm.id19 = next.id19;
-      arm.id22 = next.id22;
     } else {
       arm.id19 = gaze_id19_;
       arm.id22 = gaze_id22_;
@@ -909,6 +960,7 @@ class MashaHunterNode : public rclcpp::Node {
       hunter_.start();
       hunt_pan_t0_ = now().seconds();
       pan_sweep_done_ = false;
+      cat_head_latched_ = false;
       gaze_id19_ = rest_.id19;
       gaze_id22_ = rest_.id22;
     }
@@ -969,6 +1021,12 @@ class MashaHunterNode : public rclcpp::Node {
   double gaze_gain_{0.10};
   double max_step_pulses_{8.0};
   double deadband_rad_{0.06};
+  double cat_hold_s_{3.0};           // keep the last cat this long before scanning again
+  double cat_fresh_s_{0.40};         // only this new a pixel may move the head
+  double cat_relock_px_{80.0};       // latched head re-aims only after a real step
+  bool cat_head_latched_{false};     // focused on a still cat; servos 19/22 hold
+  double cat_head_u_{0.0};           // pixel where the latch closed
+  double cat_head_v_{0.0};
   double walk_watchdog_s_{0.3};
   double pose_max_age_s_{0.40};
   double hunt_pan_t0_{0.0};          // ROS time when the current Hunt sweep started
