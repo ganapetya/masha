@@ -1,13 +1,13 @@
 # Masha hunter — pluggable target (Saveli first)
 
-**Status:** plan only. Do **not** implement until Peter asks.  
+**Status:** hunter is live in `proud_up` (Saveli sticker and cat). Operator recipe is [Start Instructions](#start-instructions). The rest of this file is the design record.  
 **Source:** host clipboard paste (2026-09-16) titled “Step 2 Execution Plan: Masha Following Savelij (Mecanum Car)”.  
 **This memo:** feasibility against Masha as she actually runs (Jetson Orin NX, ROS 2 Humble, `ROS_DOMAIN_ID=27`, `proud_up`, Aurora 930, LD19, bus servos).  
 **Name:** the other robot is **Saveli** in the trio docs; the clipboard used **Savelij**. Same machine. This file uses **Saveli**.  
 **Revision (2026-09-16, later same day):** custom gait is **in scope**. Map pick: **variant 3 — omnidirectional tripod.**  
 **Revision (2026-09-16, hunter):** Saveli is the **first plug**, not the product. End goal is a spider **hunter**: deep stand, slow head scan, recognize, **call the target by name**, follow ≤ **60 s** or until lost, then scan again. Node: **`masha_hunter_node`**. Next plug: **cat**. Filename kept for the GitHub URL.  
 **Revision (2026-09-16, wander):** No SLAM / Nav2. Optional HUNT rule: go into open space, halt at an obstacle, rotate, look again. Default **off**.  
-**Revision (2026-09-17, start):** Hunter is live in `proud_up`. Operator recipe is [Start Instructions](#start-instructions). Launch **must** pass `enable_walk:=true` (yaml/launch default is **false**). Crab-follow run: `enable_crab:=true` `vx_max:=0.12` `vy_max:=0.08`.
+**Revision (2026-09-27, start):** The 2026-09-17 block sourced `setup.bash` and launched with `enable_walk:=true` as the first command. This machine is zsh: `~/ros2_ws/.robotrc` sources `local_setup.zsh` plus the third-party overlays. First lock is walk **off**. Cat is in the same node: `enabled_targets:=cat`, or `saveli,cat` when a visible cat must beat the sticker.
 
 Related reading (do not re-derive):
 
@@ -20,76 +20,123 @@ Related reading (do not re-derive):
 
 ## Start Instructions
 
-Checked on Masha (2026-09-17). These files exist:
+Checked on Masha (2026-09-27), against `masha_hunter.launch.py` and `masha_hunter.yaml`.
 
-| File | Role |
-|---|---|
-| `/opt/ros/humble/setup.bash` | ROS 2 Humble (`setup.zsh` also exists) |
-| `~/ros2_ws/install/setup.bash` | overlay with `proud_up` (`setup.zsh` also exists) |
-| `~/ros2_ws/.typerc` | `ROS_DOMAIN_ID=27` |
-| `~/ros2_ws/src/proud_up/launch/masha_hunter.launch.py` | launch args below |
-| `~/ros2_ws/src/proud_up/config/masha_hunter.yaml` | node params (overridden by launch args) |
-
-A normal Masha zsh already sources `.typerc` + Humble + the overlay via `.robotrc`. Re-source anyway so a bare terminal still sees domain **27** and `masha_hunter_node`. Do **not** run `~/.stop_ros.sh`. Slim bringup is assumed already up. Do **not** start `follow_the_cat` or `masha_interaction` with the hunter. Unplug Masha’s joystick (shared 2.4 GHz pad with Saveli). Place Savelij ~**0.8–1.0 m** in front, rear **36h11 id 0** facing the camera.
-
-Launch args do **not** hot-reload. Ctrl-C the old hunter, then relaunch.
-
-### Terminal 1 — launch
+A normal Masha zsh already sourced `~/ros2_ws/.robotrc` (Humble `local_setup.zsh`, `ros2_ws`, third-party overlays, `.typerc`, domain **27**). A bare terminal:
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-source ~/ros2_ws/.typerc
+source ~/ros2_ws/.robotrc
+echo $ROS_DOMAIN_ID
+```
+
+That must print `27`. Leave slim bringup up. Do **not** run `~/.stop_ros.sh`. Do **not** start `follow_the_cat` or `masha_interaction` beside the hunter. Unplug Masha’s joystick (same 2.4 GHz pad as Saveli).
+
+Launch args do **not** hot-reload. Ctrl-C the old hunter, then relaunch. After a C++ edit: `colcon build --packages-select proud_up`, then a new shell (or source `.robotrc` again) before launch.
+
+`vx_max` (0.12), `vy_max` (0.08), `enable_crab` (true), and `dry_run` (false) are already the launch defaults. Pass them only when you want a different number. `enable_wander` stays false unless yaml says otherwise.
+
+### Launch arguments
+
+| Argument | Launch default | What it does |
+|---|---|---|
+| `enabled_targets` | `saveli` | Comma list. `apriltag_ros` starts only when `saveli` is listed. `cat` loads `yolov8n.onnx` (COCO class 15). |
+| `enable_walk` | **`false`** | False: HUNT/NAME/gaze, log Twist, do not publish `/controller/cmd_vel`. |
+| `enable_crab` | `true` | Side offset uses `vy` when `\|bearing\| < 15°` and `\|y\| > 6 cm`. |
+| `vx_max` | `0.12` | Forward cap m/s (voice “go forward” is 0.12). |
+| `vy_max` | `0.08` | Crab cap m/s (`move_controller` also clamps 0.10). |
+| `dry_run` | `false` | Log servo / Traveling / Twist and skip publishes. |
+| `params_file` | `proud_up/config/masha_hunter.yaml` | Node YAML. |
+| `apriltag_params` | `proud_up/config/apriltag_36h11_savelij.yaml` | Tag size in metres (not the 0.08 stock default). |
+
+Constructor log must contain `masha_hunter enable_walk=… enable_crab=…` and `NAME saveli=… (ok) cat=… (ok)`. `(MISSING)` means the mp3 path is wrong and NAME will time out with no sound. Clips: `call-savelij.mp3` and `call-kitten.mp3` under `~/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/`. Hunter plays those with `ffplay`.
+
+### Terminal 2 — start / stop
+
+```bash
+source ~/ros2_ws/.robotrc
+ros2 service call /masha_hunter_node/start std_srvs/srv/Trigger {}
+```
+
+The node stays Idle until this call. The head then sweeps (servo 19). Tilt stays at the hunter pose (id 22 = 117, low, for the car and a cat on the floor).
+
+If the call sits on “waiting for service”, the launch process can still be up while `masha_hunter_node` has died. `ros2 node list` must show `/masha_hunter_node`.
+
+Stop (centres the head, stand with Traveling `gait=-2`, back to Idle). A zero Twist is a march in place, so stop is this service, not `cmd_vel` zeros:
+
+```bash
+ros2 service call /masha_hunter_node/stop std_srvs/srv/Trigger {}
+```
+
+Watch:
+
+```bash
+ros2 topic echo /masha_hunter_node/image_result
+ros2 topic echo /controller/cmd_vel
+ros2 topic echo /apriltag/apriltag_detections
+ros2 run tf2_ros tf2_echo base_link saveli_tag
+```
+
+With walk off, `/controller/cmd_vel` stays quiet. The launch terminal still prints the Twist she would have sent.
+
+### 1. Saveli, look only
+
+Place Saveli about **0.8–1.0 m** in front, rear **36h11 id 0** facing the camera.
+
+```bash
 ros2 launch proud_up masha_hunter.launch.py \
   enabled_targets:=saveli \
-  enable_walk:=true \
-  enable_crab:=true \
-  vx_max:=0.12 \
-  vy_max:=0.08 \
-  dry_run:=false
+  enable_walk:=false
 ```
 
-First log line must show `enable_walk=true enable_crab=true`. `enable_wander` stays **false** unless you pass it in yaml. First lock is safer with `enable_walk:=false` (Twist is logged only; legs stay in hunter pose). After a clean lock, relaunch with walk on.
+Then `~/start`. One `call-savelij` on the first lock. Cover the tag: she returns to the sweep. Show it again within 20 s: no second clip. Overlay is `~/image_result` (phase, `r`, `θ`). Empty `/apriltag/apriltag_detections` means the tag is out of view, not 36h11 id 0, or has no white margin. `tf2_echo` failing while detections are non-empty means the child frame is `tag36h11:0` rather than `saveli_tag` (the node accepts both).
 
-### Launch arguments (all of them)
+### 2. Saveli, follow
 
-| Argument | This run | Launch default | What it does |
-|---|---|---|---|
-| `enabled_targets` | `saveli` | `saveli` | Which plugs run. `apriltag_ros` starts only if `saveli` is listed. |
-| `enable_walk` | **`true`** | **`false`** | If false: HUNT/NAME only, log Twist, do not publish `/controller/cmd_vel`. |
-| `enable_crab` | **`true`** | `true` | Side offset uses `vy` when `\|bearing\| < 15°` and `\|y\| > 6 cm`. |
-| `vx_max` | `0.12` | `0.12` | Forward cap m/s (voice “go forward” is 0.12). |
-| `vy_max` | `0.08` | `0.08` | Crab cap m/s (`move_controller` also clamps 0.10). |
-| `dry_run` | `false` | `false` | Log servo / Traveling / Twist and skip publishes. |
-| `params_file` | (omit) | `proud_up/config/masha_hunter.yaml` | Node YAML. |
-| `apriltag_params` | (omit) | `proud_up/config/apriltag_36h11_savelij.yaml` | Tag size in metres (not the 0.08 stock default). |
-
-### Terminal 2 — start / watch / stop
+Floor clear. Ctrl-C the look-only launch, then:
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-source ~/ros2_ws/.typerc
-ros2 service call /masha_hunter_node/start std_srvs/srv/Trigger
+ros2 launch proud_up masha_hunter.launch.py \
+  enabled_targets:=saveli \
+  enable_walk:=true
 ```
 
-Watch crab (same terminal after start, or a third one):
+`~/start` again. Log line `enable_walk=true`. She selects Traveling gait 15 once, then publishes `/controller/cmd_vel`.
+
+- **Crab:** `linear.y` nonzero and the log says `crab=true`.
+- **Yaw first:** `\|bearing\| ≥ 15°`, so `angular.z` moves and `linear.y` stays 0.
+- LiDAR closer than 0.55 m: she stands until the range opens past 0.70 m.
+
+### 3. Cat, look only
+
+No sticker required. A real cat or a clear photo is enough for this run. This launch does **not** start `apriltag_ros`.
 
 ```bash
-ros2 topic echo /controller/cmd_vel
+ros2 launch proud_up masha_hunter.launch.py \
+  enabled_targets:=cat \
+  enable_walk:=false
 ```
 
-- **Sideways = crab gated on:** `linear.y` nonzero (and hunter log `crab=true`).
-- **Pure turn-in-place again:** crab **not** gated. Saveli is too far around (`\|bearing\| ≥ 15°`); policy yaws first (`angular.z`, `linear.y = 0`).
-- If start hangs on “waiting for service”, launch + AprilTag can still be up while `masha_hunter_node` has died. Confirm the node is in `ros2 node list`. Watch `/apriltag/apriltag_detections` and `/masha_hunter_node/image_result`. Non-empty detections = tag seen.
+`~/start`. She names the cat only after **4** detect ticks in a row, and only when COCO class 15 is the winning class on that box. One `call-kitten`. Overlay circle labelled `cat`. Cover her: sweep. Show her again within 20 s: gaze, no second clip. A chair or an empty sweep for half a minute should stay silent.
 
-Stop:
+She will look and speak from a pixel alone. She will **not** walk on a pixel or on the bbox-height guess. Walk needs a real Aurora depth at the box centre (0.15–4 m) so the pose is in `base_link`.
+
+### 4. Sticker and cat together
 
 ```bash
-ros2 service call /masha_hunter_node/stop std_srvs/srv/Trigger
+ros2 launch proud_up masha_hunter.launch.py \
+  enabled_targets:=saveli,cat \
+  enable_walk:=false
 ```
 
-Stop centres the head, halt-stands (`gait=-2`), returns IDLE. Halt is Traveling `gait=-2`, **not** a zero Twist (zero Twist marches in place).
+A visible cat wins, including when she is already locked on the sticker: she halts, plays `call-kitten` once, and keeps the cat. A one-frame miss does not hand the lock back to Saveli. After the cat has been gone for `lost_timeout` (1.5 s) she may name the sticker. Uncover the cat while she is on the sticker: kitten clip again.
+
+Turn walk on for this pair only after the cat overlay range matches a tape measure within about 10 cm at 1 m, and only with the floor clear:
+
+```bash
+ros2 launch proud_up masha_hunter.launch.py \
+  enabled_targets:=saveli,cat \
+  enable_walk:=true
+```
 
 ### Crab gate and yaml (not launch args)
 
@@ -102,7 +149,7 @@ C++ defaults (not overlaid by the launch line above):
 | `wz_max` | 0.30 rad/s | yaw cap; while crabbing, `ωz` is scaled ×0.3 |
 | `r_target` | 0.80 m | follow standoff |
 | `d_stop` / `d_go` | 0.55 / 0.70 m | LiDAR latch in `base_link` |
-| `lost_timeout` | 1.5 s | FOLLOW → HUNT after no fresh TF |
+| `lost_timeout` | 1.5 s | FOLLOW → HUNT after no fresh hit. A cat lock releases here, so Saveli can be named on a later tick |
 | `pose_max_age` | 0.40 s | older TF is not a live hit (coast) |
 | `walk_watchdog` | 0.30 s | no `cmd_vel` → halt |
 | `follow_max_s` | 60 | then back to HUNT |
