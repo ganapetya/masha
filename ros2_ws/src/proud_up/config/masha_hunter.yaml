@@ -103,6 +103,9 @@ masha_hunter_node:
     # NAME clips. Paths are mp3; hunter plays them with ffplay (aplay is wav-only).
     saveli_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/call-savelij.mp3
     cat_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/call-kitten.mp3
+    # While the cat stays in view, play call-kitten again after this much
+    # quiet. The clock starts when the clip finishes, not when it starts.
+    cat_greet_silence_s: 5.0
     # Stay in NAME until aplay drains. 5 s was tight once the USB speaker
     # woke up slowly: Follow started walking over the last syllable.
     name_timeout_s: 8.0

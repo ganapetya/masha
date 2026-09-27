@@ -208,11 +208,59 @@ void Hunter::stop() {
   lidar_latched_ = false;
   wander_kind_ = 0;
   last_twist_ = {};
+  name_playing_ = false;
+  greet_loop_ = false;
+  greet_silence_open_ = false;
   enter(HunterPhase::Idle, now_);
 }
 
 void Hunter::notify_name_done() {
+  end_name_clip(now_);
+}
+
+void Hunter::notify_name_done(double now_s) {
+  end_name_clip(now_s);
+}
+
+void Hunter::end_name_clip(double now_s) {
+  if (!name_playing_) {
+    return;
+  }
   name_playing_ = false;
+  if (!greet_loop_) {
+    return;
+  }
+  greet_silent_since_ = now_s;
+  greet_silence_open_ = true;
+}
+
+void Hunter::maybe_regreet_cat(const std::optional<TargetHit> &seen, double now_s, HunterOutput &o) {
+  if (o.play_name || name_playing_ || !greet_silence_open_) {
+    return;
+  }
+  if (phase_ == HunterPhase::Idle || phase_ == HunterPhase::Name) {
+    return;
+  }
+  if (!seen || seen->id != "cat") {
+    return;
+  }
+  if ((now_s - greet_silent_since_) < cfg_.cat_greet_silence_s) {
+    return;
+  }
+  // Stay in the current phase. Re-entering Name would halt and restart
+  // the follow clock; the repeat is the clip only.
+  name_playing_ = true;
+  greet_loop_ = true;
+  greet_silence_open_ = false;
+  named_this_lock_ = true;
+  last_named_id_ = seen->id;
+  last_named_t_ = now_s;
+  o.play_name = true;
+}
+
+HunterOutput Hunter::finish_tick(HunterOutput o, const std::optional<TargetHit> &seen, double now_s) {
+  maybe_regreet_cat(seen, now_s, o);
+  return o;
 }
 
 void Hunter::notify_halted() {
@@ -241,6 +289,8 @@ bool Hunter::name_this_hit(const TargetHit &hit, const std::string &prev_sticky,
 void Hunter::arm_name(const TargetHit &hit, double now_s, HunterOutput &o) {
   pending_wav_ = hit.spoken_wav;
   name_playing_ = true;
+  greet_silence_open_ = false;
+  greet_loop_ = (hit.id == "cat");
   named_this_lock_ = true;
   last_named_id_ = hit.id;
   last_named_t_ = now_s;
@@ -381,8 +431,12 @@ HunterOutput Hunter::hunt_motion(double d_min, bool pan_sweep_done, double left_
 //   4. Cat replacing another lock (Follow / Name / Stopped) enters NAME.
 //   5. Hunt: maybe skip NAME (already named this lock), else NAME or wander.
 //   6. Name: freeze until notify_name_done() or name_timeout_s.
+//      The timeout leaves Name but leaves name_playing_ set, so the cat
+//      silence clock still starts when the clip actually finishes.
 //   7. Follow / Stopped: 60 s cap, LiDAR hysteresis, coast on a brief miss,
 //      else PD Twist. Zero Twist → Halt, never publish Twist{0,0,0}.
+//   8. Cat still in this sighting and cat_greet_silence_s of quiet: play_name
+//      again. finish_tick() does that on the way out. Lost clears the loop.
 HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, double d_min,
                           bool pan_sweep_done, double left_open, double right_open) {
   now_ = now_s;
@@ -414,7 +468,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     o.phase = HunterPhase::Idle;
     o.legs = LegCommandKind::Halt;
     o.pan_head = false;
-    return o;
+    return finish_tick(o, seen, now_s);
   }
 
   const bool lost = !seen && (now_s - last_hit_t_) > cfg_.lost_timeout;
@@ -428,6 +482,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
   if (lost && sticky_id_ == "cat") {
     sticky_id_.clear();
     o.sticky_id.clear();
+    greet_silence_open_ = false;
   }
 
   // Visible cat beats a sticker lock that is already in Follow / Name /
@@ -435,7 +490,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
   if (seen && seen->id == "cat" && prev_sticky != "cat" && phase_ != HunterPhase::Hunt &&
       name_this_hit(*seen, prev_sticky, now_s)) {
     arm_name(*seen, now_s, o);
-    return o;
+    return finish_tick(o, seen, now_s);
   }
 
   if (phase_ == HunterPhase::Hunt) {
@@ -445,25 +500,26 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       o = hunt_motion(d_min, pan_sweep_done, left_open, right_open);
       o.sticky_id = sticky_id_;
       o.d_min = d_min;
-      return o;
+      return finish_tick(o, seen, now_s);
     }
     if (ignore_until_sweep_ && pan_sweep_done) {
       ignore_until_sweep_ = false;
     }
     if (seen) {
-      // Same id inside search_timeout_s: gaze and follow, do not shout.
+      // Same id inside search_timeout_s: Follow, no new Name phase.
+      // A cat that never left still repeats from finish_tick.
       // A different id, and any Saveli → cat switch, plays NAME.
       if (!name_this_hit(*seen, prev_sticky, now_s)) {
         enter(HunterPhase::Follow, now_s);
       } else {
         arm_name(*seen, now_s, o);
-        return o;
+        return finish_tick(o, seen, now_s);
       }
     } else {
       o = hunt_motion(d_min, pan_sweep_done, left_open, right_open);
       o.sticky_id = sticky_id_;
       o.d_min = d_min;
-      return o;
+      return finish_tick(o, seen, now_s);
     }
   }
 
@@ -471,13 +527,13 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     o.phase = HunterPhase::Name;
     o.legs = LegCommandKind::Halt;
     o.pan_head = false;
-    // name_playing_ is cleared by notify_name_done() from the node when
-    // ffplay exits. The timeout is the safety net if the clip is missing.
+    // notify_name_done() clears name_playing_ when aplay exits. The
+    // timeout leaves Name if that never arrives. It must not clear
+    // name_playing_: the cat silence clock starts at the real clip end.
     if (!name_playing_ || (now_s - phase_t_) >= cfg_.name_timeout_s) {
-      name_playing_ = false;
       enter(HunterPhase::Follow, now_s);
     } else {
-      return o;
+      return finish_tick(o, seen, now_s);
     }
   }
 
@@ -493,7 +549,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       o.legs = LegCommandKind::Halt;
       o.pan_head = true;
       o.wander_action = "hold";
-      return o;
+      return finish_tick(o, seen, now_s);
     }
 
     // Hysteresis: enter Stopped at d_stop, leave only after d_go. Without
@@ -521,7 +577,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
         o.phase = HunterPhase::Hunt;
         o.pan_head = true;
       }
-      return o;
+      return finish_tick(o, seen, now_s);
     }
 
     if (!seen && lost) {
@@ -530,7 +586,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       o.phase = HunterPhase::Hunt;
       o.legs = LegCommandKind::Halt;
       o.pan_head = true;
-      return o;
+      return finish_tick(o, seen, now_s);
     }
 
     o.phase = HunterPhase::Follow;
@@ -543,20 +599,20 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       o.crab = crab_;
       if (!cfg_.enable_walk) {
         o.legs = LegCommandKind::None;
-        return o;
+        return finish_tick(o, seen, now_s);
       }
       if (twist_is_zero(last_twist_)) {
         o.legs = LegCommandKind::Halt;
         gait15_sent_ = false;
-        return o;
+        return finish_tick(o, seen, now_s);
       }
       if (!gait15_sent_) {
         o.legs = LegCommandKind::SelectGait15;
         gait15_sent_ = true;
-        return o;
+        return finish_tick(o, seen, now_s);
       }
       o.legs = LegCommandKind::Twist;
-      return o;
+      return finish_tick(o, seen, now_s);
     }
 
     const TwistBody t = follow_twist(seen->pose, dt);
@@ -565,26 +621,26 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     o.crab = crab_;
     if (!cfg_.enable_walk) {
       o.legs = LegCommandKind::None;
-      return o;
+      return finish_tick(o, seen, now_s);
     }
     // Inside deadband: stand. Next non-zero Twist must SelectGait15 again.
     if (twist_is_zero(t)) {
       o.legs = LegCommandKind::Halt;
       gait15_sent_ = false;
-      return o;
+      return finish_tick(o, seen, now_s);
     }
     if (!gait15_sent_) {
       o.legs = LegCommandKind::SelectGait15;
       gait15_sent_ = true;
-      return o;
+      return finish_tick(o, seen, now_s);
     }
     o.legs = LegCommandKind::Twist;
-    return o;
+    return finish_tick(o, seen, now_s);
   }
 
   o.phase = phase_;
   o.legs = LegCommandKind::Halt;
-  return o;
+  return finish_tick(o, seen, now_s);
 }
 
 }  // namespace proud_up

@@ -464,3 +464,91 @@ TEST(Hunter, ConfirmCatNeedsTwoCentresAndKeepsOneMiss) {
   }
   EXPECT_TRUE(confirm_cat_hit(jumped, far, 40.0).has_value());
 }
+
+// call-kitten again after 5 s of quiet, while this sighting lasts.
+// The repeat stays in Follow: legs are not forced back through Name.
+TEST(Hunter, CatGreetingLoopsAfterFiveSecondsOfSilence) {
+  auto cfg = walk_cfg();
+  cfg.cat_greet_silence_s = 5.0;
+  Hunter h(cfg);
+  h.start();
+  auto o = h.tick(0.0, cat_at(1.20, 0.0), 2.0, true);
+  ASSERT_EQ(o.phase, HunterPhase::Name);
+  ASSERT_TRUE(o.play_name);
+  h.notify_name_done();
+
+  o = h.tick(4.9, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_FALSE(o.play_name);
+
+  o = h.tick(5.0, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_TRUE(o.play_name);
+  EXPECT_EQ(o.legs, LegCommandKind::Twist);
+
+  o = h.tick(5.05, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_FALSE(o.play_name);
+
+  h.notify_name_done();
+  o = h.tick(10.0, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_FALSE(o.play_name);
+  o = h.tick(10.05, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_TRUE(o.play_name);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+}
+
+TEST(Hunter, CatGreetingSurvivesAShortMiss) {
+  auto cfg = walk_cfg();
+  cfg.lost_timeout = 1.5;
+  Hunter h(cfg);
+  h.start();
+  h.tick(0.0, cat_at(1.20, 0.0), 2.0, true);
+  h.notify_name_done();
+  h.tick(4.0, cat_at(1.20, 0.0), 2.0, true);
+  auto o = h.tick(4.4, std::nullopt, 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_FALSE(o.play_name);
+  o = h.tick(5.0, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_TRUE(o.play_name);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+}
+
+TEST(Hunter, CatGreetingStopsAfterTheSightingIsLost) {
+  auto cfg = walk_cfg();
+  cfg.lost_timeout = 1.5;
+  cfg.search_timeout_s = 20.0;
+  Hunter h(cfg);
+  h.start();
+  h.tick(0.0, cat_at(1.20, 0.0), 2.0, true);
+  h.notify_name_done();
+  h.tick(0.30, cat_at(1.20, 0.0), 2.0, true);
+  auto o = h.tick(2.0, std::nullopt, 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Hunt);
+  o = h.tick(8.0, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_FALSE(o.play_name);
+}
+
+TEST(Hunter, SaveliGreetingDoesNotLoop) {
+  Hunter h(walk_cfg());
+  h.start();
+  h.tick(0.0, saveli_at(1.20, 0.0), 2.0, true);
+  h.notify_name_done();
+  auto o = h.tick(10.0, saveli_at(1.20, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_FALSE(o.play_name);
+}
+
+TEST(Hunter, CatGreetingLoopsWhileStandingClose) {
+  Hunter h(walk_cfg());
+  h.start();
+  h.tick(0.0, cat_at(0.40, 0.0), 0.40, true);
+  h.notify_name_done();
+  auto o = h.tick(0.30, cat_at(0.40, 0.0), 0.40, true);
+  EXPECT_EQ(o.phase, HunterPhase::Stopped);
+  EXPECT_FALSE(o.play_name);
+  o = h.tick(5.0, cat_at(0.40, 0.0), 0.40, true);
+  EXPECT_EQ(o.phase, HunterPhase::Stopped);
+  EXPECT_TRUE(o.play_name);
+  EXPECT_EQ(o.legs, LegCommandKind::Halt);
+}

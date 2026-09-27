@@ -15,6 +15,10 @@
 //                         ^                                       |
 //                         +-- lost / 60 s / LiDAR STOPPED --------+
 //
+// A cat that stays in view is greeted again after cat_greet_silence_s of
+// quiet. The clock starts when the clip finishes. That repeat sets
+// play_name and does not leave Follow, Stopped, or Hunt.
+//
 // tick() inputs (what the node must gather BEFORE calling):
 //   now_s          ROS clock seconds (monotonic enough for dt)
 //   hit            Saveli and/or cat, already in base_link, or nullopt
@@ -88,6 +92,9 @@ struct HunterConfig {
   double follow_max_s{60.0};
   double search_timeout_s{20.0};  // forget sticky_id; also NAME skip window
   double name_timeout_s{8.0};     // NAME → Follow even if aplay hangs
+  // Quiet gap before call-kitten plays again, while this cat sighting lasts.
+  // Measured from when the clip finishes, not from when it starts.
+  double cat_greet_silence_s{5.0};
   double vx_max{0.05};
   double vy_max{0.04};
   double wz_max{0.30};
@@ -162,7 +169,7 @@ struct HunterOutput {
   LegCommandKind legs{LegCommandKind::None};
   TwistBody twist;
   bool pan_head{false};   // Hunt: node runs the triangle sweep on servo 19
-  bool play_name{false};  // rising edge: node starts ffplay this tick only
+  bool play_name{false};  // rising edge: node starts the NAME clip this tick only
   bool crab{false};
   std::string sticky_id;
   double r{0.0};
@@ -222,7 +229,11 @@ class Hunter {
 
   void start();  // Idle → Hunt. Called from ~/start.
   void stop();   // any phase → Idle. Clears sticky / crab / gait latch.
-  void notify_name_done();  // WavPlayer finished (or missing file). Name → Follow.
+  void notify_name_done();  // clip finished; silence clock uses the last tick time
+  void notify_name_done(double now_s);  // same, stamped on the node's clock
+  // True from play_name until notify_name_done(). The Name-phase timeout
+  // does not clear this: aplay may still be draining.
+  bool name_playing() const { return name_playing_; }
   // Walk watchdog (or any external halt) stood the legs. Next Twist
   // must SelectGait15 again — the controller forgets cmd_gait=5 after stand.
   void notify_halted();
@@ -243,6 +254,13 @@ class Hunter {
   // does not. named_this_lock_ skips a second clip for the current lock.
   bool name_this_hit(const TargetHit &hit, const std::string &prev_sticky, double now_s) const;
   void arm_name(const TargetHit &hit, double now_s, HunterOutput &o);
+  // Clip actually finished (player exit, or a missing file). Opens the
+  // cat silence clock. The Name-phase timeout must not call this.
+  void end_name_clip(double now_s);
+  // Cat still in this sighting, and cat_greet_silence_s of quiet has passed.
+  // Sets play_name. Does not change phase or legs.
+  void maybe_regreet_cat(const std::optional<TargetHit> &seen, double now_s, HunterOutput &o);
+  HunterOutput finish_tick(HunterOutput o, const std::optional<TargetHit> &seen, double now_s);
   TwistBody follow_twist(const PoseInBase &pose, double dt);
   HunterOutput hunt_motion(double d_min, bool pan_sweep_done, double left_open,
                            double right_open);
@@ -252,7 +270,10 @@ class Hunter {
   bool crab_{false};              // latched so vy does not chatter on/off
   bool gait15_sent_{false};       // SelectGait15 already published this walk bout
   bool named_this_lock_{false};   // NAME already played for this lock
-  bool name_playing_{false};      // waiting for notify_name_done() or timeout
+  bool name_playing_{false};      // clip started, notify_name_done() not yet
+  bool greet_loop_{false};        // the outstanding or last clip is call-kitten
+  bool greet_silence_open_{false};  // cat clip finished; this sighting has not been lost
+  double greet_silent_since_{0.0};  // when the cat clip finished
   bool lidar_latched_{false};     // Stopped until d_min > d_go (hysteresis)
   bool ignore_until_sweep_{false};  // after 60 s: finish one pan before re-lock
   bool wall_stood_{false};        // wander: stand one tick before turning

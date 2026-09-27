@@ -51,7 +51,8 @@
 //     A cat pixel is offered only after kCatConfirmTicks centres in a row.
 //     One empty frame keeps that streak. The cat gate covers the whole
 //     frame: the head is moving, so the same cat is not a new object.
-//  F. If the NAME clip just finished, hunter_.notify_name_done().
+//  F. If a NAME clip just finished, hunter_.notify_name_done(t).
+//     That starts the cat silence clock in Follow as well as in Name.
 //  G. hunter_.tick(...) — THE policy. Returns HunterOutput.
 //  H. Hunt entered from Follow: start the pan sweep at the *current* pan.
 //     Snapping servo 19 to pan_min (200) looks ~70° away and loses the tag.
@@ -392,6 +393,7 @@ class MashaHunterNode : public rclcpp::Node {
     cfg.follow_max_s = declare_parameter<double>("follow_max_s", 60.0);
     cfg.search_timeout_s = declare_parameter<double>("search_timeout_s", 20.0);
     cfg.name_timeout_s = declare_parameter<double>("name_timeout_s", 8.0);
+    cfg.cat_greet_silence_s = declare_parameter<double>("cat_greet_silence_s", 5.0);
     cfg.vx_max = declare_parameter<double>("vx_max", 0.12);
     cfg.vy_max = declare_parameter<double>("vy_max", 0.08);
     cfg.wz_max = declare_parameter<double>("wz_max", 0.30);
@@ -540,9 +542,9 @@ class MashaHunterNode : public rclcpp::Node {
                 hunter_.config().enable_crab ? "true" : "false",
                 hunter_.config().enable_wander ? "true" : "false", enabled_targets_.size(),
                 follow_gait_select_, saveli_tag_frame_.c_str(), apriltag_topic_.c_str());
-    RCLCPP_INFO(get_logger(), "NAME saveli=%s (%s) cat=%s (%s)", saveli_wav_.c_str(),
-                file_exists(saveli_wav_) ? "ok" : "MISSING", cat_wav_.c_str(),
-                file_exists(cat_wav_) ? "ok" : "MISSING");
+    RCLCPP_INFO(get_logger(), "NAME saveli=%s (%s) cat=%s (%s) cat_silence=%.1fs",
+                saveli_wav_.c_str(), file_exists(saveli_wav_) ? "ok" : "MISSING", cat_wav_.c_str(),
+                file_exists(cat_wav_) ? "ok" : "MISSING", hunter_.config().cat_greet_silence_s);
   }
 
   ~MashaHunterNode() override { emergency_stop(); }
@@ -861,8 +863,8 @@ class MashaHunterNode : public rclcpp::Node {
     bool play = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (player_.finished() && hunter_.phase() == HunterPhase::Name) {
-        hunter_.notify_name_done();
+      if (player_.finished() && hunter_.name_playing()) {
+        hunter_.notify_name_done(t);
       }
       // Policy. hit / d_min / pan_done are already in library types.
       out = hunter_.tick(t, hit, d_min, pan_done, left_open, right_open);
