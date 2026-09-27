@@ -108,12 +108,21 @@ LidarSector lidar_front(const ScanView &scan, const HunterConfig &cfg) {
   return out;
 }
 
-// Priority: (1) the target we already named this lock, (2) yaml
-// enabled_targets order, (3) any hit. std::optional: empty = "no detection
-// this tick", not a default-constructed TargetHit with zeros.
+// Priority: (1) cat, if that plug fired this frame — a visible cat beats
+// a Saveli lock, (2) sticky "cat" with no cat this frame → empty, so the
+// sticker cannot cut in during the coast, (3) sticky id, (4) yaml order,
+// (5) any hit. empty = "no detection this tick", not a zero pose.
 std::optional<TargetHit> pick_target(const std::vector<std::optional<TargetHit>> &hits,
                                      const std::string &sticky_id,
                                      const std::vector<std::string> &order) {
+  for (const auto &h : hits) {
+    if (h && h->id == "cat") {
+      return h;
+    }
+  }
+  if (sticky_id == "cat") {
+    return std::nullopt;
+  }
   if (!sticky_id.empty()) {
     for (const auto &h : hits) {
       if (h && h->id == sticky_id) {
@@ -134,6 +143,43 @@ std::optional<TargetHit> pick_target(const std::vector<std::optional<TargetHit>>
     }
   }
   return std::nullopt;
+}
+
+std::optional<TargetHit> confirm_cat_hit(CatConfirmState &state, const std::optional<TargetHit> &hit,
+                                        double gate_px, int need) {
+  if (!hit || !hit->pose.has_pixel) {
+    state = {};
+    return std::nullopt;
+  }
+  if (need < 1) {
+    need = 1;
+  }
+  if (state.count > 0) {
+    const double d = std::hypot(hit->pose.u - state.u, hit->pose.v - state.v);
+    if (d > gate_px) {
+      state.count = 0;
+    }
+  }
+  state.count += 1;
+  state.u = hit->pose.u;
+  state.v = hit->pose.v;
+  if (state.count < need) {
+    return std::nullopt;
+  }
+  return hit;
+}
+
+LegCommandKind legs_for_metric_target(LegCommandKind legs, const std::optional<TargetHit> &hit) {
+  if (legs != LegCommandKind::Twist && legs != LegCommandKind::SelectGait15) {
+    return legs;
+  }
+  if (!hit || hit->id != "cat") {
+    return legs;
+  }
+  if (hit->pose_in_base && hit->pose.range_ok) {
+    return legs;
+  }
+  return LegCommandKind::None;
 }
 
 Hunter::Hunter(HunterConfig cfg) : cfg_(std::move(cfg)) {}
@@ -165,6 +211,37 @@ void Hunter::notify_halted() {
 // Centralize "what resets when a phase begins". Leaving Follow must
 // forget gait15 and the PD history, otherwise the next Follow inherits
 // a stale e_dot and the legs lurch.
+bool Hunter::name_this_hit(const TargetHit &hit, const std::string &prev_sticky,
+                           double now_s) const {
+  // Saveli → cat (or any other lock → cat) always plays call-kitten,
+  // including inside the 20 s quiet window of an earlier cat name.
+  if (hit.id == "cat" && !prev_sticky.empty() && prev_sticky != "cat") {
+    return true;
+  }
+  if (named_this_lock_) {
+    return false;
+  }
+  if (hit.id == last_named_id_ && (now_s - last_named_t_) < cfg_.search_timeout_s) {
+    return false;
+  }
+  return true;
+}
+
+void Hunter::arm_name(const TargetHit &hit, double now_s, HunterOutput &o) {
+  pending_wav_ = hit.spoken_wav;
+  name_playing_ = true;
+  named_this_lock_ = true;
+  last_named_id_ = hit.id;
+  last_named_t_ = now_s;
+  enter(HunterPhase::Name, now_s);
+  o.phase = HunterPhase::Name;
+  o.legs = LegCommandKind::Halt;
+  o.play_name = true;
+  o.pan_head = false;
+  o.sticky_id = sticky_id_;
+  o.crab = false;
+}
+
 void Hunter::enter(HunterPhase p, double now_s) {
   phase_ = p;
   phase_t_ = now_s;
@@ -289,9 +366,11 @@ HunterOutput Hunter::hunt_motion(double d_min, bool pan_sweep_done, double left_
 //   1. Stamp last_hit_t_ / sticky_id if we have a pose this tick.
 //   2. Idle: halt, return. start() is the only way out.
 //   3. lost = no hit for lost_timeout (1.5 s). Brief TF gaps are NOT lost.
-//   4. Hunt: maybe skip NAME (already named this lock), else NAME or wander.
-//   5. Name: freeze until notify_name_done() or name_timeout_s.
-//   6. Follow / Stopped: 60 s cap, LiDAR hysteresis, coast on a brief miss,
+//      A lost cat clears sticky so Saveli can be named on a later tick.
+//   4. Cat replacing another lock (Follow / Name / Stopped) enters NAME.
+//   5. Hunt: maybe skip NAME (already named this lock), else NAME or wander.
+//   6. Name: freeze until notify_name_done() or name_timeout_s.
+//   7. Follow / Stopped: 60 s cap, LiDAR hysteresis, coast on a brief miss,
 //      else PD Twist. Zero Twist → Halt, never publish Twist{0,0,0}.
 HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, double d_min,
                           bool pan_sweep_done, double left_open, double right_open) {
@@ -302,11 +381,20 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
   o.sticky_id = sticky_id_;
   o.crab = crab_;
 
-  if (hit) {
+  // While the lock is the cat, ignore a Saveli hit. pick_target already
+  // returns empty in that case; this keeps a direct tick() caller honest
+  // until lost_timeout clears the cat sticky below.
+  const std::string prev_sticky = sticky_id_;
+  std::optional<TargetHit> seen = hit;
+  if (prev_sticky == "cat" && seen && seen->id != "cat") {
+    seen.reset();
+  }
+
+  if (seen) {
     last_hit_t_ = now_s;
-    sticky_id_ = hit->id;
+    sticky_id_ = seen->id;
     o.sticky_id = sticky_id_;
-    const FollowErrors e = errors_from_pose(hit->pose, cfg_.r_target);
+    const FollowErrors e = errors_from_pose(seen->pose, cfg_.r_target);
     o.r = e.r;
     o.theta = e.theta;
   }
@@ -318,10 +406,25 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     return o;
   }
 
-  const bool lost = !hit && (now_s - last_hit_t_) > cfg_.lost_timeout;
+  const bool lost = !seen && (now_s - last_hit_t_) > cfg_.lost_timeout;
   if (!sticky_id_.empty() && (now_s - last_hit_t_) > cfg_.search_timeout_s) {
     sticky_id_.clear();
     o.sticky_id.clear();
+  }
+  // Cat coast is over. Drop the hold so the next tick may lock Saveli.
+  // This tick still has no cat (seen was cleared or empty), so Saveli is
+  // not adopted until pick_target runs again with an empty sticky.
+  if (lost && sticky_id_ == "cat") {
+    sticky_id_.clear();
+    o.sticky_id.clear();
+  }
+
+  // Visible cat beats a sticker lock that is already in Follow / Name /
+  // Stopped. Hunt names her in the branch below (after the forced pan).
+  if (seen && seen->id == "cat" && prev_sticky != "cat" && phase_ != HunterPhase::Hunt &&
+      name_this_hit(*seen, prev_sticky, now_s)) {
+    arm_name(*seen, now_s, o);
+    return o;
   }
 
   if (phase_ == HunterPhase::Hunt) {
@@ -336,25 +439,13 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     if (ignore_until_sweep_ && pan_sweep_done) {
       ignore_until_sweep_ = false;
     }
-    if (hit) {
-      // Skip NAME if we already called this lock, or we named the same
-      // id in the last search_timeout_s (lost-and-found, do not shout again).
-      const bool skip_name =
-          named_this_lock_ ||
-          (hit->id == last_named_id_ && (now_s - last_named_t_) < cfg_.search_timeout_s);
-      if (skip_name) {
+    if (seen) {
+      // Same id inside search_timeout_s: gaze and follow, do not shout.
+      // A different id, and any Saveli → cat switch, plays NAME.
+      if (!name_this_hit(*seen, prev_sticky, now_s)) {
         enter(HunterPhase::Follow, now_s);
       } else {
-        pending_wav_ = hit->spoken_wav;
-        name_playing_ = true;
-        named_this_lock_ = true;
-        last_named_id_ = hit->id;
-        last_named_t_ = now_s;
-        enter(HunterPhase::Name, now_s);
-        o.phase = HunterPhase::Name;
-        o.legs = LegCommandKind::Halt;
-        o.play_name = true;
-        o.pan_head = false;
+        arm_name(*seen, now_s, o);
         return o;
       }
     } else {
@@ -402,7 +493,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     }
     if (lidar_latched_ && std::isfinite(d_min) && d_min > cfg_.d_go) {
       lidar_latched_ = false;
-      if (hit) {
+      if (seen) {
         enter(HunterPhase::Follow, now_s);
         follow_t0_ = now_s - (cfg_.follow_max_s - left);
       }
@@ -412,7 +503,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       o.phase = HunterPhase::Stopped;
       o.legs = LegCommandKind::Halt;
       o.pan_head = false;
-      if (!hit && lost) {
+      if (!seen && lost) {
         named_this_lock_ = false;
         lidar_latched_ = false;
         enter(HunterPhase::Hunt, now_s);
@@ -422,7 +513,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       return o;
     }
 
-    if (!hit && lost) {
+    if (!seen && lost) {
       named_this_lock_ = false;
       enter(HunterPhase::Hunt, now_s);
       o.phase = HunterPhase::Hunt;
@@ -433,7 +524,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
 
     o.phase = HunterPhase::Follow;
     o.pan_head = false;
-    if (!hit) {
+    if (!seen) {
       // Brief miss (duplicate prune, motion blur). Hold last Twist so
       // the 0.30 s walk watchdog does not stand the legs, and so Hunt
       // pan does not start. Lost after lost_timeout still goes Hunt.
@@ -457,7 +548,7 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       return o;
     }
 
-    const TwistBody t = follow_twist(hit->pose, dt);
+    const TwistBody t = follow_twist(seen->pose, dt);
     last_twist_ = t;
     o.twist = t;
     o.crab = crab_;

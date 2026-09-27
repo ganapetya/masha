@@ -98,6 +98,29 @@ struct HumanDetectConfig {
   bool enable_face_fallback{true};
 };
 
+// YOLOv8 row: 4 box numbers, then COCO scores. True when `cls` is present
+// and no other class scores strictly higher. Cat detection requires this.
+// Person detection does not call it (a seated person often loses to "chair").
+inline bool coco_class_is_best(const float *row, int cols, int cls, int n_classes = 80) {
+  if (row == nullptr || cls < 0 || cols < 5 || (4 + cls) >= cols) {
+    return false;
+  }
+  const float mine = row[4 + cls];
+  int n = n_classes;
+  if (n > cols - 4) {
+    n = cols - 4;
+  }
+  for (int c = 0; c < n; ++c) {
+    if (c == cls) {
+      continue;
+    }
+    if (row[4 + c] > mine) {
+      return false;
+    }
+  }
+  return true;
+}
+
 class HumanDetector {
  public:
   explicit HumanDetector(const HumanDetectConfig &cfg = {});

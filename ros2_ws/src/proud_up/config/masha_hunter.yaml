@@ -27,6 +27,12 @@ masha_hunter_node:
     # Walk still requires enable_walk:=true on launch. Crab and speed are on.
     # vx_max 0.12 matches voice "go forward". kp_x 0.60 saturates that at ~1 m
     # (e.x = 1.00 − 0.80). Tripod half-cycle at T=0.70 s is ~40 mm, stride cap.
+    #
+    # Who to hunt. "saveli" is the AprilTag sticker (call-savelij.mp3).
+    # "cat" is COCO class 15 (call-kitten.mp3). A visible cat beats a locked
+    # sticker. Default stays saveli-only so a normal launch does not load YOLO:
+    #   ros2 launch proud_up masha_hunter.launch.py enabled_targets:=cat
+    #   ros2 launch proud_up masha_hunter.launch.py enabled_targets:=saveli,cat
     enabled_targets: [saveli]
     enable_walk: false
     enable_crab: true

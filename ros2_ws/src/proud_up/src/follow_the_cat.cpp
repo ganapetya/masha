@@ -198,15 +198,18 @@ std::optional<cv::Rect> HumanDetector::detect_person_box(const cv::Mat &bgr) {
   for (int i = 0; i < pred.rows; ++i) {
     const float *row = pred.ptr<float>(i);
     // row[4 + coco_class] is that class's score. Class 0 is person, 15 is
-    // cat. We do not require this class to beat "chair" on the same
-    // candidate — a seated person (or a loafed cat) often loses that
-    // comparison.
+    // cat. Person may lose the argmax to "chair" and still be a person.
+    // Cat must be the winning class, or a chair with a weak cat score
+    // would play call-kitten.
     const int cls = cfg_.coco_class;
     if (cls < 0 || 4 + cls >= pred.cols) {
       continue;
     }
     const float person_s = row[4 + cls];
     if (person_s < conf_th) {
+      continue;
+    }
+    if (cls != 0 && !coco_class_is_best(row, pred.cols, cls)) {
       continue;
     }
     const float cx = row[0];
@@ -258,6 +261,9 @@ std::optional<cv::Rect> HumanDetector::detect_person_box(const cv::Mat &bgr) {
     if (gated >= 0 && best_d <= gate) {
       best_i = gated;
     } else {
+      // Jumped outside the gate. Drop the lock this frame so the next
+      // frame can acquire anywhere. Keeping the old centre hid a darting cat.
+      reset_track();
       return std::nullopt;
     }
   } else {

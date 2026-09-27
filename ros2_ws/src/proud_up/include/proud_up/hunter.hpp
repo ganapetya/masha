@@ -182,10 +182,34 @@ double pd_axis(double e, double e_dot, double kp, double kd, double deadband, do
 
 LidarSector lidar_front(const ScanView &scan, const HunterConfig &cfg);
 
-// sticky_id (who we named) beats yaml `order` (enabled_targets).
+// Priority: (1) a cat hit this frame, even over a Saveli lock,
+// (2) sticky id "cat" with no cat this frame → empty, so Saveli cannot
+//     cut in during the coast (Hunter clears that sticky after lost_timeout),
+// (3) sticky_id, (4) yaml order, (5) any hit.
 std::optional<TargetHit> pick_target(const std::vector<std::optional<TargetHit>> &hits,
                                      const std::string &sticky_id,
                                      const std::vector<std::string> &order);
+
+// Consecutive cat centres before the node offers the hit to Hunter.
+// One YOLO frame at conf 0.45 is enough to false-NAME a chair.
+inline constexpr int kCatConfirmTicks = 4;
+
+struct CatConfirmState {
+  int count{0};
+  double u{0.0};
+  double v{0.0};
+};
+
+// `need` centres in a row, each within gate_px of the previous. A miss or
+// a jump clears the streak. Returns nullopt until the streak is full.
+std::optional<TargetHit> confirm_cat_hit(CatConfirmState &state,
+                                        const std::optional<TargetHit> &hit, double gate_px,
+                                        int need = kCatConfirmTicks);
+
+// Twist and SelectGait15 need a metric base pose. A cat pixel, or a
+// bbox-height guess (range_ok false), may still NAME and gaze. Those leg
+// commands become None so Follow does not walk toward (0, 0).
+LegCommandKind legs_for_metric_target(LegCommandKind legs, const std::optional<TargetHit> &hit);
 
 class Hunter {
  public:
@@ -210,6 +234,10 @@ class Hunter {
 
  private:
   void enter(HunterPhase p, double now_s);
+  // Cat replacing another lock always speaks. Same id inside search_timeout_s
+  // does not. named_this_lock_ skips a second clip for the current lock.
+  bool name_this_hit(const TargetHit &hit, const std::string &prev_sticky, double now_s) const;
+  void arm_name(const TargetHit &hit, double now_s, HunterOutput &o);
   TwistBody follow_twist(const PoseInBase &pose, double dt);
   HunterOutput hunt_motion(double d_min, bool pan_sweep_done, double left_open,
                            double right_open);

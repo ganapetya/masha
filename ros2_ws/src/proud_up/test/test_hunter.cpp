@@ -17,12 +17,16 @@
 #include "proud_up/hunter.hpp"
 #include "proud_up/target_source.hpp"
 
+using proud_up::CatConfirmState;
+using proud_up::confirm_cat_hit;
 using proud_up::errors_from_pose;
 using proud_up::Hunter;
 using proud_up::HunterConfig;
 using proud_up::HunterPhase;
+using proud_up::kCatConfirmTicks;
 using proud_up::kHunterPi;
 using proud_up::LegCommandKind;
+using proud_up::legs_for_metric_target;
 using proud_up::lidar_front;
 using proud_up::pick_target;
 using proud_up::PoseInBase;
@@ -43,6 +47,19 @@ TargetHit saveli_at(double x, double y, double t = 0.0) {
   h.pose.y = y;
   h.pose_in_base = true;
   h.pose.range_ok = true;
+  return h;
+}
+
+TargetHit cat_at(double x, double y, bool metric = true) {
+  TargetHit h = saveli_at(x, y);
+  h.id = "cat";
+  h.display_name = "cat";
+  h.spoken_wav = "call-kitten.mp3";
+  h.pose.has_pixel = true;
+  h.pose.u = 200.0;
+  h.pose.v = 180.0;
+  h.pose_in_base = metric;
+  h.pose.range_ok = metric;
   return h;
 }
 
@@ -310,4 +327,132 @@ TEST(Hunter, NotifyHaltedReselectsGait) {
   o = h.tick(0.40, saveli_at(1.20, 0.0), 2.0, true);
   EXPECT_EQ(o.phase, HunterPhase::Follow);
   EXPECT_EQ(o.legs, LegCommandKind::SelectGait15);
+}
+
+TEST(Hunter, CatBeatsStickySaveli) {
+  TargetHit saveli = saveli_at(1.0, 0.0);
+  TargetHit cat = cat_at(1.1, 0.1);
+  std::vector<std::optional<TargetHit>> hits{saveli, cat};
+  const auto p = pick_target(hits, "saveli", {"saveli", "cat"});
+  ASSERT_TRUE(p.has_value());
+  EXPECT_EQ(p->id, "cat");
+}
+
+TEST(Hunter, CatStickyHidesSaveliUntilReleased) {
+  std::vector<std::optional<TargetHit>> hits{saveli_at(1.0, 0.0), std::nullopt};
+  EXPECT_FALSE(pick_target(hits, "cat", {"saveli", "cat"}).has_value());
+}
+
+TEST(Hunter, CatTakesOverSaveliAndNames) {
+  Hunter h(walk_cfg());
+  h.start();
+  auto o = h.tick(0.0, saveli_at(1.20, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Name);
+  EXPECT_TRUE(o.play_name);
+  h.notify_name_done();
+  o = h.tick(0.30, saveli_at(1.20, 0.0), 2.0, true);
+  if (o.legs == LegCommandKind::SelectGait15) {
+    o = h.tick(0.35, saveli_at(1.20, 0.0), 2.0, true);
+  }
+  ASSERT_EQ(o.phase, HunterPhase::Follow);
+
+  o = h.tick(0.50, cat_at(1.10, 0.10), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Name);
+  EXPECT_TRUE(o.play_name);
+  EXPECT_EQ(o.legs, LegCommandKind::Halt);
+  EXPECT_EQ(o.sticky_id, "cat");
+
+  h.notify_name_done();
+  o = h.tick(0.80, cat_at(1.10, 0.10), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_FALSE(o.play_name);
+  EXPECT_EQ(o.sticky_id, "cat");
+}
+
+TEST(Hunter, SaveliDoesNotCutInDuringCatCoast) {
+  Hunter h(walk_cfg());
+  h.start();
+  h.tick(0.0, cat_at(1.20, 0.0), 2.0, true);
+  h.notify_name_done();
+  auto o = h.tick(0.30, cat_at(1.20, 0.0), 2.0, true);
+  if (o.legs == LegCommandKind::SelectGait15) {
+    o = h.tick(0.35, cat_at(1.20, 0.0), 2.0, true);
+  }
+  ASSERT_EQ(o.phase, HunterPhase::Follow);
+  ASSERT_EQ(o.sticky_id, "cat");
+
+  // walk_cfg lost_timeout is 0.5 s. This Saveli pose is inside the coast.
+  o = h.tick(0.50, saveli_at(0.90, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_EQ(o.sticky_id, "cat");
+  EXPECT_FALSE(o.play_name);
+
+  o = h.tick(1.00, saveli_at(0.90, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Hunt);
+  EXPECT_TRUE(o.sticky_id.empty());
+
+  o = h.tick(1.10, saveli_at(0.90, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Name);
+  EXPECT_TRUE(o.play_name);
+  EXPECT_EQ(o.sticky_id, "saveli");
+}
+
+TEST(Hunter, CatReacquireInsideQuietWindowDoesNotRename) {
+  Hunter h(walk_cfg());
+  h.start();
+  auto o = h.tick(0.0, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_TRUE(o.play_name);
+  h.notify_name_done();
+  h.tick(0.30, cat_at(1.20, 0.0), 2.0, true);
+  o = h.tick(1.00, std::nullopt, 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Hunt);
+  EXPECT_TRUE(o.sticky_id.empty());
+  o = h.tick(1.10, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_FALSE(o.play_name);
+  EXPECT_EQ(o.sticky_id, "cat");
+}
+
+TEST(Hunter, PixelCatStillNamesButDoesNotWalk) {
+  Hunter h(walk_cfg());
+  h.start();
+  const auto o = h.tick(0.0, cat_at(0.0, 0.0, false), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Name);
+  EXPECT_TRUE(o.play_name);
+
+  TargetHit guessed = cat_at(1.2, 0.0, false);
+  EXPECT_EQ(legs_for_metric_target(LegCommandKind::Twist, guessed), LegCommandKind::None);
+  EXPECT_EQ(legs_for_metric_target(LegCommandKind::SelectGait15, guessed), LegCommandKind::None);
+  EXPECT_EQ(legs_for_metric_target(LegCommandKind::Halt, guessed), LegCommandKind::Halt);
+  guessed.pose_in_base = true;
+  guessed.pose.range_ok = false;
+  EXPECT_EQ(legs_for_metric_target(LegCommandKind::Twist, guessed), LegCommandKind::None);
+  guessed.pose.range_ok = true;
+  EXPECT_EQ(legs_for_metric_target(LegCommandKind::Twist, guessed), LegCommandKind::Twist);
+  EXPECT_EQ(legs_for_metric_target(LegCommandKind::Twist, saveli_at(1.2, 0.0)),
+            LegCommandKind::Twist);
+}
+
+TEST(Hunter, ConfirmCatNeedsFourCentres) {
+  CatConfirmState st;
+  const TargetHit cat = cat_at(1.0, 0.0);
+  for (int i = 0; i < kCatConfirmTicks - 1; ++i) {
+    EXPECT_FALSE(confirm_cat_hit(st, cat, 40.0).has_value());
+  }
+  const auto ok = confirm_cat_hit(st, cat, 40.0);
+  ASSERT_TRUE(ok.has_value());
+  EXPECT_EQ(ok->id, "cat");
+
+  EXPECT_FALSE(confirm_cat_hit(st, std::nullopt, 40.0).has_value());
+  EXPECT_FALSE(confirm_cat_hit(st, cat, 40.0).has_value());
+
+  CatConfirmState jumped;
+  EXPECT_FALSE(confirm_cat_hit(jumped, cat, 40.0).has_value());
+  TargetHit far = cat;
+  far.pose.u = 400.0;
+  EXPECT_FALSE(confirm_cat_hit(jumped, far, 40.0).has_value());
+  for (int i = 0; i < kCatConfirmTicks - 2; ++i) {
+    EXPECT_FALSE(confirm_cat_hit(jumped, far, 40.0).has_value());
+  }
+  EXPECT_TRUE(confirm_cat_hit(jumped, far, 40.0).has_value());
 }

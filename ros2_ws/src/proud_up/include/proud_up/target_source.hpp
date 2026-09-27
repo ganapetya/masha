@@ -7,7 +7,8 @@
 //      → TargetHit with pixel + range, pose_in_base = false.
 //   2. control_tick: saveli_from_tf() fills DetectInput.saveli_pose
 //      (already in base_link) → SaveliSource::detect.
-//   3. fill_cat_base_pose() if needed, then pick_target(), then Hunter::tick.
+//   3. fill_cat_base_pose() if needed, then pick_target() (a visible cat
+//      beats a Saveli lock), then Hunter::tick.
 //
 // Why a virtual base: the next plug (person, ball, …) implements
 // TargetSource::detect and is listed in enabled_targets. Hunter never

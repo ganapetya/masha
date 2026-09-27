@@ -9,6 +9,7 @@
 
 using proud_up::angles_to_pulses;
 using proud_up::CameraIntrinsics;
+using proud_up::coco_class_is_best;
 using proud_up::clamp_pulse;
 using proud_up::HumanDetector;
 using proud_up::fallback_intrinsics;
@@ -43,6 +44,17 @@ CameraIntrinsics unit_k() {
 cv::Mat white_wall() { return cv::Mat(400, 640, CV_8UC3, cv::Scalar(240, 240, 240)); }
 
 }  // namespace
+
+TEST(FollowTheCat, CatClassMustBeatOtherCocoScores) {
+  float row[84] = {};
+  row[4 + 15] = 0.60f;
+  row[4 + 56] = 0.90f;
+  EXPECT_FALSE(coco_class_is_best(row, 84, 15));
+  row[4 + 56] = 0.20f;
+  EXPECT_TRUE(coco_class_is_best(row, 84, 15));
+  EXPECT_FALSE(coco_class_is_best(row, 84, 99));
+  EXPECT_FALSE(coco_class_is_best(nullptr, 84, 15));
+}
 
 // A centre pixel is the optical axis. After normalizing (X, Y, 1) we must
 // land on +Z of the optical frame.

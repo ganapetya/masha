@@ -47,7 +47,8 @@
 //  C. Cat (optional): if YOLO already found a pixel, fill_cat_base_pose()
 //     turns (u,v,depth) into (x,y) in base_link via TF camera→base.
 //  D. Saveli: saveli_from_tf() looks up T_base_tag. Stale TF is not a hit.
-//  E. pick_target(): sticky id (who we already named) wins; else yaml order.
+//  E. pick_target(): a visible cat wins; else sticky id; else yaml order.
+//     A cat pixel is offered only after kCatConfirmTicks centres in a row.
 //  F. If the NAME clip just finished, hunter_.notify_name_done().
 //  G. hunter_.tick(...) — THE policy. Returns HunterOutput.
 //  H. Hunt entered from Follow: start the pan sweep at the *current* pan.
@@ -435,6 +436,7 @@ class MashaHunterNode : public rclcpp::Node {
     cat_cfg.person_imgsz = declare_parameter<int>("person_imgsz", 320);
     cat_cfg.person_conf = declare_parameter<double>("person_conf", 0.45);
     cat_cfg.dnn_cuda = declare_parameter<bool>("dnn_cuda", true);
+    cat_track_gate_frac_ = cat_cfg.track_gate_frac;
     cat_cfg.person_onnx = declare_parameter<std::string>("person_onnx", "");
     if (cat_cfg.person_onnx.empty()) {
       try {
@@ -623,8 +625,18 @@ class MashaHunterNode : public rclcpp::Node {
                            info->k.data());
     }
     auto hit = cat_->detect(in);
+    const double diag = std::hypot(static_cast<double>(cv->image.cols),
+                                   static_cast<double>(cv->image.rows));
+    const double gate = cat_track_gate_frac_ * diag;
+    auto confirmed = confirm_cat_hit(cat_confirm_, hit, gate, kCatConfirmTicks);
+    const double stamp = now().seconds();
     std::lock_guard<std::mutex> lock(mutex_);
-    cat_hit_ = std::move(hit);
+    if (confirmed) {
+      cat_hit_ = std::move(confirmed);
+      cat_hit_stamp_s_ = stamp;
+    } else {
+      cat_hit_.reset();
+    }
   }
 
   // Pixel (u,v) is a DIRECTION, not a 3D point. Scale the unit ray by
@@ -751,6 +763,7 @@ class MashaHunterNode : public rclcpp::Node {
     sensor_msgs::msg::Image::ConstSharedPtr image;
     sensor_msgs::msg::CameraInfo::ConstSharedPtr info;
     std::optional<TargetHit> cat_hit;
+    double cat_stamp_s = 0.0;
     HunterPhase prev;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -761,7 +774,18 @@ class MashaHunterNode : public rclcpp::Node {
       image = latest_image_;
       info = latest_info_;
       cat_hit = cat_hit_;
+      cat_stamp_s = cat_hit_stamp_s_;
       prev = hunter_.phase();
+    }
+    if (cat_hit) {
+      const double max_age = pose_max_age_s_ > 0.05 ? pose_max_age_s_ : 0.40;
+      const double age = now().seconds() - cat_stamp_s;
+      if (age > max_age) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                             "cat hit stale (%.2f s > %.2f). Coast, do not lock a ghost.", age,
+                             max_age);
+        cat_hit.reset();
+      }
     }
 
     double d_min = std::numeric_limits<double>::infinity();
@@ -808,6 +832,9 @@ class MashaHunterNode : public rclcpp::Node {
       }
       // Policy. hit / d_min / pan_done are already in library types.
       out = hunter_.tick(t, hit, d_min, pan_done, left_open, right_open);
+      // Pixel-only cat (or bbox-height guess) may NAME and gaze. It must
+      // not SelectGait15 / Twist toward a pose that is still (0, 0).
+      out.legs = legs_for_metric_target(out.legs, hit);
       play = out.play_name;
       if (out.phase == HunterPhase::Hunt && prev != HunterPhase::Hunt) {
         pan_sweep_done_ = false;
@@ -833,7 +860,7 @@ class MashaHunterNode : public rclcpp::Node {
       if (out.legs == LegCommandKind::Twist) {
         walking_active_ = true;
         last_walk_cmd_at_ = now();
-      } else if (out.legs == LegCommandKind::Halt) {
+      } else if (out.legs == LegCommandKind::Halt || out.legs == LegCommandKind::None) {
         walking_active_ = false;
       }
     }
@@ -1129,6 +1156,9 @@ class MashaHunterNode : public rclcpp::Node {
   std::unique_ptr<SaveliSource> saveli_;
   std::unique_ptr<CatSource> cat_;
   std::optional<TargetHit> cat_hit_;  // written by detect_tick, read by control
+  double cat_hit_stamp_s_{0.0};       // ROS seconds of the last confirmed cat hit
+  CatConfirmState cat_confirm_{};     // detect thread only (detect_cb_group_)
+  double cat_track_gate_frac_{0.22};
   WavPlayer player_;
   std::mutex mutex_;                  // guards latest_* + hunter_ + cat_hit_
   tf2_ros::Buffer tf_buffer_;         // declared before listener (init order)
