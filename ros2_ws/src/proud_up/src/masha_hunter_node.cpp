@@ -49,6 +49,8 @@
 //  D. Saveli: saveli_from_tf() looks up T_base_tag. Stale TF is not a hit.
 //  E. pick_target(): a visible cat wins; else sticky id; else yaml order.
 //     A cat pixel is offered only after kCatConfirmTicks centres in a row.
+//     One empty frame keeps that streak. The cat gate covers the whole
+//     frame: the head is moving, so the same cat is not a new object.
 //  F. If the NAME clip just finished, hunter_.notify_name_done().
 //  G. hunter_.tick(...) — THE policy. Returns HunterOutput.
 //  H. Hunt entered from Follow: start the pan sweep at the *current* pan.
@@ -258,22 +260,41 @@ class WavPlayer {
   bool finished() const { return finished_.load(); }
 
  private:
+  // ffplay -autoexit closes Pulse when the decoder hits EOF. The USB
+  // speaker still has the tail queued, and that tail is dropped — the
+  // clip starts, then the last syllable is missing. aplay drains the
+  // device before it exits. A short silence pad is what gets dropped if
+  // a later fallback still has to use ffplay.
+  std::string wav_for_aplay() {
+    if (!looks_like_mp3(wav_)) {
+      return wav_;
+    }
+    const std::string out = "/tmp/masha_hunter_name.wav";
+    const pid_t enc = spawn_argv({"/usr/bin/ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                                  "-i", wav_, "-af", "apad=pad_dur=0.6", "-ar", "44100", "-ac",
+                                  "2", out});
+    if (enc <= 0) {
+      return {};
+    }
+    wait_spawned(enc, 8.0);
+    if (!file_exists(out)) {
+      return {};
+    }
+    return out;
+  }
+
   void worker() {
-    // aplay is wav-only. NAME clips are Peter's mp3s (call-savelij /
-    // call-kitten); play those with ffplay. Wav still goes to pulse aplay.
-    // -volume 100 is ffplay's max (0–100). Pulse sink is also forced to 100%.
+    // NAME clips are mp3. Pulse sink is forced to 100% before the sample
+    // starts, or the first call after the speaker has suspended is quiet.
     set_output_max();
+    const std::string wav = wav_for_aplay();
     pid_t pid = -1;
-    if (looks_like_mp3(wav_)) {
-      pid = spawn_argv({"/usr/bin/ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                        "-volume", "100", wav_});
-    }
-    if (pid <= 0) {
-      pid = spawn_argv({"/usr/bin/aplay", "-q", "-D", "pulse", wav_});
+    if (!wav.empty()) {
+      pid = spawn_argv({"/usr/bin/aplay", "-q", "-D", "pulse", wav});
     }
     if (pid <= 0) {
       pid = spawn_argv({"/usr/bin/ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                        "-volume", "100", wav_});
+                        "-volume", "100", "-af", "apad=pad_dur=0.8", wav_});
     }
     if (pid <= 0) {
       running_.store(false);
@@ -370,7 +391,7 @@ class MashaHunterNode : public rclcpp::Node {
     pose_max_age_s_ = declare_parameter<double>("pose_max_age", 0.40);
     cfg.follow_max_s = declare_parameter<double>("follow_max_s", 60.0);
     cfg.search_timeout_s = declare_parameter<double>("search_timeout_s", 20.0);
-    cfg.name_timeout_s = declare_parameter<double>("name_timeout_s", 5.0);
+    cfg.name_timeout_s = declare_parameter<double>("name_timeout_s", 8.0);
     cfg.vx_max = declare_parameter<double>("vx_max", 0.12);
     cfg.vy_max = declare_parameter<double>("vy_max", 0.08);
     cfg.wz_max = declare_parameter<double>("wz_max", 0.30);
@@ -434,8 +455,13 @@ class MashaHunterNode : public rclcpp::Node {
     cat_cfg.enable_face_fallback = false;
     cat_cfg.person_head_frac = 0.50;
     cat_cfg.person_imgsz = declare_parameter<int>("person_imgsz", 320);
-    cat_cfg.person_conf = declare_parameter<double>("person_conf", 0.45);
+    cat_cfg.person_conf = declare_parameter<double>("person_conf", 0.25);
     cat_cfg.dnn_cuda = declare_parameter<bool>("dnn_cuda", true);
+    // follow-the-cat uses 0.22 so a person lock does not hop to a
+    // neighbour. The hunter pans servo 19 and then walks, so the same
+    // cat crosses most of the picture between YOLO frames. A tight gate
+    // threw that box away and the red circle vanished.
+    cat_cfg.track_gate_frac = 1.05;
     cat_track_gate_frac_ = cat_cfg.track_gate_frac;
     cat_cfg.person_onnx = declare_parameter<std::string>("person_onnx", "");
     if (cat_cfg.person_onnx.empty()) {
@@ -634,9 +660,10 @@ class MashaHunterNode : public rclcpp::Node {
     if (confirmed) {
       cat_hit_ = std::move(confirmed);
       cat_hit_stamp_s_ = stamp;
-    } else {
-      cat_hit_.reset();
     }
+    // A miss leaves the last confirmed hit. control_tick drops it when
+    // the stamp is older than the cat hold, so one empty YOLO frame does
+    // not erase the red circle or the follow pose.
   }
 
   // Pixel (u,v) is a DIRECTION, not a 3D point. Scale the unit ray by
@@ -778,13 +805,20 @@ class MashaHunterNode : public rclcpp::Node {
       prev = hunter_.phase();
     }
     if (cat_hit) {
-      const double max_age = pose_max_age_s_ > 0.05 ? pose_max_age_s_ : 0.40;
+      // Longer than Saveli's pose_max_age. YOLO on the moving head often
+      // skips a few tenths of a second; 0.40 s made a visible cat go stale
+      // before the next good frame.
+      const double max_age = 1.0;
       const double age = now().seconds() - cat_stamp_s;
       if (age > max_age) {
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
                              "cat hit stale (%.2f s > %.2f). Coast, do not lock a ghost.", age,
                              max_age);
         cat_hit.reset();
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (cat_hit_stamp_s_ == cat_stamp_s) {
+          cat_hit_.reset();
+        }
       }
     }
 

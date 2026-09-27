@@ -433,7 +433,7 @@ TEST(Hunter, PixelCatStillNamesButDoesNotWalk) {
             LegCommandKind::Twist);
 }
 
-TEST(Hunter, ConfirmCatNeedsFourCentres) {
+TEST(Hunter, ConfirmCatNeedsTwoCentresAndKeepsOneMiss) {
   CatConfirmState st;
   const TargetHit cat = cat_at(1.0, 0.0);
   for (int i = 0; i < kCatConfirmTicks - 1; ++i) {
@@ -443,8 +443,16 @@ TEST(Hunter, ConfirmCatNeedsFourCentres) {
   ASSERT_TRUE(ok.has_value());
   EXPECT_EQ(ok->id, "cat");
 
+  // One empty frame keeps the streak. The next centre is still a lock.
+  EXPECT_FALSE(confirm_cat_hit(st, std::nullopt, 40.0).has_value());
+  const auto still = confirm_cat_hit(st, cat, 40.0);
+  ASSERT_TRUE(still.has_value());
+
+  // Two empty frames clear it, so a single later centre does not lock.
+  EXPECT_FALSE(confirm_cat_hit(st, std::nullopt, 40.0).has_value());
   EXPECT_FALSE(confirm_cat_hit(st, std::nullopt, 40.0).has_value());
   EXPECT_FALSE(confirm_cat_hit(st, cat, 40.0).has_value());
+  EXPECT_TRUE(confirm_cat_hit(st, cat, 40.0).has_value());
 
   CatConfirmState jumped;
   EXPECT_FALSE(confirm_cat_hit(jumped, cat, 40.0).has_value());

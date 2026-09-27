@@ -147,19 +147,30 @@ std::optional<TargetHit> pick_target(const std::vector<std::optional<TargetHit>>
 
 std::optional<TargetHit> confirm_cat_hit(CatConfirmState &state, const std::optional<TargetHit> &hit,
                                         double gate_px, int need) {
-  if (!hit || !hit->pose.has_pixel) {
-    state = {};
-    return std::nullopt;
-  }
   if (need < 1) {
     need = 1;
+  }
+  if (!hit || !hit->pose.has_pixel) {
+    if (state.count <= 0) {
+      state = {};
+      return std::nullopt;
+    }
+    // One blur frame while walking used to zero the streak, and the
+    // next good frame had to start over. Two empty frames means it left.
+    state.misses += 1;
+    if (state.misses >= 2) {
+      state = {};
+    }
+    return std::nullopt;
   }
   if (state.count > 0) {
     const double d = std::hypot(hit->pose.u - state.u, hit->pose.v - state.v);
     if (d > gate_px) {
       state.count = 0;
+      state.misses = 0;
     }
   }
+  state.misses = 0;
   state.count += 1;
   state.u = hit->pose.u;
   state.v = hit->pose.v;

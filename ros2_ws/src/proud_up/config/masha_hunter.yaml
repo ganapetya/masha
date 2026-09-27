@@ -93,11 +93,17 @@ masha_hunter_node:
 
     person_onnx: ""
     person_imgsz: 320
-    person_conf: 0.45
+    # Cat plug only (COCO 15). The live white cat scores about 0.30–0.64
+    # (peak ~0.64). Kitchen / empty views stay under ~0.06. Two class-15
+    # frames at or above this bar lock the cat; one empty frame does not
+    # drop it. The picture gate is the whole frame (the head is moving).
+    person_conf: 0.25
     dnn_cuda: true
 
     # NAME clips. Paths are mp3; hunter plays them with ffplay (aplay is wav-only).
     saveli_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/call-savelij.mp3
     cat_wav: /home/ubuntu/ros2_ws/src/xf_mic_asr_offline/feedback_voice/english/call-kitten.mp3
-    name_timeout_s: 5.0
+    # Stay in NAME until aplay drains. 5 s was tight once the USB speaker
+    # woke up slowly: Follow started walking over the last syllable.
+    name_timeout_s: 8.0
     name_play_timeout_s: 8.0

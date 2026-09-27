@@ -87,7 +87,7 @@ struct HunterConfig {
   double lost_timeout{1.5};  // Follow→Hunt; brief TF drops *coast* until then
   double follow_max_s{60.0};
   double search_timeout_s{20.0};  // forget sticky_id; also NAME skip window
-  double name_timeout_s{5.0};     // NAME → Follow even if ffplay hangs
+  double name_timeout_s{8.0};     // NAME → Follow even if aplay hangs
   double vx_max{0.05};
   double vy_max{0.04};
   double wz_max{0.30};
@@ -190,18 +190,23 @@ std::optional<TargetHit> pick_target(const std::vector<std::optional<TargetHit>>
                                      const std::string &sticky_id,
                                      const std::vector<std::string> &order);
 
-// Consecutive cat centres before the node offers the hit to Hunter.
-// One YOLO frame at conf 0.45 is enough to false-NAME a chair.
-inline constexpr int kCatConfirmTicks = 4;
+// Class-15 centres before the node offers the hit to Hunter.
+// One YOLO frame at conf 0.45 is enough to false-NAME a chair, so a
+// single frame never counts. Two winning frames do. A third empty
+// frame used to wipe a cat that was already in the picture.
+inline constexpr int kCatConfirmTicks = 2;
 
 struct CatConfirmState {
   int count{0};
+  int misses{0};
   double u{0.0};
   double v{0.0};
 };
 
-// `need` centres in a row, each within gate_px of the previous. A miss or
-// a jump clears the streak. Returns nullopt until the streak is full.
+// `need` centres in a row, each within gate_px of the previous. One empty
+// frame keeps the streak (the score flickers while the head or the body
+// moves). A second empty frame, or a jump, clears it. Returns nullopt
+// until the streak is full.
 std::optional<TargetHit> confirm_cat_hit(CatConfirmState &state,
                                         const std::optional<TargetHit> &hit, double gate_px,
                                         int need = kCatConfirmTicks);
