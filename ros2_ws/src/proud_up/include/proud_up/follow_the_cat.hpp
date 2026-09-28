@@ -63,20 +63,23 @@ struct PersonDetection {
 };
 
 // ---------------------------------------------------------------------------
-// 2. Finding a person — YOLOv8n, with an optional face inside the box
+// 2. Finding a subject — one COCO class from yolov8n.onnx
 // ---------------------------------------------------------------------------
 
-// YOLOv8n (COCO class 0 = person) finds a person from many viewpoints:
-// standing, sitting, facing away, across the room. The LBP face cascade is
-// a second, cheaper pass. It only helps when someone is looking at the
-// lens; it is optional and off by default because it can lock onto a
-// window or a curtain instead of a face.
+// The same net scores every COCO class. coco_class picks the column:
+// 0 is a person, 15 is a cat. Follow-the-cat and the hunter share this
+// detector; only the column and the shape checks change.
+//
+// The LBP face cascade is a second, cheaper pass, and only for a person.
+// It helps when someone is looking at the lens. It is optional and off by
+// default because it can lock onto a window or a curtain instead of a face.
+// A cat turns it off.
 //
 // person_head_frac chooses the aim pixel inside the YOLO box. 0.0 is the
-// top edge, 0.5 is the middle, 1.0 is the bottom. 0.45 aims at the torso.
-// Aiming too high (for example 0.12) sends the camera up toward the
+// top edge, 0.5 is the middle, 1.0 is the bottom. 0.45 aims at a person's
+// torso. Aiming too high (for example 0.12) sends the camera up toward the
 // ceiling and it stays there.
-struct HumanDetectConfig {
+struct SubjectDetectConfig {
   std::string cascade_dir{"/usr/share/opencv4/haarcascades"};
   std::string lbp_dir{"/usr/share/opencv4/lbpcascades"};
   std::string person_onnx;  // empty = skip YOLO (tests, or face-only)
@@ -121,17 +124,17 @@ inline bool coco_class_is_best(const float *row, int cols, int cls, int n_classe
   return true;
 }
 
-class HumanDetector {
+class SubjectDetector {
  public:
-  explicit HumanDetector(const HumanDetectConfig &cfg = {});
-  ~HumanDetector();
+  explicit SubjectDetector(const SubjectDetectConfig &cfg = {});
+  ~SubjectDetector();
   bool ok() const { return ok_ || person_ok_; }
   bool person_ok() const { return person_ok_; }
   bool using_cuda() const { return using_cuda_; }
   double last_detect_ms() const { return last_detect_ms_; }
   void reset_track();
   // Copy runtime scalars (thresholds, gates). Does not reload ONNX or cascades.
-  void apply_runtime_cfg(const HumanDetectConfig &cfg);
+  void apply_runtime_cfg(const SubjectDetectConfig &cfg);
   std::optional<PersonDetection> detect(const cv::Mat &bgr);
 
  private:
@@ -139,10 +142,10 @@ class HumanDetector {
   std::optional<PersonDetection> detect_face_in(const cv::Mat &bgr, const cv::Rect &roi);
   void warmup_person_net();
   static bool looks_like_person(const cv::Rect &r, int width, int height,
-                                const HumanDetectConfig &cfg);
+                                const SubjectDetectConfig &cfg);
 
   struct PersonNet;
-  HumanDetectConfig cfg_;
+  SubjectDetectConfig cfg_;
   cv::CascadeClassifier face_;
   std::unique_ptr<PersonNet> person_;
   cv::Rect last_person_;

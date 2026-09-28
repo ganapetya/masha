@@ -44,11 +44,11 @@ cv::Rect largest(const std::vector<cv::Rect> &boxes) {
 
 }  // namespace
 
-struct HumanDetector::PersonNet {
+struct SubjectDetector::PersonNet {
   cv::dnn::Net net;
 };
 
-HumanDetector::HumanDetector(const HumanDetectConfig &cfg) : cfg_(cfg) {
+SubjectDetector::SubjectDetector(const SubjectDetectConfig &cfg) : cfg_(cfg) {
   const auto haar = [&](const char *file) { return cfg_.cascade_dir + "/" + file; };
   const auto lbp = [&](const char *file) { return cfg_.lbp_dir + "/" + file; };
   // LBP is much faster than Haar on this CPU. Haar alt2 is only the fallback
@@ -88,14 +88,14 @@ HumanDetector::HumanDetector(const HumanDetectConfig &cfg) : cfg_(cfg) {
   }
 }
 
-HumanDetector::~HumanDetector() = default;
+SubjectDetector::~SubjectDetector() = default;
 
-void HumanDetector::reset_track() {
+void SubjectDetector::reset_track() {
   have_last_person_ = false;
   last_person_ = cv::Rect();
 }
 
-void HumanDetector::apply_runtime_cfg(const HumanDetectConfig &cfg) {
+void SubjectDetector::apply_runtime_cfg(const SubjectDetectConfig &cfg) {
   cfg_.image_scale = cfg.image_scale;
   cfg_.scale_factor = cfg.scale_factor;
   cfg_.min_neighbors = cfg.min_neighbors;
@@ -112,8 +112,8 @@ void HumanDetector::apply_runtime_cfg(const HumanDetectConfig &cfg) {
   cfg_.enable_face_fallback = cfg.enable_face_fallback;
 }
 
-bool HumanDetector::looks_like_person(const cv::Rect &r, int width, int height,
-                                      const HumanDetectConfig &cfg) {
+bool SubjectDetector::looks_like_person(const cv::Rect &r, int width, int height,
+                                      const SubjectDetectConfig &cfg) {
   if (!cfg.require_person_shape) {
     if (r.width < 12 || r.height < 12) {
       return false;
@@ -142,7 +142,7 @@ bool HumanDetector::looks_like_person(const cv::Rect &r, int width, int height,
   return true;
 }
 
-void HumanDetector::warmup_person_net() {
+void SubjectDetector::warmup_person_net() {
   if (!person_) {
     return;
   }
@@ -154,7 +154,7 @@ void HumanDetector::warmup_person_net() {
   person_->net.forward();
 }
 
-std::optional<cv::Rect> HumanDetector::detect_person_box(const cv::Mat &bgr) {
+std::optional<cv::Rect> SubjectDetector::detect_person_box(const cv::Mat &bgr) {
   if (!person_ || bgr.empty()) {
     return std::nullopt;
   }
@@ -278,7 +278,7 @@ std::optional<cv::Rect> HumanDetector::detect_person_box(const cv::Mat &bgr) {
   return boxes[best_i];
 }
 
-std::optional<PersonDetection> HumanDetector::detect_face_in(const cv::Mat &bgr,
+std::optional<PersonDetection> SubjectDetector::detect_face_in(const cv::Mat &bgr,
                                                              const cv::Rect &roi) {
   if (!ok_ || bgr.empty()) {
     return std::nullopt;
@@ -330,7 +330,7 @@ std::optional<PersonDetection> HumanDetector::detect_face_in(const cv::Mat &bgr,
   return box_to_detection(f, "face", 0.50);
 }
 
-std::optional<PersonDetection> HumanDetector::detect(const cv::Mat &bgr) {
+std::optional<PersonDetection> SubjectDetector::detect(const cv::Mat &bgr) {
   const auto t0 = std::chrono::steady_clock::now();
   auto finish = [&](std::optional<PersonDetection> out) {
     last_detect_ms_ = std::chrono::duration<double, std::milli>(

@@ -163,7 +163,7 @@ class FollowTheCatNode : public rclcpp::Node {
         human_cfg_.person_onnx.clear();
       }
     }
-    human_ = std::make_unique<HumanDetector>(human_cfg_);
+    human_ = std::make_unique<SubjectDetector>(human_cfg_);
     if (!human_->ok()) {
       RCLCPP_ERROR(get_logger(),
                    "no person detector (cascade %s / %s, onnx %s) — gaze will miss",
@@ -335,7 +335,7 @@ class FollowTheCatNode : public rclcpp::Node {
     sensor_msgs::msg::Image::ConstSharedPtr image;
     sensor_msgs::msg::CameraInfo::ConstSharedPtr info;
     bool stopping;
-    HumanDetectConfig human_cfg;
+    SubjectDetectConfig human_cfg;
     bool reset_track = false;
     double lost_timeout;
     double aim_u;
@@ -1092,8 +1092,8 @@ class FollowTheCatNode : public rclcpp::Node {
   bool logged_intrinsics_{false};
   bool logged_fallback_intrinsics_{false};
 
-  HumanDetectConfig human_cfg_;
-  std::unique_ptr<HumanDetector> human_;
+  SubjectDetectConfig human_cfg_;
+  std::unique_ptr<SubjectDetector> human_;
   PulseMapping pulse_map_;
   ArmPulses rest_;
 

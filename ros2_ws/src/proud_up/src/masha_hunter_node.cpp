@@ -256,7 +256,7 @@ class MashaHunterNode : public rclcpp::Node {
     saveli_ = std::make_unique<SaveliSource>(saveli_tag_id_, saveli_wav_);
     saveli_->set_enabled(target_enabled("saveli"));
 
-    HumanDetectConfig cat_cfg;
+    SubjectDetectConfig cat_cfg;
     cat_cfg.coco_class = 15;  // COCO: 0=person, 15=cat. Same ONNX file.
     cat_cfg.require_person_shape = false;
     cat_cfg.enable_face_fallback = false;

@@ -23,7 +23,7 @@ double depth_at_px(const cv::Mat &depth_mm, double u, double v) {
 
 }  // namespace
 
-CatSource::CatSource(const HumanDetectConfig &cfg, std::string spoken_wav,
+CatSource::CatSource(const SubjectDetectConfig &cfg, std::string spoken_wav,
                        double greet_silence_s)
     : detector_(cfg),
       spoken_wav_(std::move(spoken_wav)),

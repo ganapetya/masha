@@ -11,7 +11,7 @@ using proud_up::angles_to_pulses;
 using proud_up::CameraIntrinsics;
 using proud_up::coco_class_is_best;
 using proud_up::clamp_pulse;
-using proud_up::HumanDetector;
+using proud_up::SubjectDetector;
 using proud_up::fallback_intrinsics;
 using proud_up::from_k_matrix;
 using proud_up::gaze_quaternion;
@@ -226,16 +226,16 @@ TEST(FollowTheCat, IntegrateGazeSlewLimit) {
   EXPECT_NEAR(next.id19, 518.0f, 0.01);
 }
 
-TEST(FollowTheCat, HumanDetectorLoadsCascades) {
-  HumanDetector human;
-  ASSERT_TRUE(human.ok());
-  EXPECT_FALSE(human.person_ok());
-  EXPECT_FALSE(human.detect(cv::Mat()).has_value());
-  EXPECT_FALSE(human.detect(white_wall()).has_value());
+TEST(FollowTheCat, SubjectDetectorLoadsCascades) {
+  SubjectDetector detector;
+  ASSERT_TRUE(detector.ok());
+  EXPECT_FALSE(detector.person_ok());
+  EXPECT_FALSE(detector.detect(cv::Mat()).has_value());
+  EXPECT_FALSE(detector.detect(white_wall()).has_value());
 }
 
 TEST(FollowTheCat, YoloPersonIgnoresWhiteWall) {
-  proud_up::HumanDetectConfig cfg;
+  proud_up::SubjectDetectConfig cfg;
   cfg.dnn_cuda = false;
   const char *candidates[] = {
       "/home/ubuntu/ros2_ws/src/proud_up/models/yolov8n.onnx",
@@ -243,12 +243,12 @@ TEST(FollowTheCat, YoloPersonIgnoresWhiteWall) {
   };
   for (const char *path : candidates) {
     cfg.person_onnx = path;
-    HumanDetector human(cfg);
-    if (!human.person_ok()) {
+    SubjectDetector detector(cfg);
+    if (!detector.person_ok()) {
       continue;
     }
-    EXPECT_FALSE(human.detect(white_wall()).has_value());
-    EXPECT_FALSE(human.detect(cv::Mat()).has_value());
+    EXPECT_FALSE(detector.detect(white_wall()).has_value());
+    EXPECT_FALSE(detector.detect(cv::Mat()).has_value());
     return;
   }
   GTEST_SKIP() << "yolov8n.onnx not installed";
