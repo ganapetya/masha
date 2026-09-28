@@ -48,7 +48,7 @@
 //  C. Cat (optional): if YOLO already found a pixel, fill_cat_base_pose()
 //     turns (u,v,depth) into (x,y) in base_link via TF camera→base.
 //  D. Saveli: saveli_from_tf() looks up T_base_tag. Stale TF is not a hit.
-//  E. pick_target(): a visible cat wins; else sticky id; else yaml order.
+//  E. pick_target(): preempt_rank, else sticky id, else yaml order.
 //     A cat pixel is offered only after kCatConfirmTicks centres in a row.
 //     One empty frame keeps that streak. The cat gate covers the whole
 //     frame: the head is moving, so the same cat is not a new object.
@@ -277,7 +277,7 @@ class MashaHunterNode : public rclcpp::Node {
       }
     }
     if (target_enabled("cat")) {
-      cat_ = std::make_unique<CatSource>(cat_cfg, cat_wav_);
+      cat_ = std::make_unique<CatSource>(cat_cfg, cat_wav_, cfg.cat_greet_silence_s);
       cat_->set_enabled(true);
     }
 
@@ -616,7 +616,7 @@ class MashaHunterNode : public rclcpp::Node {
       // so a sitting cat is not scanned out of the picture.
       const double max_age = cat_hold_s_ > 0.2 ? cat_hold_s_ : 3.0;
       const double age = now().seconds() - cat_stamp_s;
-      cat_fresh = cat_hit->id == "cat" && age <= cat_fresh_s_;
+      cat_fresh = cat_hit->policy.gaze_on_pixel && age <= cat_fresh_s_;
       if (age > max_age) {
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
                              "cat hit stale (%.2f s > %.2f). Search again.", age, max_age);
@@ -652,16 +652,21 @@ class MashaHunterNode : public rclcpp::Node {
     if (cat_hit && !cat_hit->pose_in_base) {
       fill_cat_base_pose(*cat_hit, info);
     }
-    // Both slots always present (maybe empty). pick_target walks them.
+    // One slot per plug. This order is not priority. pick_target uses
+    // TargetPolicy::preempt_rank, then the sticky lock, then enabled_targets.
+    // A dog or a second tag is another optional<TargetHit> here, with that
+    // plug's policy already stamped. Hunter::tick does not learn the name.
     std::vector<std::optional<TargetHit>> hits;
     hits.push_back(saveli_from_tf());
     hits.push_back(cat_hit);
     std::string sticky;
+    TargetPolicy sticky_policy;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       sticky = hunter_.sticky_id();
+      sticky_policy = hunter_.sticky_policy();
     }
-    const auto hit = pick_target(hits, sticky, enabled_targets_);
+    const auto hit = pick_target(hits, sticky, enabled_targets_, sticky_policy);
 
     const double t = now().seconds();
     bool pan_done = pan_sweep_done_;
@@ -771,7 +776,7 @@ class MashaHunterNode : public rclcpp::Node {
                   sensor_msgs::msg::CameraInfo::ConstSharedPtr info, bool cat_fresh) {
     ArmPulses arm = rest_;
     arm.duration_s = 0.08;
-    const bool cat_seen = hit && hit->id == "cat" && hit->pose.has_pixel &&
+    const bool cat_seen = hit && hit->policy.gaze_on_pixel && hit->pose.has_pixel &&
                           out.phase != HunterPhase::Idle;
     const bool can_gaze = cat_seen && info && info->k.size() >= 9;
     if (cat_seen && !can_gaze) {
@@ -800,11 +805,11 @@ class MashaHunterNode : public rclcpp::Node {
         cat_head_u_ = hit->pose.u;
         cat_head_v_ = hit->pose.v;
         RCLCPP_INFO(get_logger(),
-                    "cat focused: head hold pan %.0f tilt %.0f. Still cat, not scanning.",
-                    gaze_id19_, gaze_id22_);
+                    "%s focused: head hold pan %.0f tilt %.0f. Still target, not scanning.",
+                    hit->id.c_str(), gaze_id19_, gaze_id22_);
       } else if (!focus.latched && cat_head_latched_) {
-        RCLCPP_INFO(get_logger(), "cat moved in the image (%.0f px): re-aim, then hold.",
-                    shift);
+        RCLCPP_INFO(get_logger(), "%s moved in the image (%.0f px): re-aim, then hold.",
+                    hit->id.c_str(), shift);
       }
       cat_head_latched_ = focus.latched;
       if (focus.gaze) {

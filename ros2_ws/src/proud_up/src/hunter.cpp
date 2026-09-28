@@ -108,19 +108,44 @@ LidarSector lidar_front(const ScanView &scan, const HunterConfig &cfg) {
   return out;
 }
 
-// Priority: (1) cat, if that plug fired this frame — a visible cat beats
-// a Saveli lock, (2) sticky "cat" with no cat this frame → empty, so the
-// sticker cannot cut in during the coast, (3) sticky id, (4) yaml order,
+// Priority: (1) preempt_rank above the sticky lock — equal ranks do not
+// steal; yaml order breaks a tie, (2) exclusive_coast with that id missing
+// → empty, so a lower plug cannot cut in, (3) sticky id, (4) yaml order,
 // (5) any hit. empty = "no detection this tick", not a zero pose.
 std::optional<TargetHit> pick_target(const std::vector<std::optional<TargetHit>> &hits,
                                      const std::string &sticky_id,
-                                     const std::vector<std::string> &order) {
+                                     const std::vector<std::string> &order,
+                                     const TargetPolicy &sticky_policy) {
+  // No lock yet: only rank > 0 preempts, so two tags still follow yaml order.
+  const int floor_rank = sticky_id.empty() ? 0 : sticky_policy.preempt_rank;
+  int winning = floor_rank;
+  bool preempt = false;
   for (const auto &h : hits) {
-    if (h && h->id == "cat") {
-      return h;
+    if (h && h->policy.preempt_rank > floor_rank) {
+      preempt = true;
+      winning = std::max(winning, h->policy.preempt_rank);
     }
   }
-  if (sticky_id == "cat") {
+  if (preempt) {
+    for (const auto &want : order) {
+      for (const auto &h : hits) {
+        if (h && h->id == want && h->policy.preempt_rank == winning) {
+          return h;
+        }
+      }
+    }
+    for (const auto &h : hits) {
+      if (h && h->policy.preempt_rank == winning) {
+        return h;
+      }
+    }
+  }
+  if (!sticky_id.empty() && sticky_policy.exclusive_coast) {
+    for (const auto &h : hits) {
+      if (h && h->id == sticky_id) {
+        return h;
+      }
+    }
     return std::nullopt;
   }
   if (!sticky_id.empty()) {
@@ -184,7 +209,7 @@ LegCommandKind legs_for_metric_target(LegCommandKind legs, const std::optional<T
   if (legs != LegCommandKind::Twist && legs != LegCommandKind::SelectGait15) {
     return legs;
   }
-  if (!hit || hit->id != "cat") {
+  if (!hit || !hit->policy.walk_needs_metric) {
     return legs;
   }
   if (hit->pose_in_base && hit->pose.range_ok) {
@@ -201,8 +226,13 @@ void Hunter::start() {
   enter(HunterPhase::Hunt, now_);
 }
 
-void Hunter::stop() {
+void Hunter::clear_sticky() {
   sticky_id_.clear();
+  sticky_policy_ = {};
+}
+
+void Hunter::stop() {
+  clear_sticky();
   crab_ = false;
   gait15_sent_ = false;
   lidar_latched_ = false;
@@ -234,17 +264,19 @@ void Hunter::end_name_clip(double now_s) {
   greet_silence_open_ = true;
 }
 
-void Hunter::maybe_regreet_cat(const std::optional<TargetHit> &seen, double now_s, HunterOutput &o) {
+void Hunter::maybe_regreet(const std::optional<TargetHit> &seen, double now_s, HunterOutput &o) {
   if (o.play_name || name_playing_ || !greet_silence_open_) {
     return;
   }
   if (phase_ == HunterPhase::Idle || phase_ == HunterPhase::Name) {
     return;
   }
-  if (!seen || seen->id != "cat") {
+  // Tag plugs leave this at 0 and are named once. A vision plug sets
+  // the gap on the hit (yaml cat_greet_silence_s for the cat).
+  if (!seen || seen->policy.greet_silence_s <= 0.0) {
     return;
   }
-  if ((now_s - greet_silent_since_) < cfg_.cat_greet_silence_s) {
+  if ((now_s - greet_silent_since_) < seen->policy.greet_silence_s) {
     return;
   }
   // Stay in the current phase. Re-entering Name would halt and restart
@@ -259,7 +291,7 @@ void Hunter::maybe_regreet_cat(const std::optional<TargetHit> &seen, double now_
 }
 
 HunterOutput Hunter::finish_tick(HunterOutput o, const std::optional<TargetHit> &seen, double now_s) {
-  maybe_regreet_cat(seen, now_s, o);
+  maybe_regreet(seen, now_s, o);
   return o;
 }
 
@@ -272,9 +304,9 @@ void Hunter::notify_halted() {
 // a stale e_dot and the legs lurch.
 bool Hunter::name_this_hit(const TargetHit &hit, const std::string &prev_sticky,
                            double now_s) const {
-  // Saveli → cat (or any other lock → cat) always plays call-kitten,
-  // including inside the 20 s quiet window of an earlier cat name.
-  if (hit.id == "cat" && !prev_sticky.empty() && prev_sticky != "cat") {
+  // A vision plug taking over some other lock always speaks, including
+  // inside the 20 s quiet window of an earlier clip of this same id.
+  if (hit.policy.rename_on_preempt && !prev_sticky.empty() && prev_sticky != hit.id) {
     return true;
   }
   if (named_this_lock_) {
@@ -290,7 +322,7 @@ void Hunter::arm_name(const TargetHit &hit, double now_s, HunterOutput &o) {
   pending_wav_ = hit.spoken_wav;
   name_playing_ = true;
   greet_silence_open_ = false;
-  greet_loop_ = (hit.id == "cat");
+  greet_loop_ = hit.policy.greet_silence_s > 0.0;
   named_this_lock_ = true;
   last_named_id_ = hit.id;
   last_named_t_ = now_s;
@@ -424,19 +456,24 @@ HunterOutput Hunter::hunt_motion(double d_min, bool pan_sweep_done, double left_
 
 // One 50 ms step. Branch order is the logic — read top to bottom:
 //
-//   1. Stamp last_hit_t_ / sticky_id if we have a pose this tick.
+//   1. An exclusive coast (vision lock, target missing) drops any other
+//      plug's hit. Then stamp last_hit_t_ / sticky_id / sticky_policy.
 //   2. Idle: halt, return. start() is the only way out.
-//   3. lost = no hit for lost_timeout (1.5 s). Brief TF gaps are NOT lost.
-//      A lost cat clears sticky so Saveli can be named on a later tick.
-//   4. Cat replacing another lock (Follow / Name / Stopped) enters NAME.
+//   3. lost = no hit for lost_timeout (1.5 s). Brief gaps are NOT lost.
+//      release_sticky_on_lost clears the lock so the next tick may name
+//      someone else. A tag lock waits for search_timeout_s instead.
+//   4. rename_on_preempt from Follow / Name / Stopped enters NAME.
+//      Hunt names in the branch below (after the forced pan).
 //   5. Hunt: maybe skip NAME (already named this lock), else NAME or wander.
 //   6. Name: freeze until notify_name_done() or name_timeout_s.
-//      The timeout leaves Name but leaves name_playing_ set, so the cat
-//      silence clock still starts when the clip actually finishes.
+//      The timeout leaves Name but leaves name_playing_ set, so a repeating
+//      clip's silence clock still starts when the clip actually finishes.
 //   7. Follow / Stopped: 60 s cap, LiDAR hysteresis, coast on a brief miss,
 //      else PD Twist. Zero Twist → Halt, never publish Twist{0,0,0}.
-//   8. Cat still in this sighting and cat_greet_silence_s of quiet: play_name
-//      again. finish_tick() does that on the way out. Lost clears the loop.
+//   8. greet_silence_s > 0 and that quiet has passed: play_name again.
+//      finish_tick() does that on the way out. Lost clears the loop.
+// Species (Saveli, cat, a later dog or tag robot) is TargetPolicy on the
+// hit. This function does not compare id to "cat" or "saveli".
 HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, double d_min,
                           bool pan_sweep_done, double left_open, double right_open) {
   now_ = now_s;
@@ -446,18 +483,19 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
   o.sticky_id = sticky_id_;
   o.crab = crab_;
 
-  // While the lock is the cat, ignore a Saveli hit. pick_target already
-  // returns empty in that case; this keeps a direct tick() caller honest
-  // until lost_timeout clears the cat sticky below.
+  // Exclusive coast: a vision lock ignores every other plug until
+  // lost_timeout. pick_target already returns empty; this keeps a direct
+  // tick() caller honest until the release below.
   const std::string prev_sticky = sticky_id_;
   std::optional<TargetHit> seen = hit;
-  if (prev_sticky == "cat" && seen && seen->id != "cat") {
+  if (sticky_policy_.exclusive_coast && !prev_sticky.empty() && seen && seen->id != prev_sticky) {
     seen.reset();
   }
 
   if (seen) {
     last_hit_t_ = now_s;
     sticky_id_ = seen->id;
+    sticky_policy_ = seen->policy;
     o.sticky_id = sticky_id_;
     const FollowErrors e = errors_from_pose(seen->pose, cfg_.r_target);
     o.r = e.r;
@@ -473,22 +511,23 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
 
   const bool lost = !seen && (now_s - last_hit_t_) > cfg_.lost_timeout;
   if (!sticky_id_.empty() && (now_s - last_hit_t_) > cfg_.search_timeout_s) {
-    sticky_id_.clear();
+    clear_sticky();
     o.sticky_id.clear();
   }
-  // Cat coast is over. Drop the hold so the next tick may lock Saveli.
-  // This tick still has no cat (seen was cleared or empty), so Saveli is
-  // not adopted until pick_target runs again with an empty sticky.
-  if (lost && sticky_id_ == "cat") {
-    sticky_id_.clear();
+  // Vision coast is over. Drop the hold so the next tick may lock a tag.
+  // This tick still has no vision hit (seen was cleared or empty), so the
+  // other plug is not adopted until pick_target runs again with an empty
+  // sticky. A tag lock does not release here; it waits for search_timeout_s.
+  if (lost && sticky_policy_.release_sticky_on_lost) {
+    clear_sticky();
     o.sticky_id.clear();
     greet_silence_open_ = false;
   }
 
-  // Visible cat beats a sticker lock that is already in Follow / Name /
-  // Stopped. Hunt names her in the branch below (after the forced pan).
-  if (seen && seen->id == "cat" && prev_sticky != "cat" && phase_ != HunterPhase::Hunt &&
-      name_this_hit(*seen, prev_sticky, now_s)) {
+  // Higher-rank plug (vision over a tag) beats a lock already in Follow /
+  // Name / Stopped and speaks again. Hunt names in the branch below.
+  if (seen && seen->policy.rename_on_preempt && seen->id != prev_sticky &&
+      phase_ != HunterPhase::Hunt && name_this_hit(*seen, prev_sticky, now_s)) {
     arm_name(*seen, now_s, o);
     return finish_tick(o, seen, now_s);
   }
@@ -507,8 +546,8 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     }
     if (seen) {
       // Same id inside search_timeout_s: Follow, no new Name phase.
-      // A cat that never left still repeats from finish_tick.
-      // A different id, and any Saveli → cat switch, plays NAME.
+      // A repeating plug that never left still speaks from finish_tick.
+      // rename_on_preempt (vision taking a tag lock) plays NAME.
       if (!name_this_hit(*seen, prev_sticky, now_s)) {
         enter(HunterPhase::Follow, now_s);
       } else {

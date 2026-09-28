@@ -7,12 +7,16 @@
 //      → TargetHit with pixel + range, pose_in_base = false.
 //   2. control_tick: saveli_from_tf() fills DetectInput.saveli_pose
 //      (already in base_link) → SaveliSource::detect.
-//   3. fill_cat_base_pose() if needed, then pick_target() (a visible cat
-//      beats a Saveli lock), then Hunter::tick.
+//   3. fill the vision pose if needed, then pick_target() (preempt_rank,
+//      then the sticky lock, then enabled_targets), then Hunter::tick.
 //
-// Why a virtual base: the next plug (person, ball, …) implements
-// TargetSource::detect and is listed in enabled_targets. Hunter never
-// names "saveli" or "cat" — it only sees TargetHit.id.
+// Adding a target: implement TargetSource, stamp tag_target_policy() or
+// vision_target_policy() on the hit, and list the id in enabled_targets.
+// Hunter::tick does not grow a branch for the new name.
+//   - Dog, ball, person: copy CatSource, change coco class / wav / id.
+//     Raise preempt_rank above 1 only if it must beat the cat.
+//   - Another robot's AprilTag: copy SaveliSource with that id, tag id,
+//     TF frame, and wav. Leave the tag policy at rank 0.
 //
 // Saveli is a fiducial (AprilTag TF). Cat is COCO class 15 on the same
 // yolov8n.onnx follow_the_cat already loads — not a second DNN node.
@@ -71,7 +75,8 @@ class SaveliSource : public TargetSource {
 // HumanDetector is the same class follow_the_cat uses for people (class 0).
 class CatSource : public TargetSource {
  public:
-  explicit CatSource(const HumanDetectConfig &cfg, std::string spoken_wav = "cat.wav");
+  explicit CatSource(const HumanDetectConfig &cfg, std::string spoken_wav = "cat.wav",
+                     double greet_silence_s = 5.0);
   std::string id() const override { return "cat"; }
   bool enabled() const override { return enabled_; }
   void set_enabled(bool on) override { enabled_ = on; }
@@ -82,7 +87,8 @@ class CatSource : public TargetSource {
   HumanDetector detector_;
   std::string spoken_wav_;
   bool enabled_{false};
-  double cat_height_m_{0.25};  // bbox-height heuristic if depth is missing
+  double greet_silence_s_{5.0};  // stamped onto each hit's vision policy
+  double cat_height_m_{0.25};    // bbox-height heuristic if depth is missing
 };
 
 }  // namespace proud_up

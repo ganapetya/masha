@@ -22,6 +22,7 @@ std::optional<TargetHit> SaveliSource::detect(const DetectInput &in) {
   hit.id = "saveli";
   hit.display_name = "Saveli";
   hit.spoken_wav = spoken_wav_;
+  hit.policy = tag_target_policy();
   hit.pose = in.saveli_pose;
   hit.pose.range_ok = true;
   hit.pose_in_base = true;

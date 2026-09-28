@@ -32,8 +32,11 @@ using proud_up::pick_target;
 using proud_up::PoseInBase;
 using proud_up::SaveliSource;
 using proud_up::ScanView;
+using proud_up::tag_target_policy;
 using proud_up::TargetHit;
+using proud_up::TargetPolicy;
 using proud_up::twist_is_zero;
+using proud_up::vision_target_policy;
 
 namespace {
 
@@ -43,6 +46,7 @@ TargetHit saveli_at(double x, double y, double t = 0.0) {
   h.id = "saveli";
   h.display_name = "Saveli";
   h.spoken_wav = "saveli.wav";
+  h.policy = tag_target_policy();
   h.pose.x = x;
   h.pose.y = y;
   h.pose_in_base = true;
@@ -55,6 +59,7 @@ TargetHit cat_at(double x, double y, bool metric = true) {
   h.id = "cat";
   h.display_name = "cat";
   h.spoken_wav = "call-kitten.mp3";
+  h.policy = vision_target_policy();
   h.pose.has_pixel = true;
   h.pose.u = 200.0;
   h.pose.v = 180.0;
@@ -268,6 +273,8 @@ TEST(Hunter, SaveliPlugNeedsMatchingTag) {
   auto hit = src.detect(in);
   ASSERT_TRUE(hit.has_value());
   EXPECT_EQ(hit->id, "saveli");
+  EXPECT_EQ(hit->policy.preempt_rank, 0);
+  EXPECT_FALSE(hit->policy.exclusive_coast);
   in.tag_id = 7;
   EXPECT_FALSE(src.detect(in).has_value());
 }
@@ -333,14 +340,16 @@ TEST(Hunter, CatBeatsStickySaveli) {
   TargetHit saveli = saveli_at(1.0, 0.0);
   TargetHit cat = cat_at(1.1, 0.1);
   std::vector<std::optional<TargetHit>> hits{saveli, cat};
-  const auto p = pick_target(hits, "saveli", {"saveli", "cat"});
+  const auto p = pick_target(hits, "saveli", {"saveli", "cat"}, tag_target_policy());
   ASSERT_TRUE(p.has_value());
   EXPECT_EQ(p->id, "cat");
 }
 
 TEST(Hunter, CatStickyHidesSaveliUntilReleased) {
   std::vector<std::optional<TargetHit>> hits{saveli_at(1.0, 0.0), std::nullopt};
-  EXPECT_FALSE(pick_target(hits, "cat", {"saveli", "cat"}).has_value());
+  // The hold is the vision policy, not the spelling of the id.
+  EXPECT_FALSE(
+      pick_target(hits, "cat", {"saveli", "cat"}, vision_target_policy()).has_value());
 }
 
 TEST(Hunter, CatTakesOverSaveliAndNames) {
@@ -525,6 +534,56 @@ TEST(Hunter, CatGreetingStopsAfterTheSightingIsLost) {
   auto o = h.tick(2.0, std::nullopt, 2.0, true);
   EXPECT_EQ(o.phase, HunterPhase::Hunt);
   o = h.tick(8.0, cat_at(1.20, 0.0), 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_FALSE(o.play_name);
+}
+
+// A dog is not a new branch in tick. Same vision policy, different id.
+// A second tag robot is tag_target_policy with its own id: it does not
+// steal a vision coast, and it does not repeat its name clip.
+TEST(Hunter, DogAndOtherTagUsePolicyNotANewBranch) {
+  TargetHit dog = cat_at(1.10, 0.10);
+  dog.id = "dog";
+  dog.display_name = "dog";
+  dog.spoken_wav = "call-dog.mp3";
+  TargetHit mira = saveli_at(0.90, 0.0);
+  mira.id = "mira";
+  mira.display_name = "Mira";
+
+  const auto picked =
+      pick_target({saveli_at(1.0, 0.0), dog}, "saveli", {"saveli", "dog"}, tag_target_policy());
+  ASSERT_TRUE(picked.has_value());
+  EXPECT_EQ(picked->id, "dog");
+  EXPECT_FALSE(pick_target({mira, std::nullopt}, "dog", {"mira", "dog"}, vision_target_policy())
+                   .has_value());
+
+  auto cfg = walk_cfg();
+  cfg.lost_timeout = 1.5;
+  Hunter h(cfg);
+  h.start();
+  h.tick(0.0, saveli_at(1.20, 0.0), 2.0, true);
+  h.notify_name_done();
+  auto o = h.tick(0.30, dog, 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Name);
+  EXPECT_TRUE(o.play_name);
+  EXPECT_EQ(o.sticky_id, "dog");
+
+  h.notify_name_done();
+  o = h.tick(0.50, dog, 2.0, true);
+  ASSERT_EQ(o.phase, HunterPhase::Follow);
+  o = h.tick(0.70, mira, 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_EQ(o.sticky_id, "dog");
+  EXPECT_FALSE(o.play_name);
+
+  o = h.tick(2.20, mira, 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Hunt);
+  EXPECT_TRUE(o.sticky_id.empty());
+  o = h.tick(2.30, mira, 2.0, true);
+  EXPECT_EQ(o.phase, HunterPhase::Name);
+  EXPECT_EQ(o.sticky_id, "mira");
+  h.notify_name_done();
+  o = h.tick(12.0, mira, 2.0, true);
   EXPECT_EQ(o.phase, HunterPhase::Follow);
   EXPECT_FALSE(o.play_name);
 }

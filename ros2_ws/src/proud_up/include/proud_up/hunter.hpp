@@ -15,9 +15,11 @@
 //                         ^                                       |
 //                         +-- lost / 60 s / LiDAR STOPPED --------+
 //
-// A cat that stays in view is greeted again after cat_greet_silence_s of
-// quiet. The clock starts when the clip finishes. That repeat sets
-// play_name and does not leave Follow, Stopped, or Hunt.
+// A vision target that stays in view is greeted again after its
+// TargetPolicy::greet_silence_s of quiet. The clock starts when the clip
+// finishes. That repeat sets play_name and does not leave Follow,
+// Stopped, or Hunt. Tag targets leave greet_silence_s at 0 and are
+// named once per lock.
 //
 // tick() inputs (what the node must gather BEFORE calling):
 //   now_s          ROS clock seconds (monotonic enough for dt)
@@ -46,7 +48,7 @@ inline constexpr double kHunterPi = 3.14159265358979323846;
 
 // Idle     constructed, or after ~/stop. No motion, no pan.
 // Hunt     looking: head triangle-pan. Optional wander walk.
-// Name     freeze, play call-savelij / call-kitten, then Follow.
+// Name     freeze, play the locked target's clip, then Follow.
 // Follow   PD on range + bearing for ≤ follow_max_s.
 // Stopped  LiDAR closer than d_stop; stand until d_go or lost.
 enum class HunterPhase { Idle, Hunt, Name, Follow, Stopped };
@@ -59,8 +61,59 @@ enum class LegCommandKind {
   Twist          // publish vx, vy, wz on /controller/cmd_vel
 };
 
+// How one plug participates in the shared phase machine.
+// Hunter::tick never branches on the id string. Saveli stamps
+// tag_target_policy(); the cat stamps vision_target_policy(). A dog is
+// another vision plug (raise preempt_rank if it should beat the cat).
+// Another robot's AprilTag is another tag plug with its own id and wav.
+struct TargetPolicy {
+  // Strictly above the sticky lock's rank: this hit wins pick_target and
+  // can re-enter Name. 0 = tag. 1 = vision. Equal ranks do not steal;
+  // sticky, then enabled_targets order, decides.
+  int preempt_rank{0};
+  // While this id is sticky and missing this frame, pick_target returns
+  // empty so a lower-rank hit cannot cut in. The brain drops the lock
+  // after lost_timeout when release_sticky_on_lost is set.
+  bool exclusive_coast{false};
+  // lost_timeout clears sticky_id and the greet-silence clock, so the
+  // next tick may lock someone else.
+  bool release_sticky_on_lost{false};
+  // Switching onto this id from a different lock always plays NAME,
+  // including inside search_timeout_s of an earlier clip of the same id.
+  bool rename_on_preempt{false};
+  // Seconds of quiet after the clip ends before play_name again, while
+  // this sighting lasts. 0 names once per lock.
+  double greet_silence_s{0.0};
+  // Twist and SelectGait15 need pose_in_base and range_ok. A pixel-only
+  // vision hit may still NAME and gaze.
+  bool walk_needs_metric{false};
+  // A fresh pixel aims the head (servo 19/22) instead of the hunt pan.
+  bool gaze_on_pixel{false};
+};
+
+// Fiducial / AprilTag. Name once. A frame with no tag may adopt another
+// hit. The pose is already metric. The head holds; it does not gaze.
+inline TargetPolicy tag_target_policy() {
+  return TargetPolicy{};
+}
+
+// Camera class (cat, and the same shape for a later dog). Outranks a tag
+// lock. A miss blocks other targets until lost_timeout. The clip repeats
+// after greet_silence_s. Pixel-only poses do not walk. A pixel aims the head.
+inline TargetPolicy vision_target_policy(double greet_silence_s = 5.0) {
+  TargetPolicy p;
+  p.preempt_rank = 1;
+  p.exclusive_coast = true;
+  p.release_sticky_on_lost = true;
+  p.rename_on_preempt = true;
+  p.greet_silence_s = greet_silence_s;
+  p.walk_needs_metric = true;
+  p.gaze_on_pixel = true;
+  return p;
+}
+
 // Target pose in Masha's body frame (ROS REP-103): +X forward, +Y left, +Z up.
-// Saveli's AprilTag TF is already in this frame. Cat starts as a pixel and
+// A tag TF is already in this frame. A vision hit starts as a pixel and
 // the node fills x,y via depth × camera ray × TF.
 struct PoseInBase {
   double x{0.0};  // m, +X out the head
@@ -73,9 +126,10 @@ struct PoseInBase {
 };
 
 struct TargetHit {
-  std::string id;            // "saveli" | "cat" — sticky_id and pick_target key
+  std::string id;            // plug key: "saveli", "cat", or the next one
   std::string display_name;
   std::string spoken_wav;    // absolute path to the NAME clip
+  TargetPolicy policy;       // set by the plug; tick reads this, not id
   PoseInBase pose;
   double range_m{0.0};       // metres along the camera ray before TF, or hypot(x,y)
   bool pose_in_base{false};  // node must TF the cat before tick() if this is false
@@ -92,8 +146,8 @@ struct HunterConfig {
   double follow_max_s{60.0};
   double search_timeout_s{20.0};  // forget sticky_id; also NAME skip window
   double name_timeout_s{8.0};     // NAME → Follow even if aplay hangs
-  // Quiet gap before call-kitten plays again, while this cat sighting lasts.
-  // Measured from when the clip finishes, not from when it starts.
+  // Node copies this onto the cat plug's TargetPolicy::greet_silence_s.
+  // tick() reads the hit, not this field. Measured from clip end.
   double cat_greet_silence_s{5.0};
   double vx_max{0.05};
   double vy_max{0.04};
@@ -189,13 +243,14 @@ double pd_axis(double e, double e_dot, double kp, double kd, double deadband, do
 
 LidarSector lidar_front(const ScanView &scan, const HunterConfig &cfg);
 
-// Priority: (1) a cat hit this frame, even over a Saveli lock,
-// (2) sticky id "cat" with no cat this frame → empty, so Saveli cannot
-//     cut in during the coast (Hunter clears that sticky after lost_timeout),
+// Priority: (1) a hit whose preempt_rank is above the sticky lock,
+// (2) exclusive_coast and that id is missing → empty,
 // (3) sticky_id, (4) yaml order, (5) any hit.
+// sticky_policy is the lock from the previous tick (default: a tag).
 std::optional<TargetHit> pick_target(const std::vector<std::optional<TargetHit>> &hits,
                                      const std::string &sticky_id,
-                                     const std::vector<std::string> &order);
+                                     const std::vector<std::string> &order,
+                                     const TargetPolicy &sticky_policy = {});
 
 // Class-15 centres before the node offers the hit to Hunter.
 // One YOLO frame at conf 0.45 is enough to false-NAME a chair, so a
@@ -218,9 +273,10 @@ std::optional<TargetHit> confirm_cat_hit(CatConfirmState &state,
                                         const std::optional<TargetHit> &hit, double gate_px,
                                         int need = kCatConfirmTicks);
 
-// Twist and SelectGait15 need a metric base pose. A cat pixel, or a
-// bbox-height guess (range_ok false), may still NAME and gaze. Those leg
-// commands become None so Follow does not walk toward (0, 0).
+// Twist and SelectGait15 need a metric base pose when the hit's policy
+// says walk_needs_metric. A pixel, or a bbox-height guess (range_ok
+// false), may still NAME and gaze. Those leg commands become None so
+// Follow does not walk toward (0, 0). A tag pose is not gated.
 LegCommandKind legs_for_metric_target(LegCommandKind legs, const std::optional<TargetHit> &hit);
 
 class Hunter {
@@ -247,19 +303,24 @@ class Hunter {
 
   HunterPhase phase() const { return phase_; }
   std::string sticky_id() const { return sticky_id_; }
+  // Policy of the sticky lock. Default-constructed while nothing is locked,
+  // which is tag_target_policy() (rank 0, no exclusive coast).
+  const TargetPolicy &sticky_policy() const { return sticky_policy_; }
 
  private:
   void enter(HunterPhase p, double now_s);
-  // Cat replacing another lock always speaks. Same id inside search_timeout_s
-  // does not. named_this_lock_ skips a second clip for the current lock.
+  // rename_on_preempt from a different lock always speaks. Same id inside
+  // search_timeout_s does not. named_this_lock_ skips a second clip.
   bool name_this_hit(const TargetHit &hit, const std::string &prev_sticky, double now_s) const;
   void arm_name(const TargetHit &hit, double now_s, HunterOutput &o);
   // Clip actually finished (player exit, or a missing file). Opens the
-  // cat silence clock. The Name-phase timeout must not call this.
+  // greet-silence clock when this lock repeats. The Name-phase timeout
+  // must not call this.
   void end_name_clip(double now_s);
-  // Cat still in this sighting, and cat_greet_silence_s of quiet has passed.
-  // Sets play_name. Does not change phase or legs.
-  void maybe_regreet_cat(const std::optional<TargetHit> &seen, double now_s, HunterOutput &o);
+  // Same sighting, greet_silence_s of quiet has passed. Sets play_name.
+  // Does not change phase or legs. A tag (greet_silence_s == 0) never hits.
+  void maybe_regreet(const std::optional<TargetHit> &seen, double now_s, HunterOutput &o);
+  void clear_sticky();
   HunterOutput finish_tick(HunterOutput o, const std::optional<TargetHit> &seen, double now_s);
   TwistBody follow_twist(const PoseInBase &pose, double dt);
   HunterOutput hunt_motion(double d_min, bool pan_sweep_done, double left_open,
@@ -271,9 +332,9 @@ class Hunter {
   bool gait15_sent_{false};       // SelectGait15 already published this walk bout
   bool named_this_lock_{false};   // NAME already played for this lock
   bool name_playing_{false};      // clip started, notify_name_done() not yet
-  bool greet_loop_{false};        // the outstanding or last clip is call-kitten
-  bool greet_silence_open_{false};  // cat clip finished; this sighting has not been lost
-  double greet_silent_since_{0.0};  // when the cat clip finished
+  bool greet_loop_{false};        // this lock repeats its clip after silence
+  bool greet_silence_open_{false};  // repeating clip finished; sighting not lost
+  double greet_silent_since_{0.0};  // when that clip finished
   bool lidar_latched_{false};     // Stopped until d_min > d_go (hysteresis)
   bool ignore_until_sweep_{false};  // after 60 s: finish one pan before re-lock
   bool wall_stood_{false};        // wander: stand one tick before turning
@@ -288,6 +349,7 @@ class Hunter {
   double prev_eth_{0.0};
   bool have_prev_e_{false};
   std::string sticky_id_;         // keep following the named target, not a new one
+  TargetPolicy sticky_policy_{};  // that lock's policy; survives a missed frame
   std::string last_named_id_;
   std::string pending_wav_;
   TwistBody last_twist_{};        // coast this Twist during a brief TF miss

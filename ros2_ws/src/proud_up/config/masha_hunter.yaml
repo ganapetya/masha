@@ -29,9 +29,11 @@ masha_hunter_node:
     # vx_max 0.12 matches voice "go forward". kp_x 0.60 saturates that at ~1 m
     # (e.x = 1.00 − 0.80). Tripod half-cycle at T=0.70 s is ~40 mm, stride cap.
     #
-    # Who to hunt. "saveli" is the AprilTag sticker (call-savelij.mp3).
-    # "cat" is COCO class 15 (call-kitten.mp3). A visible cat beats a locked
-    # sticker. Default stays saveli-only so a normal launch does not load YOLO:
+    # Who to hunt. "saveli" is the AprilTag sticker (call-savelij.mp3),
+    # tag_target_policy. "cat" is COCO class 15 (call-kitten.mp3),
+    # vision_target_policy: a visible cat beats a locked sticker.
+    # A new id is another TargetSource with one of those two policies.
+    # Default stays saveli-only so a normal launch does not load YOLO:
     #   ros2 launch proud_up masha_hunter.launch.py enabled_targets:=cat
     #   ros2 launch proud_up masha_hunter.launch.py enabled_targets:=saveli,cat
     enabled_targets: [saveli]
