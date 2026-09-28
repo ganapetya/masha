@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "proud_up/hunter.hpp"
+#include "proud_up/reach_greet.hpp"
 #include "proud_up/target_source.hpp"
 
 using proud_up::CatConfirmState;
@@ -32,6 +33,13 @@ using proud_up::pick_target;
 using proud_up::PoseInBase;
 using proud_up::SaveliSource;
 using proud_up::ScanView;
+using proud_up::advance_reach_greet;
+using proud_up::kGripperClose;
+using proud_up::kGripperOpen;
+using proud_up::ReachArm;
+using proud_up::ReachGreet;
+using proud_up::ReachGreetOutput;
+using proud_up::ReachPhase;
 using proud_up::tag_target_policy;
 using proud_up::TargetHit;
 using proud_up::TargetPolicy;
@@ -73,7 +81,6 @@ HunterConfig walk_cfg() {
   c.enable_walk = true;
   c.enable_crab = false;
   c.enable_wander = false;
-  c.follow_max_s = 60.0;
   c.lost_timeout = 0.5;
   c.search_timeout_s = 20.0;
   c.name_timeout_s = 0.2;
@@ -184,17 +191,19 @@ TEST(Hunter, NameOnceThenSkipWithinSearchTimeout) {
   EXPECT_FALSE(o.play_name);
 }
 
-TEST(Hunter, FollowMaxGoesToHuntEvenIfStillTracking) {
-  auto cfg = walk_cfg();
-  cfg.follow_max_s = 60.0;
-  Hunter h(cfg);
+// The old 60 s cap left Follow and forced one pan while the tag was
+// still in view, so a later plug could be discovered by looking away.
+// A held lock stays in Follow. The pan starts only after lost_timeout.
+TEST(Hunter, FollowStaysWhileTargetIsHeld) {
+  Hunter h(walk_cfg());
   h.start();
   h.tick(0.0, saveli_at(1.0, 0.0), 2.0, true);
   h.notify_name_done();
   h.tick(1.0, saveli_at(1.0, 0.0), 2.0, true);
-  const auto o = h.tick(61.5, saveli_at(1.0, 0.0), 2.0, false);
-  EXPECT_EQ(o.phase, HunterPhase::Hunt);
-  EXPECT_EQ(o.legs, LegCommandKind::Halt);
+  const auto o = h.tick(120.0, saveli_at(1.0, 0.0), 2.0, false);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_FALSE(o.pan_head);
+  EXPECT_EQ(o.sticky_id, "saveli");
 }
 
 TEST(Hunter, EnableWalkFalseNeverPublishesTwist) {
@@ -588,6 +597,69 @@ TEST(Hunter, DogAndOtherTagUsePolicyNotANewBranch) {
   EXPECT_FALSE(o.play_name);
 }
 
+// 15 cm is the follow standoff. A LiDAR return on the target does not
+// count as a wall, so she is allowed to arrive. A return well in front
+// of a far target still latches Stopped, and that stop does not greet.
+TEST(Hunter, StandoffIsFifteenCentimetresNotTheWall) {
+  auto cfg = walk_cfg();
+  cfg.r_target = 0.15;
+  cfg.d_stop = 0.55;
+  cfg.d_go = 0.70;
+  Hunter h(cfg);
+  h.start();
+  h.tick(0.0, saveli_at(0.15, 0.0), 2.0, true);
+  h.notify_name_done();
+  auto o = h.tick(0.30, saveli_at(0.15, 0.0), 0.14, true);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
+  EXPECT_TRUE(o.at_standoff);
+  EXPECT_EQ(o.legs, LegCommandKind::Halt);
+  EXPECT_FALSE(o.pan_head);
+
+  o = h.tick(0.40, saveli_at(1.20, 0.0), 0.40, true);
+  EXPECT_EQ(o.phase, HunterPhase::Stopped);
+  EXPECT_FALSE(o.at_standoff);
+}
+
+TEST(Hunter, ReachGreetGrabsTwiceThenReturnsHome) {
+  ReachArm home;
+  home.id19 = 500.0f;
+  home.id20 = 810.0f;
+  home.id22 = 117.0f;
+  home.id24 = 500.0f;
+  ReachGreet g;
+  int closes = 0;
+  bool saw_reach = false;
+  bool saw_home = false;
+  ReachGreetOutput step;
+  for (int i = 0; i <= 40; ++i) {
+    const double t = 0.1 * static_cast<double>(i);
+    step = advance_reach_greet(g, true, t, home, 520.0f);
+    if (!step.publish) {
+      continue;
+    }
+    if (step.arm.id20 > home.id20 && step.arm.id24 == kGripperOpen && !saw_reach) {
+      saw_reach = true;
+      EXPECT_FLOAT_EQ(step.arm.id19, 520.0f);
+    }
+    if (step.arm.id24 == kGripperClose) {
+      closes += 1;
+    }
+    if (step.arm.id20 == home.id20 && step.arm.id24 == home.id24 &&
+        step.arm.id22 == home.id22) {
+      saw_home = true;
+    }
+  }
+  EXPECT_TRUE(saw_reach);
+  EXPECT_EQ(closes, 2);
+  EXPECT_TRUE(saw_home);
+  EXPECT_EQ(g.phase, ReachPhase::Hold);
+  EXPECT_TRUE(step.own_arm);
+
+  const auto left = advance_reach_greet(g, false, 10.0, home, 500.0f);
+  EXPECT_FALSE(left.own_arm);
+  EXPECT_EQ(g.phase, ReachPhase::Idle);
+}
+
 TEST(Hunter, SaveliGreetingDoesNotLoop) {
   Hunter h(walk_cfg());
   h.start();
@@ -603,11 +675,12 @@ TEST(Hunter, CatGreetingLoopsWhileStandingClose) {
   h.start();
   h.tick(0.0, cat_at(0.40, 0.0), 0.40, true);
   h.notify_name_done();
+  // The return matches the cat, so it is not a wall. She stays in Follow.
+  // The name clip still repeats while she is there.
   auto o = h.tick(0.30, cat_at(0.40, 0.0), 0.40, true);
-  EXPECT_EQ(o.phase, HunterPhase::Stopped);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
   EXPECT_FALSE(o.play_name);
   o = h.tick(5.0, cat_at(0.40, 0.0), 0.40, true);
-  EXPECT_EQ(o.phase, HunterPhase::Stopped);
+  EXPECT_EQ(o.phase, HunterPhase::Follow);
   EXPECT_TRUE(o.play_name);
-  EXPECT_EQ(o.legs, LegCommandKind::Halt);
 }

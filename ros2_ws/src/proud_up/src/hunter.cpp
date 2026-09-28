@@ -344,9 +344,6 @@ void Hunter::enter(HunterPhase p, double now_s) {
     crab_ = false;
     last_twist_ = {};
   }
-  if (p == HunterPhase::Follow) {
-    follow_t0_ = now_s;
-  }
   if (p == HunterPhase::Hunt) {
     wander_kind_ = 0;
   }
@@ -463,13 +460,16 @@ HunterOutput Hunter::hunt_motion(double d_min, bool pan_sweep_done, double left_
 //      release_sticky_on_lost clears the lock so the next tick may name
 //      someone else. A tag lock waits for search_timeout_s instead.
 //   4. rename_on_preempt from Follow / Name / Stopped enters NAME.
-//      Hunt names in the branch below (after the forced pan).
+//      Hunt names in the branch below. No timed look-away.
 //   5. Hunt: maybe skip NAME (already named this lock), else NAME or wander.
+//      The head pans only while Hunt has no hit.
 //   6. Name: freeze until notify_name_done() or name_timeout_s.
 //      The timeout leaves Name but leaves name_playing_ set, so a repeating
 //      clip's silence clock still starts when the clip actually finishes.
-//   7. Follow / Stopped: 60 s cap, LiDAR hysteresis, coast on a brief miss,
-//      else PD Twist. Zero Twist → Halt, never publish Twist{0,0,0}.
+//   7. Follow / Stopped: LiDAR hysteresis, coast on a brief miss, else PD
+//      Twist. Zero Twist → Halt, never publish Twist{0,0,0}.
+//      lost_timeout with no hit returns to Hunt and pans. A held target
+//      stays in Follow; there is no follow clock.
 //   8. greet_silence_s > 0 and that quiet has passed: play_name again.
 //      finish_tick() does that on the way out. Lost clears the loop.
 // Species (Saveli, cat, a later dog or tag robot) is TargetPolicy on the
@@ -533,17 +533,9 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
   }
 
   if (phase_ == HunterPhase::Hunt) {
-    // After the 60 s Follow cap we force one full pan before locking
-    // again, otherwise a tag still in view would instantly re-Follow.
-    if (ignore_until_sweep_ && !pan_sweep_done) {
-      o = hunt_motion(d_min, pan_sweep_done, left_open, right_open);
-      o.sticky_id = sticky_id_;
-      o.d_min = d_min;
-      return finish_tick(o, seen, now_s);
-    }
-    if (ignore_until_sweep_ && pan_sweep_done) {
-      ignore_until_sweep_ = false;
-    }
+    // Pan only while nothing is locked. A hit locks immediately: we do
+    // not finish a sweep first, and we do not leave Follow on a clock
+    // just to look for someone else.
     if (seen) {
       // Same id inside search_timeout_s: Follow, no new Name phase.
       // A repeating plug that never left still speaks from finish_tick.
@@ -577,23 +569,15 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
   }
 
   if (phase_ == HunterPhase::Follow || phase_ == HunterPhase::Stopped) {
-    const double left = cfg_.follow_max_s - (now_s - follow_t0_);
-    o.follow_left_s = left;
-
-    if (left <= 0.0) {
-      named_this_lock_ = false;
-      ignore_until_sweep_ = true;
-      enter(HunterPhase::Hunt, now_s);
-      o.phase = HunterPhase::Hunt;
-      o.legs = LegCommandKind::Halt;
-      o.pan_head = true;
-      o.wander_action = "hold";
-      return finish_tick(o, seen, now_s);
-    }
-
     // Hysteresis: enter Stopped at d_stop, leave only after d_go. Without
     // it, a return at 0.55 m would chatter Halt/Twist every other tick.
-    if (std::isfinite(d_min) && d_min < cfg_.d_stop) {
+    // The followed target is not a wall: a return within 20 cm of its
+    // range is the target itself, and she keeps closing to r_target.
+    const double target_r =
+        seen ? std::hypot(seen->pose.x, seen->pose.y) : std::numeric_limits<double>::infinity();
+    const bool target_return =
+        std::isfinite(d_min) && std::isfinite(target_r) && (d_min + 0.20 >= target_r);
+    if (std::isfinite(d_min) && d_min < cfg_.d_stop && !target_return) {
       lidar_latched_ = true;
       enter(HunterPhase::Stopped, now_s);
     }
@@ -601,7 +585,6 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
       lidar_latched_ = false;
       if (seen) {
         enter(HunterPhase::Follow, now_s);
-        follow_t0_ = now_s - (cfg_.follow_max_s - left);
       }
     }
 
@@ -658,6 +641,10 @@ HunterOutput Hunter::tick(double now_s, const std::optional<TargetHit> &hit, dou
     last_twist_ = t;
     o.twist = t;
     o.crab = crab_;
+    // Settled on the standoff. A few centimetres of deadband, not a
+    // second stop distance. The reach greeting keys off this flag.
+    const double range = std::hypot(seen->pose.x, seen->pose.y);
+    o.at_standoff = std::fabs(range - cfg_.r_target) <= cfg_.deadband_x && twist_is_zero(t);
     if (!cfg_.enable_walk) {
       o.legs = LegCommandKind::None;
       return finish_tick(o, seen, now_s);

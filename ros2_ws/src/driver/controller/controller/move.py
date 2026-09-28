@@ -369,7 +369,7 @@ def _aep_pep(p0, vx, vy, wz, ts, stride_max, linear_factor=1.0):
     return (ax, ay, p0[2]), (px, py, p0[2])
 
 
-def sample_follow_gait(phi, vx, vy, wz, lift, period, nominal, stride_max=40.0, linear_factor=1.0):
+def sample_follow_gait(phi, vx, vy, wz, lift, period, nominal, stride_max=55.0, linear_factor=1.0):
     """One 20 ms bead. vx,vy mm/s; lift mm; period s; nominal six (x,y,z) mm.
 
     Cycle clock keeps rolling (no rest at wrap). Swing uses sigma(τ).
@@ -413,14 +413,17 @@ def FollowGaitGenerator(params, log=None):
     phase_num = math.ceil(round((params.period * 1000.0 / 20.0), 1))
     phase_num = max(int(phase_num), 2)
     phase_list = [(i / phase_num) * 2.0 * math.pi for i in range(phase_num)]
-    stride_max = 40.0
+    # Offset cap (|AEP-p0|), not the full step. 55 mm → ~75 mm step at
+    # the hunter's vx 0.25 m/s and T 0.60 s. 40 mm was the short shuffle.
+    stride_max = 55.0
     linear_factor = getattr(params, 'linear_factor', 1.0)
 
     if log is not None:
         log.info(
             'FollowGaitGenerator start (gait=5, never set_step_mode). '
             f'vx={params.velocity_x:.1f} mm/s vy={params.velocity_y:.1f} '
-            f'wz={params.angular_z:.3f} T={params.period:.2f}s h={height:.1f} mm'
+            f'wz={params.angular_z:.3f} T={params.period:.2f}s h={height:.1f} mm '
+            f'stride_cap={stride_max:.0f} mm'
         )
 
     cur_pose, status = yield None

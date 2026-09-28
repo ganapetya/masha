@@ -26,8 +26,8 @@ masha_hunter_node:
 
     # Walk still requires enable_walk:=true on launch. Wander is
     # enable_wander:=true and still needs that walk flag. Crab and speed are on.
-    # vx_max 0.12 matches voice "go forward". kp_x 0.60 saturates that at ~1 m
-    # (e.x = 1.00 − 0.80). Tripod half-cycle at T=0.70 s is ~40 mm, stride cap.
+    # vx_max 0.25 with T=0.60 s is a ~75 mm step (offset cap 55 mm in the
+    # follow gait). The old 0.12 m/s at T=0.70 s was a ~42 mm shuffle.
     #
     # Who to hunt. "saveli" is the AprilTag sticker (call-savelij.mp3),
     # tag_target_policy. "cat" is COCO class 15 (call-kitten.mp3),
@@ -42,22 +42,26 @@ masha_hunter_node:
     enable_wander: false
     dry_run: false
 
-    # Follow standoff and LiDAR hysteresis (metres). d_go > d_stop on purpose.
-    r_target: 0.80
+    # Follow standoff (metres). She halts when hypot(x,y) is within
+    # deadband_x of r_target, then the arm reaches and the gripper
+    # closes twice. d_stop is a wall, not the target: a LiDAR return
+    # within 20 cm of the target range does not latch Stopped.
+    r_target: 0.15
     d_stop: 0.55
     d_go: 0.70
-    # Follow→Hunt only after this long with no fresh TF. Duplicate id-0
+    # Follow→Hunt only after this long with no fresh hit. Duplicate id-0
     # frames used to drop TF and dump to head-search in 0.5 s.
+    # A held target is not dropped on a clock. The head pans again only
+    # after this loss (Saveli, cat, or whichever id was locked).
     lost_timeout: 1.5
     # TF older than this is not a live hit (coast instead).
     pose_max_age: 0.40
     walk_watchdog: 0.3
-    follow_max_s: 60.0
     search_timeout_s: 20.0
-    # PD: u = clamp(kp*e + kd*e_dot, ±*_max). kp_x 0.60 * 0.20 m error = 0.12
-    # which saturates vx_max — that is intentional at ~1 m range.
-    vx_max: 0.12
-    vy_max: 0.08
+    # PD: u = clamp(kp*e + kd*e_dot, ±*_max). Far from the 0.15 m
+    # standoff, kp_x saturates vx_max on purpose.
+    vx_max: 0.25
+    vy_max: 0.16
     wz_max: 0.30
     kp_x: 0.60
     kd_x: 0.08
@@ -71,8 +75,8 @@ masha_hunter_node:
     lidar_y: 0.0
     follow_gait: 5
     follow_gait_select: 15
-    cmd_height: 25.0
-    cmd_period: 0.70
+    cmd_height: 35.0
+    cmd_period: 0.60
 
     pan_min: 200.0
     pan_max: 800.0

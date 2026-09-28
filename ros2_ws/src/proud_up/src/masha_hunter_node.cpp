@@ -12,9 +12,12 @@
 //
 // Phase machine (owned by Hunter, executed here):
 //
-//   IDLE --~/start--> HUNT --hit--> NAME --mp3 done--> FOLLOW (≤60 s)
+//   IDLE --~/start--> HUNT --hit--> NAME --mp3 done--> FOLLOW
 //                         ^                              |
-//                         +-- lost / 60 s / LiDAR STOPPED +
+//                         +-- lost (lost_timeout) -------+
+//
+// Follow keeps the lock until it is lost. The head does not pan away
+// on a timer to look for another target. LiDAR Stopped stands in place.
 //
 // ---------------------------------------------------------------------------
 // Order of operations — process lifetime
@@ -119,6 +122,7 @@
 #include "proud_up/follow_the_cat.hpp"
 #include "proud_up/hunter.hpp"
 #include "proud_up/pose_commander.hpp"
+#include "proud_up/reach_greet.hpp"
 #include "proud_up/target_source.hpp"
 
 using namespace std::chrono_literals;
@@ -178,17 +182,16 @@ class MashaHunterNode : public rclcpp::Node {
     cfg.enable_walk = declare_parameter<bool>("enable_walk", false);
     cfg.enable_crab = declare_parameter<bool>("enable_crab", true);
     cfg.enable_wander = declare_parameter<bool>("enable_wander", false);
-    cfg.r_target = declare_parameter<double>("r_target", 0.80);
+    cfg.r_target = declare_parameter<double>("r_target", 0.15);
     cfg.d_stop = declare_parameter<double>("d_stop", 0.55);
     cfg.d_go = declare_parameter<double>("d_go", 0.70);
     cfg.lost_timeout = declare_parameter<double>("lost_timeout", 1.5);
     pose_max_age_s_ = declare_parameter<double>("pose_max_age", 0.40);
-    cfg.follow_max_s = declare_parameter<double>("follow_max_s", 60.0);
     cfg.search_timeout_s = declare_parameter<double>("search_timeout_s", 20.0);
     cfg.name_timeout_s = declare_parameter<double>("name_timeout_s", 8.0);
     cfg.cat_greet_silence_s = declare_parameter<double>("cat_greet_silence_s", 5.0);
-    cfg.vx_max = declare_parameter<double>("vx_max", 0.12);
-    cfg.vy_max = declare_parameter<double>("vy_max", 0.08);
+    cfg.vx_max = declare_parameter<double>("vx_max", 0.25);
+    cfg.vy_max = declare_parameter<double>("vy_max", 0.16);
     cfg.wz_max = declare_parameter<double>("wz_max", 0.30);
     cfg.kp_x = declare_parameter<double>("kp_x", 0.60);
     cfg.kd_x = declare_parameter<double>("kd_x", 0.08);
@@ -215,8 +218,8 @@ class MashaHunterNode : public rclcpp::Node {
     pan_max_ = static_cast<float>(declare_parameter<double>("pan_max", 800.0));
     pan_period_s_ = declare_parameter<double>("pan_period_s", 10.0);
     follow_gait_select_ = declare_parameter<int>("follow_gait_select", 15);
-    cmd_height_ = static_cast<float>(declare_parameter<double>("cmd_height", 25.0));
-    cmd_period_ = static_cast<float>(declare_parameter<double>("cmd_period", 0.70));
+    cmd_height_ = static_cast<float>(declare_parameter<double>("cmd_height", 35.0));
+    cmd_period_ = static_cast<float>(declare_parameter<double>("cmd_period", 0.60));
     gaze_gain_ = declare_parameter<double>("gaze_gain", 0.10);
     max_step_pulses_ = declare_parameter<double>("max_step_pulses", 8.0);
     deadband_rad_ = declare_parameter<double>("deadband_rad", 0.06);
@@ -719,7 +722,9 @@ class MashaHunterNode : public rclcpp::Node {
     }
 
     apply_legs(out);
-    apply_head(out, hit, info, cat_fresh);
+    if (!apply_reach_greet(t, out)) {
+      apply_head(out, hit, info, cat_fresh);
+    }
     publish_overlay(out, hit, d_min, image);
   }
 
@@ -759,6 +764,49 @@ class MashaHunterNode : public rclcpp::Node {
       }
       cmd_vel_pub_->publish(tw);
     }
+  }
+
+  // True while the reach greeting owns the arm. Hunt pan and gaze stay off
+  // for that stretch, including the hold after the head is back at rest.
+  bool apply_reach_greet(double now_s, const HunterOutput &out) {
+    ReachArm home;
+    home.id19 = rest_.id19;
+    home.id20 = rest_.id20;
+    home.id21 = rest_.id21;
+    home.id22 = rest_.id22;
+    home.id23 = rest_.id23;
+    home.id24 = rest_.id24;
+    float pan = rest_.id19;
+    pan += static_cast<float>(pulse_map_.yaw_sign * out.theta * pulse_map_.ticks_per_rad);
+    pan = std::max(pan_min_, std::min(pan_max_, pan));
+    const ReachPhase prev = reach_greet_.phase;
+    const ReachGreetOutput greet =
+        advance_reach_greet(reach_greet_, out.at_standoff, now_s, home, pan);
+    if (greet.publish) {
+      ArmPulses arm = rest_;
+      arm.id19 = greet.arm.id19;
+      arm.id20 = greet.arm.id20;
+      arm.id21 = greet.arm.id21;
+      arm.id22 = greet.arm.id22;
+      arm.id23 = greet.arm.id23;
+      arm.id24 = greet.arm.id24;
+      arm.duration_s = greet.arm.duration_s;
+      if (prev == ReachPhase::Idle && reach_greet_.phase == ReachPhase::Reach) {
+        RCLCPP_INFO(get_logger(),
+                    "standoff greet: reach, grab twice, home. pan %.0f shoulder %.0f",
+                    arm.id19, arm.id20);
+      }
+      if (dry_run_) {
+        RCLCPP_INFO(get_logger(),
+                    "dry_run greet id19=%.0f id20=%.0f id22=%.0f id24=%.0f dur=%.2f",
+                    arm.id19, arm.id20, arm.id22, arm.id24, arm.duration_s);
+      } else {
+        servo_pub_->publish(make_arm_command(arm));
+      }
+      gaze_id19_ = arm.id19;
+      gaze_id22_ = arm.id22;
+    }
+    return greet.own_arm;
   }
 
   // Head modes, in this order:
@@ -875,10 +923,9 @@ class MashaHunterNode : public rclcpp::Node {
     }
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "%s r=%.2f th=%.1f crab=%d vx=%.2f vy=%.2f dmin=%.2f left=%.0f %s",
+                  "%s r=%.2f th=%.1f crab=%d vx=%.2f vy=%.2f dmin=%.2f %s",
                   hunter_phase_name(out.phase), out.r, out.theta * 180.0 / kHunterPi,
-                  out.crab ? 1 : 0, out.twist.vx, out.twist.vy, d_min, out.follow_left_s,
-                  out.wander_action);
+                  out.crab ? 1 : 0, out.twist.vx, out.twist.vy, d_min, out.wander_action);
     cv::putText(cv->image, buf, {12, 28}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 255, 0}, 2);
     if (hit && hit->pose.has_pixel) {
       cv::circle(cv->image, {static_cast<int>(hit->pose.u), static_cast<int>(hit->pose.v)}, 8,
@@ -968,6 +1015,7 @@ class MashaHunterNode : public rclcpp::Node {
       cat_head_latched_ = false;
       gaze_id19_ = rest_.id19;
       gaze_id22_ = rest_.id22;
+      reach_greet_ = {};
     }
     send_rest();
     response->success = true;
@@ -981,6 +1029,7 @@ class MashaHunterNode : public rclcpp::Node {
       std::lock_guard<std::mutex> lock(mutex_);
       stopping_ = true;
       hunter_.stop();
+      reach_greet_ = {};
     }
     // player_.stop() joins the player thread — do it outside the mutex
     // so control_tick is not blocked for the length of the clip.
@@ -1042,6 +1091,7 @@ class MashaHunterNode : public rclcpp::Node {
   float gaze_id19_{500.0f};          // last commanded pan (integrator state)
   float gaze_id22_{150.0f};          // last commanded tilt
   ArmPulses rest_;                   // hunter pose: arm out, camera forward-down
+  ReachGreet reach_greet_{};         // neck reach + two grabs at the 15 cm stop
   PulseMapping pulse_map_;           // optical yaw/pitch → servo ticks
   Hunter hunter_;                    // the ROS-free policy object
   HunterOutput last_out_;

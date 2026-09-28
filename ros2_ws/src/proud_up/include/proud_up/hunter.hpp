@@ -13,7 +13,12 @@
 //
 //   IDLE --start()--> HUNT --hit--> NAME --notify_name_done()--> FOLLOW
 //                         ^                                       |
-//                         +-- lost / 60 s / LiDAR STOPPED --------+
+//                         +-- lost (lost_timeout) ----------------+
+//
+// Follow has no clock. A target that stays in view is followed until it
+// is lost. The head pans again only in Hunt, which is that lost case
+// (and the search before the first lock). LiDAR closer than d_stop
+// stands in Stopped without panning; opening past d_go returns to Follow.
 //
 // A vision target that stays in view is greeted again after its
 // TargetPolicy::greet_silence_s of quiet. The clock starts when the clip
@@ -49,7 +54,7 @@ inline constexpr double kHunterPi = 3.14159265358979323846;
 // Idle     constructed, or after ~/stop. No motion, no pan.
 // Hunt     looking: head triangle-pan. Optional wander walk.
 // Name     freeze, play the locked target's clip, then Follow.
-// Follow   PD on range + bearing for ≤ follow_max_s.
+// Follow   PD on range + bearing, until the lock is lost.
 // Stopped  LiDAR closer than d_stop; stand until d_go or lost.
 enum class HunterPhase { Idle, Hunt, Name, Follow, Stopped };
 
@@ -143,7 +148,6 @@ struct HunterConfig {
   double d_stop{0.55};       // LiDAR closer than this → Stopped
   double d_go{0.70};         // hysteresis: must open past this to leave Stopped
   double lost_timeout{1.5};  // Follow→Hunt; brief TF drops *coast* until then
-  double follow_max_s{60.0};
   double search_timeout_s{20.0};  // forget sticky_id; also NAME skip window
   double name_timeout_s{8.0};     // NAME → Follow even if aplay hangs
   // Node copies this onto the cat plug's TargetPolicy::greet_silence_s.
@@ -224,12 +228,15 @@ struct HunterOutput {
   TwistBody twist;
   bool pan_head{false};   // Hunt: node runs the triangle sweep on servo 19
   bool play_name{false};  // rising edge: node starts the NAME clip this tick only
+  // Follow has settled on the standoff: range within deadband_x of
+  // r_target and the twist is zero. Not a LiDAR wall stop. The node
+  // plays the reach-and-grab greeting from this.
+  bool at_standoff{false};
   bool crab{false};
   std::string sticky_id;
   double r{0.0};
   double theta{0.0};
   double d_min{0.0};
-  double follow_left_s{0.0};
   const char *wander_action{"hold"};
 };
 
@@ -336,12 +343,10 @@ class Hunter {
   bool greet_silence_open_{false};  // repeating clip finished; sighting not lost
   double greet_silent_since_{0.0};  // when that clip finished
   bool lidar_latched_{false};     // Stopped until d_min > d_go (hysteresis)
-  bool ignore_until_sweep_{false};  // after 60 s: finish one pan before re-lock
   bool wall_stood_{false};        // wander: stand one tick before turning
   int wander_kind_{0};            // 0 hold, 1 walk, 2 turn
   double now_{0.0};
   double phase_t_{0.0};           // when we entered the current phase
-  double follow_t0_{0.0};         // Follow clock; 60 s is measured from here
   double last_hit_t_{0.0};
   double last_named_t_{-1.0e9};
   double prev_ex_{0.0};           // previous errors, for e_dot = (e - prev) / dt

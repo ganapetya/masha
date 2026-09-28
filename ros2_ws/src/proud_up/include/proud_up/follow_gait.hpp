@@ -50,9 +50,12 @@ inline constexpr double kPi = 3.14159265358979323846;
 inline constexpr double kTwoPi = 2.0 * kPi;
 inline constexpr double kOmegaEps = 1.0e-6;     // rad/s; below this, SE(2) uses the linear map
 inline constexpr double kContactBandMm = 3.0;   // stance feet must stay this close in z
-inline constexpr double kDefaultStrideMaxMm = 40.0;
-inline constexpr double kDefaultLiftMm = 25.0;
-inline constexpr double kDefaultPeriodS = 0.70;
+// Cap on |AEP − p0| and |PEP − p0|, not on the full step. A full step is
+// about twice this. 55 mm allows a ~75 mm step at vx = 0.25 m/s, T = 0.60 s.
+// The old 40 mm cap, with vx 0.12 m/s, was a ~42 mm shuffle.
+inline constexpr double kDefaultStrideMaxMm = 55.0;
+inline constexpr double kDefaultLiftMm = 35.0;
+inline constexpr double kDefaultPeriodS = 0.60;
 inline constexpr double kDt = 0.02;             // StepController tick, seconds
 
 struct Vec3 {
