@@ -166,10 +166,15 @@ def total_dist_sq(a_pts, b_pts):
         s += dx*dx + dy*dy + dz*dz
     return s
 
-# Module-level handoff between consecutive CmdVelGenerator instances.
-# When a generator is told status=='finish', it stores the last pose it
-# yielded in finish_ps. The next generator uses that pose to pick a start
-# phase close to where the previous cycle left the feet (avoids a jump).
+# Module-level handoff shared by CmdVelGenerator and FollowGaitGenerator.
+# On status=='finish' the live generator stores the pose it is about to
+# yield into finish_ps, every finish tick, so the last one is the pose the
+# feet were given when that slice wrapped. The next generator searches its
+# new cycle for the frame nearest that pose and starts there (avoids a jump).
+# slow is the servo-timing tag returned with each pose ('cmd_true' asks for
+# a 50 ms blend, 'cmd_false' keeps the usual 20 ms command).
+# stop means "we refused to splice at frame 0". finish_index is the cursor
+# after a finish yield; no other function reads it.
 finish_ps = []
 slow = 'cmd_false'
 stop = False   
@@ -305,13 +310,15 @@ def CmdVelGenerator(params, log=None):
 
 
 # ---------------------------------------------------------------------------
-# Follow gait (gait=5). Formulas: proud_up/include/proud_up/follow_gait.hpp
+# Follow gait (gait=5). The foot curves match
+# proud_up/include/proud_up/follow_gait.hpp, retyped in sample_follow_gait
+# below. This file does not include that header and does not call it.
 #
-# This generator is a *client* of that map. It does not call
-# kinematics.set_step_mode or cmd_vel_new_point. StepController still
-# owns the 20 ms loop and the IK (set_leg_position).
+# FollowGaitGenerator does not call kinematics.set_step_mode or
+# cmd_vel_new_point. StepController still owns the 20 ms loop and the IK
+# (set_leg_position).
 #
-# Same handshake as CmdVelGenerator so halt can finish a cycle and a new
+# Same handshake as CmdVelGenerator so a halt can finish a cycle and a new
 # Twist can splice on last_part without teleporting the feet.
 # ---------------------------------------------------------------------------
 
@@ -405,19 +412,67 @@ def FollowGaitGenerator(params, log=None):
     """Yield omnidirectional-tripod poses for gait=5 / cmd_gait=5.
 
     Never calls kinematics.set_step_mode. IK stays in StepController.
+
+    Python generator: `yield` freezes this function and hands one value to
+    StepController. The controller's 20 ms loop is the projector. This
+    function is the film. Calling FollowGaitGenerator(...) only builds the
+    generator object; the body runs on send().
+
+    Handshake, same words as CmdVelGenerator:
+      send(None) once     — prime, runs up to the first yield
+      status 'first'      — play the intro slice (steps1), startup or swap
+      status 'running'    — play the full baked cycle
+      status 'finish'     — play the outro slice (steps2), stash finish_ps
+    The bool beside each pose is last_part: True means this slice just
+    wrapped, so the controller may wind down or swap generators.
+    A new Twist does not edit this table. It builds a new generator and
+    waits for last_part.
     """
+    # `global` is a write permit, not an import. These four names already
+    # exist at the top of this file and are shared with CmdVelGenerator.
+    # Without `global`, `finish_ps = []` below would create a local and
+    # the next generator would never see the hand-off pose.
+    # finish_ps is that hand-off: the previous animation's last feet, used
+    # once so two generators can be glued without a servo snap.
     global finish_ps, slow, stop, finish_index
+
+    # Requested peak toe clearance, millimetres. relative_h may replace it
+    # with a percent of the current stance height on each bake.
     height = params.height
+    # Stance object this bake was computed from. The inner loop compares
+    # it with `is` (same Python object). It is StepController.pose, the
+    # stored foot targets, not a reading from the servos.
     org_pose = None
+    # Cursor into whichever slice we are playing. Survives a rebake;
+    # the outer loop does not put it back to 0.
     phase_index = 0
+
+    # How many 20 ms frames fit in one period. round-to-1-decimal, then
+    # ceil, so binary float noise (30.0000001) does not become an extra
+    # frame. 1.00 s → 50 frames. The hunter's 0.60 s → 30 frames.
     phase_num = math.ceil(round((params.period * 1000.0 / 20.0), 1))
+    # Two frames minimum. A 1-frame cycle wraps on every tick (`% 1`
+    # is always 0), and the controller would treat every tick as a boundary.
     phase_num = max(int(phase_num), 2)
+
+    # The gait clock is an angle. A for-loop cannot walk "0 to 2π", so
+    # each frame gets one sample: frame i is at fraction i/phase_num of
+    # the circle. The list starts at 0 and stops just before 2π. The next
+    # lap is frame 0 again. That seam is why index 0 is special below.
     phase_list = [(i / phase_num) * 2.0 * math.pi for i in range(phase_num)]
-    # Offset cap (|AEP-p0|), not the full step. 55 mm → ~75 mm step at
-    # the hunter's vx 0.25 m/s and T 0.60 s. 40 mm was the short shuffle.
+
+    # Offset cap (|AEP − home| and |PEP − home|), not the full PEP→AEP
+    # travel. 55 mm → ~75 mm step at the hunter's vx 0.25 m/s and T 0.60 s.
+    # 40 mm was the short shuffle. sample_follow_gait clamps each foot so
+    # a large command cannot park a toe past this radius from its home.
     stride_max = 55.0
+    # Multiplies vx and vy inside _aep_pep. wz is left alone.
+    # CmdVelParams always has this attribute; getattr keeps a stray params
+    # object from crashing the bake. Missing → 1.0, meaning "use vx, vy as given".
     linear_factor = getattr(params, 'linear_factor', 1.0)
 
+    # Once, before any foot pose. Later ticks do not log. The numbers are
+    # the command this generator was built with; a new Twist is a new object.
     if log is not None:
         log.info(
             'FollowGaitGenerator start (gait=5, never set_step_mode). '
@@ -426,14 +481,39 @@ def FollowGaitGenerator(params, log=None):
             f'stride_cap={stride_max:.0f} mm'
         )
 
+    # Prime. `cur_pose, status = yield None` both gives None to the caller
+    # and, on the next send, receives whatever they pass. cmd_vel's first
+    # send(None) only gets us here and discards the None. The loop thread's
+    # first send((stance, 'first')) is what fills cur_pose and status.
     cur_pose, status = yield None
+
+    # Outer loop, the animator. Bakes one full cycle into `steps`, then
+    # the inner loop plays it. We come back here only when the controller
+    # replaces self.pose with a different object (a stand, or a body move).
+    # A normal 20 ms tick does not. A new velocity does not either: that
+    # waits for last_part and then runs a new generator from the top.
     while True:
         org_pose = cur_pose
+        # Six homes as plain (x, y, z) floats, millimetres, body frame.
+        # Each foot's curve is drawn around its own home.
         nominal = [(float(p[0]), float(p[1]), float(p[2])) for p in cur_pose]
         if params.relative_h:
+            # Stance z is negative: the feet are below the body origin
+            # (DEFAULT_POSE uses −INITIAL_HEIGHT). abs() is the ruler.
+            # params.height is then a percent of leg 0's stance height.
+            # That number is the peak of the swing arch in sample_follow_gait:
+            # z = home_z + 4·σ·(1−σ)·height, highest when σ = 0.5.
+            # Twist walking passes relative_h False, so this stays off;
+            # set_step_mode gait 5 can turn it on.
             height = abs(nominal[0][2]) * (params.height / 100.0)
+
+        # Bake every frame now. This for-loop does not yield. After it,
+        # `steps[i]` is the six toes at phase_list[i].
         steps = []
         for phase in phase_list:
+            # phase: radians along the circle. vx, vy: mm/s. angular_z:
+            # rad/s. height: peak lift, mm. period: seconds. nominal: the
+            # six homes. stride_max / linear_factor: resolved above.
             steps.append(sample_follow_gait(
                 phase,
                 params.velocity_x,
@@ -446,48 +526,114 @@ def FollowGaitGenerator(params, log=None):
                 linear_factor,
             ))
 
+        # Splice, once per bake. Frame 0 puts one tripod at PEP and the
+        # other at AEP, the two extremes. Playback has to be allowed to
+        # start at a later frame that already looks like the current feet.
         if finish_ps:
+            # Sum of squared foot-to-foot distances. Skipping the square
+            # root is enough: we only need which frame is nearest.
             dists = [total_dist_sq(finish_ps, bi) for bi in steps]
             idx = min(range(len(dists)), key=lambda i: dists[i])
             if idx == 0:
+                # Frame 0 would make the outro `steps[:0]` empty, and the
+                # first 'finish' tick would index that empty list. Start
+                # one frame later. stop remembers that we refused the seam;
+                # the 'first' branch ORs it into the slow-blend test while
+                # finish_ps is still set.
                 idx = 1
                 stop = True
             else:
                 stop = False
         else:
+            # No hand-off pose. That is a cold start, and also a rebake:
+            # the 'first' tick already cleared finish_ps, so a later stance
+            # change comes through here too. Leg 1 (the second tuple) stands
+            # at x = 0 in DEFAULT_POSE, so "leg 1's x closest to 0" means
+            # that foot is near its forward home. Search only the first half
+            # of the cycle; the second half is the other tripod.
             idx = min(range(len(steps) // 2), key=lambda i: abs(steps[i][1][0]))
             if idx == 0:
+                # Same empty-outro guard as the hand-off path. This branch
+                # does not arm the slow blend: finish_ps is empty, so the
+                # 'first' tick below takes the other arm and writes
+                # slow = 'cmd_false'.
                 idx = 1
                 stop = True
             else:
                 stop = False
 
+        # Cut the film at the splice. Math frame 0 is the seam, not "where
+        # the feet are now", so playback must be allowed to start mid-table.
+        # steps1, the intro: splice → end of the table. status 'first'.
+        # steps2, the outro: start of the table → splice. status 'finish'.
+        # status 'running' ignores both and plays `steps` whole.
         steps1 = steps[idx:]
         steps2 = steps[:idx]
 
+        # Inner loop, the projector. One yield per wake-up. At each yield
+        # we freeze; ~20 ms later the controller send()s the stance it
+        # still holds, plus the next status word.
         while True:
             if status == 'first':
+                # Intro: from the splice toward the end of the math cycle.
                 ps = steps1[phase_index]
                 if finish_ps:
+                    # Only the first 'first' tick still has the stash. The
+                    # largest single-toe jump to this frame, in millimetres.
+                    # Over 7 mm, or we skipped the seam (stop), asks
+                    # StepController for a 50 ms command on this one frame
+                    # (slow == 'cmd_true'). The thread still sleeps 20 ms;
+                    # the next tick replaces that pulse.
                     distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, finish_ps)])
                     if distances > 7 or stop:
                         slow = 'cmd_true'
+                    # Drop the stash now, or every later 'first' tick would
+                    # run this test again.
                     finish_ps = []
                 else:
+                    # Later 'first' ticks, and a cold start: ordinary timing.
                     slow = 'cmd_false'
+                # Advance inside the intro. Its length is phase_num − idx,
+                # which is len(steps1). Wrapping this modulo is what makes
+                # phase_index == 0 at the end of the intro.
                 phase_index = (phase_index + 1) % (len(steps) - idx)
             elif status == 'finish':
+                # Outro: from the math seam back toward the splice, so a
+                # stop can park on the way to a pose the next generator
+                # knows how to meet.
                 ps = steps2[phase_index]
+                # max(idx, 1) keeps this modulo off zero if idx were ever
+                # left at 0. The splice above already forces idx to 1.
                 phase_index = (phase_index + 1) % max(idx, 1)
+                # Overwrite the hand-off every finish tick. The write that
+                # matters is the one on the wrapping yield: that pose is
+                # what the next generator splices against.
                 finish_ps = ps
+                # Cursor after the increment. Stored, never read.
                 finish_index = phase_index
             else:
+                # 'running', and any word that is not 'first' or 'finish'.
+                # Full cycle, seam included.
                 ps = steps[phase_index]
+                # 29 + 1 wraps to 0 when phase_num is 30. That 0 is the
+                # signal below; the frame we just took was the last one.
                 phase_index = (phase_index + 1) % phase_num
+
+            # The frame was chosen first, then the cursor moved. Cursor 0
+            # means the move wrapped, so `ps` is the last frame of this
+            # slice. True: controller may enter 'finish' or swap in the
+            # queued generator. False: mid-slice, keep playing.
             if phase_index == 0:
                 cur_pose, status = yield ps, True, params, slow
             else:
                 cur_pose, status = yield ps, False, params, slow
+
+            # Wake-up, about 20 ms later. `is` checks the object, not the
+            # millimetres. Gait ticks call set_pose_base(..., update_pose=
+            # False), so self.pose stays this same object and `steps` keeps
+            # playing. A stand or a pose transform stores a new tuple; that
+            # object arrives here and we break out to bake again.
+            # phase_index is still wherever the old film had reached.
             if cur_pose is not org_pose:
                 break
 
