@@ -8,6 +8,10 @@
   <a href="https://docs.google.com/document/d/1htNEsd6-288xz86QeZI_8CehXg5_2lO9QK0vWuy5Szk/edit?usp=sharing">Masha Internals and Workings Research</a>
 </h2>
 
+<h2 align="center">
+  <a href="https://www.youtube.com/@CatsBotsStuff">Videos of different scenarious and experiments</a>
+</h2>
+
 Masha is a **Hiwonder ROSpider** hexapod. This repository is her software image: ROS 2 Humble on a Jetson Orin NX. Git root is the robot home directory (`/home/ubuntu`). Develop on a Linux host, then `git pull` and `colcon build` on the Jetson.
 
 Sister robot **Savelij** will live in a separate repo. Shared world-level notes belong in [robots-world](https://github.com/ganapetya/robots-world).
