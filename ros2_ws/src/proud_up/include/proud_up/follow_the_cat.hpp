@@ -1,163 +1,36 @@
 #pragma once
 
-// Follow-the-cat library: find a person in a camera image and turn that
-// pixel into pan/tilt servo pulses.
+// Follow-the-cat geometry: turn an aim pixel into pan/tilt servo pulses.
 //
-// This header has no ROS. The node (follow_the_cat_node.cpp) calls these
-// functions from a timer after it has copied the latest image pointer.
-// Tests call the same functions with fake images — no robot required.
+// The box itself comes from SubjectDetector (subject_detector.hpp). This
+// header has no ROS and does not run YOLO. The node
+// (follow_the_cat_node.cpp) calls these functions from a timer after it
+// has a SubjectDetection. Tests call the same functions with fake pixels.
 //
 // Pipeline a learner can follow top to bottom:
 //
-//   image  →  YOLO person box  →  aim pixel (torso, not the top of the box)
-//         →  ray through the camera lens
-//         →  yaw / pitch (how far the person is from the image centre)
-//         →  a small step on arm servos 19 (pan) and 22 (tilt)
+//   aim pixel  →  ray through the camera lens
+//             →  yaw / pitch (how far the subject is from the image centre)
+//             →  a small step on arm servos 19 (pan) and 22 (tilt)
 //
 // Optical frame (ROS camera convention, not the robot base):
 //   X right, Y down, Z forward (out of the lens).
-// A pixel (u, v) is not a 3D point in the room. It is a direction. This
-// week we have no depth, so we never compute "metres to the person".
+// A pixel (u, v) is not a 3D point in the room. It is a direction.
 
 #include <cmath>
 #include <cstring>
-#include <memory>
 #include <optional>
-#include <string>
-#include <vector>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <opencv2/core.hpp>
-#include <opencv2/objdetect.hpp>
+
+#include "proud_up/subject_detector.hpp"
 
 namespace proud_up {
 
 // ---------------------------------------------------------------------------
-// 1. Image plane — where the person appears in the picture
-// ---------------------------------------------------------------------------
-
-// Pixel coordinates in the Aurora RGB image. The origin is the top-left
-// corner of the frame. u grows to the right, v grows downward. Units are
-// pixels, not metres.
-struct Pixel {
-  double u{0.0};
-  double v{0.0};
-};
-
-// One detection the rest of the node can use. Both YOLO (a person) and LBP
-// (a face) fill this same struct. After detection, the control loop does
-// not care which detector produced the box — it only needs a pixel to look
-// at, a rectangle to draw, and a short label.
-//
-// std::optional<PersonDetection> is the "did we see anyone?" result:
-//   has a value  →  there is a box this frame (or a remembered coast box)
-//   empty        →  a miss: Idle waits, Tracking may go Lost, Moving aborts
-struct PersonDetection {
-  Pixel center;                       // the pixel we aim the camera at
-  std::vector<cv::Point> contour;     // rectangle corners, for the debug image
-  std::vector<cv::Point> approx;      // same as contour for a YOLO / face box
-  double area{0.0};                   // box width * height, in px^2
-  double aspect{0.0};                 // width / height; a standing person is < 1
-  const char *label{"person"};        // "person", "face", or "coast"
-};
-
-// ---------------------------------------------------------------------------
-// 2. Finding a subject — one COCO class from yolov8n.onnx
-// ---------------------------------------------------------------------------
-
-// The same net scores every COCO class. coco_class picks the column:
-// 0 is a person, 15 is a cat. Follow-the-cat and the hunter share this
-// detector; only the column and the shape checks change.
-//
-// The LBP face cascade is a second, cheaper pass, and only for a person.
-// It helps when someone is looking at the lens. It is optional and off by
-// default because it can lock onto a window or a curtain instead of a face.
-// A cat turns it off.
-//
-// person_head_frac chooses the aim pixel inside the YOLO box. 0.0 is the
-// top edge, 0.5 is the middle, 1.0 is the bottom. 0.45 aims at a person's
-// torso. Aiming too high (for example 0.12) sends the camera up toward the
-// ceiling and it stays there.
-struct SubjectDetectConfig {
-  std::string cascade_dir{"/usr/share/opencv4/haarcascades"};
-  std::string lbp_dir{"/usr/share/opencv4/lbpcascades"};
-  std::string person_onnx;  // empty = skip YOLO (tests, or face-only)
-  double image_scale{0.45};  // LBP face runs on a smaller grey image
-  double scale_factor{1.2};
-  int min_neighbors{3};
-  int min_face{24};  // pixels in the original image, not the scaled copy
-  double person_conf{0.45};
-  double person_iou{0.45};
-  int person_imgsz{320};
-  bool dnn_cuda{true};
-  bool enable_face_refine{false};
-  double person_head_frac{0.45};
-  double max_box_frac{0.40};     // a box that fills the frame is a wall, not a person
-  double max_aspect{1.05};       // a person is taller than they are wide
-  double track_gate_frac{0.22};  // stay on the same person; do not jump to a neighbour
-  int coco_class{0};             // 0 = person, 15 = cat. Same ONNX, different column.
-  bool require_person_shape{true};
-  bool enable_face_fallback{true};
-};
-
-// YOLOv8 row: 4 box numbers, then COCO scores. True when `cls` is present
-// and no other class scores strictly higher. Cat detection requires this.
-// Person detection does not call it (a seated person often loses to "chair").
-inline bool coco_class_is_best(const float *row, int cols, int cls, int n_classes = 80) {
-  if (row == nullptr || cls < 0 || cols < 5 || (4 + cls) >= cols) {
-    return false;
-  }
-  const float mine = row[4 + cls];
-  int n = n_classes;
-  if (n > cols - 4) {
-    n = cols - 4;
-  }
-  for (int c = 0; c < n; ++c) {
-    if (c == cls) {
-      continue;
-    }
-    if (row[4 + c] > mine) {
-      return false;
-    }
-  }
-  return true;
-}
-
-class SubjectDetector {
- public:
-  explicit SubjectDetector(const SubjectDetectConfig &cfg = {});
-  ~SubjectDetector();
-  bool ok() const { return ok_ || person_ok_; }
-  bool person_ok() const { return person_ok_; }
-  bool using_cuda() const { return using_cuda_; }
-  double last_detect_ms() const { return last_detect_ms_; }
-  void reset_track();
-  // Copy runtime scalars (thresholds, gates). Does not reload ONNX or cascades.
-  void apply_runtime_cfg(const SubjectDetectConfig &cfg);
-  std::optional<PersonDetection> detect(const cv::Mat &bgr);
-
- private:
-  std::optional<cv::Rect> detect_person_box(const cv::Mat &bgr);
-  std::optional<PersonDetection> detect_face_in(const cv::Mat &bgr, const cv::Rect &roi);
-  void warmup_person_net();
-  static bool looks_like_person(const cv::Rect &r, int width, int height,
-                                const SubjectDetectConfig &cfg);
-
-  struct PersonNet;
-  SubjectDetectConfig cfg_;
-  cv::CascadeClassifier face_;
-  std::unique_ptr<PersonNet> person_;
-  cv::Rect last_person_;
-  bool have_last_person_{false};
-  bool ok_{false};
-  bool person_ok_{false};
-  bool using_cuda_{false};
-  double last_detect_ms_{0.0};
-};
-
-// ---------------------------------------------------------------------------
-// 3. Camera internals — turning a pixel into a 3D direction
+// 1. Camera internals — turning a pixel into a 3D direction
 // ---------------------------------------------------------------------------
 
 // Pinhole camera. K is the 3×3 camera matrix:
@@ -205,7 +78,7 @@ CameraIntrinsics from_k_matrix(int width, int height, const double k[9]);
 Eigen::Vector3d pixel_to_ray(double u, double v, const CameraIntrinsics &K);
 
 // ---------------------------------------------------------------------------
-// 4. Yaw and pitch — how far the person is from the image centre
+// 2. Yaw and pitch — how far the subject is from the image centre
 // ---------------------------------------------------------------------------
 
 // Angles that rotate the camera's +Z onto the target ray.
@@ -232,7 +105,7 @@ GazeAngles ray_to_yaw_pitch(const Eigen::Vector3d &ray);
 Eigen::Quaterniond gaze_quaternion(double yaw, double pitch);
 
 // ---------------------------------------------------------------------------
-// 5. Servo pulses — turning angles into bus-servo ticks
+// 3. Servo pulses — turning angles into bus-servo ticks
 // ---------------------------------------------------------------------------
 
 // Bus-servo travel on this robot: 240 degrees mapped onto pulse ticks 0..1000.
@@ -326,23 +199,23 @@ float clamp_delta(float value, float max_abs);
 bool near_optical_axis(const GazeAngles &angles, double yaw_tol, double pitch_tol);
 
 // ---------------------------------------------------------------------------
-// 6. Coast, walk gate, debug overlay
+// 4. Coast, walk gate, debug overlay
 // ---------------------------------------------------------------------------
 
 // If YOLO misses for a moment, the node keeps the last box and marks it
 // "coast" so the camera can hold still. Walking must not use that
 // remembered box: the person may already have moved.
-inline bool is_coasted_detection(const PersonDetection &det) {
+inline bool is_coasted_detection(const SubjectDetection &det) {
   return det.label != nullptr && std::strcmp(det.label, "coast") == 0;
 }
 
-inline bool walk_detection_valid(const std::optional<PersonDetection> &det) {
+inline bool walk_detection_valid(const std::optional<SubjectDetection> &det) {
   return det.has_value() && !is_coasted_detection(*det);
 }
 
 // Debug overlay for ~/image_result: box, aim pixel, phase string.
 // Writes onto `bgr` in place (the node already owns a copy from toCvCopy).
-void draw_debug_overlay(cv::Mat &bgr, const std::optional<PersonDetection> &det,
+void draw_debug_overlay(cv::Mat &bgr, const std::optional<SubjectDetection> &det,
                         const char *phase, const GazeAngles *angles = nullptr,
                         const char *note = nullptr);
 

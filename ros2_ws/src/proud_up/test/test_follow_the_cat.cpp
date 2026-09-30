@@ -22,7 +22,7 @@ using proud_up::integrate_gaze;
 using proud_up::kPi;
 using proud_up::kTicksPerRadian;
 using proud_up::near_optical_axis;
-using proud_up::PersonDetection;
+using proud_up::SubjectDetection;
 using proud_up::pixel_to_ray;
 using proud_up::PulseMapping;
 using proud_up::ray_to_yaw_pitch;
@@ -229,7 +229,7 @@ TEST(FollowTheCat, IntegrateGazeSlewLimit) {
 TEST(FollowTheCat, SubjectDetectorLoadsCascades) {
   SubjectDetector detector;
   ASSERT_TRUE(detector.ok());
-  EXPECT_FALSE(detector.person_ok());
+  EXPECT_FALSE(detector.subject_ok());
   EXPECT_FALSE(detector.detect(cv::Mat()).has_value());
   EXPECT_FALSE(detector.detect(white_wall()).has_value());
 }
@@ -244,7 +244,7 @@ TEST(FollowTheCat, YoloPersonIgnoresWhiteWall) {
   for (const char *path : candidates) {
     cfg.person_onnx = path;
     SubjectDetector detector(cfg);
-    if (!detector.person_ok()) {
+    if (!detector.subject_ok()) {
       continue;
     }
     EXPECT_FALSE(detector.detect(white_wall()).has_value());
@@ -257,15 +257,15 @@ TEST(FollowTheCat, YoloPersonIgnoresWhiteWall) {
 TEST(FollowTheCat, CoastDetectionIsNotValidForWalk) {
   EXPECT_FALSE(walk_detection_valid(std::nullopt));
 
-  PersonDetection person;
+  SubjectDetection person;
   person.label = "person";
   EXPECT_TRUE(walk_detection_valid(person));
 
-  PersonDetection face;
+  SubjectDetection face;
   face.label = "face";
   EXPECT_TRUE(walk_detection_valid(face));
 
-  PersonDetection coast;
+  SubjectDetection coast;
   coast.label = "coast";
   EXPECT_FALSE(walk_detection_valid(coast));
 }

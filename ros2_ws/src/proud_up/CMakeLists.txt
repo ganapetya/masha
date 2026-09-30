@@ -48,7 +48,16 @@ target_link_libraries(proud_up_core
   CURL::libcurl
 )
 
-# Geometry + detection only. No rclcpp — gtest links this without spinning a node.
+# YOLO + face cascade. No rclcpp. Follow-the-cat and the hunter both link this.
+add_library(subject_detector STATIC src/subject_detector.cpp)
+target_include_directories(subject_detector PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(subject_detector PUBLIC ${OpenCV_LIBS})
+
+# Pixel → ray → servo pulses. No rclcpp. Detection is subject_detector.
 add_library(follow_the_cat STATIC src/follow_the_cat.cpp)
 target_include_directories(follow_the_cat PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -57,7 +66,7 @@ target_include_directories(follow_the_cat PUBLIC
   ${Eigen3_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
 )
-target_link_libraries(follow_the_cat PUBLIC ${OpenCV_LIBS})
+target_link_libraries(follow_the_cat PUBLIC subject_detector ${OpenCV_LIBS})
 if(TARGET Eigen3::Eigen)
   target_link_libraries(follow_the_cat PUBLIC Eigen3::Eigen)
 endif()
@@ -151,7 +160,7 @@ target_link_libraries(follow_the_cat_node
 )
 
 # Wiring executable: sensors, TF, servos. Links hunter (policy)
-# + follow_the_cat (YOLO + pinhole + gaze) + proud_up_core (arm pulses)
+# + subject_detector (YOLO) + follow_the_cat (pinhole + gaze) + proud_up_core (arm pulses)
 # + audio_player (NAME clips). This file does not spawn aplay.
 add_executable(masha_hunter_node src/masha_hunter_node.cpp)
 target_include_directories(masha_hunter_node PUBLIC

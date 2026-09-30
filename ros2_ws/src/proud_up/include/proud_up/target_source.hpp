@@ -72,7 +72,7 @@ class SaveliSource : public TargetSource {
 };
 
 // YOLO plug. coco_class 15 is "cat" in the COCO column of yolov8n.onnx.
-// SubjectDetector is the same class follow_the_cat uses for people (class 0).
+// SubjectDetector lives in subject_detector.hpp. Class 0 is a person, 15 is a cat.
 class CatSource : public TargetSource {
  public:
   explicit CatSource(const SubjectDetectConfig &cfg, std::string spoken_wav = "cat.wav",
@@ -80,7 +80,7 @@ class CatSource : public TargetSource {
   std::string id() const override { return "cat"; }
   bool enabled() const override { return enabled_; }
   void set_enabled(bool on) override { enabled_ = on; }
-  bool net_ok() const { return detector_.person_ok(); }
+  bool net_ok() const { return detector_.subject_ok(); }
   std::optional<TargetHit> detect(const DetectInput &in) override;
 
  private:

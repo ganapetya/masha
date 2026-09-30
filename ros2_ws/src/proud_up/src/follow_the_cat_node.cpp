@@ -8,7 +8,8 @@
 //        → small servo step on ids 19 (pan) and 22 (tilt)
 //        → optional 3 s walk at 0.05 m/s after 2 s of centre lock
 //
-// Math lives in follow_the_cat.hpp (no ROS). This file is the wiring:
+// The box comes from subject_detector.hpp. Gaze math lives in
+// follow_the_cat.hpp. Neither header uses ROS. This file is the wiring:
 // image subscription, 20 Hz detect and control timers, mutex, services,
 // servo and cmd_vel publishers.
 //
@@ -171,7 +172,7 @@ class FollowTheCatNode : public rclcpp::Node {
                    human_cfg_.person_onnx.c_str());
     } else {
       RCLCPP_INFO(get_logger(), "person detector onnx=%s cuda=%s face=%s",
-                  human_->person_ok() ? human_cfg_.person_onnx.c_str() : "off",
+                  human_->subject_ok() ? human_cfg_.person_onnx.c_str() : "off",
                   human_->using_cuda() ? "yes" : "no",
                   human_cfg_.cascade_dir.empty() ? "off" : "lbp");
     }
@@ -390,7 +391,7 @@ class FollowTheCatNode : public rclcpp::Node {
                   K.width, K.height, K.fx, K.fy);
     }
 
-    std::optional<PersonDetection> det;
+    std::optional<SubjectDetection> det;
     GazeAngles angles;
     cv::Mat annotated;
     rclcpp::Time image_stamp(0, 0, RCL_ROS_TIME);
@@ -511,7 +512,7 @@ class FollowTheCatNode : public rclcpp::Node {
   void control_tick() {
     maybe_mark_ready();
 
-    std::optional<PersonDetection> det;
+    std::optional<SubjectDetection> det;
     GazeAngles angles;
     PulseMapping pulse_map;
     bool enable_walk;
@@ -632,7 +633,7 @@ class FollowTheCatNode : public rclcpp::Node {
   // detection would otherwise send a large, sudden arm motion.
   //
   // A miss zeros the streak; we stay in Idle. Next phase: Tracking.
-  void tick_idle_locked(const std::optional<PersonDetection> &det, const GazeAngles &angles,
+  void tick_idle_locked(const std::optional<SubjectDetection> &det, const GazeAngles &angles,
                         const PulseMapping &pulse_map, ArmPulses &arm, double &servo_dt,
                         bool &publish_servos) {
     if (!rest_sent_) {
@@ -668,7 +669,7 @@ class FollowTheCatNode : public rclcpp::Node {
   //
   // This function never publishes cmd_vel. enable_walk only decides whether
   // Tracking may *enter* Moving.
-  void tick_tracking_locked(const std::optional<PersonDetection> &det, const GazeAngles &angles,
+  void tick_tracking_locked(const std::optional<SubjectDetection> &det, const GazeAngles &angles,
                             const PulseMapping &pulse_map, bool enable_walk, ArmPulses &arm,
                             double &servo_dt, bool &publish_servos) {
     if (!det) {
@@ -710,7 +711,7 @@ class FollowTheCatNode : public rclcpp::Node {
   // Otherwise keep applying gaze and publish linear.x = walk_speed
   // (0.05 m/s). After walk_seconds (default 3 s) halt the legs and go to
   // Done. Done does not walk again until ~/start.
-  void tick_moving_locked(const std::optional<PersonDetection> &det, const GazeAngles &angles,
+  void tick_moving_locked(const std::optional<SubjectDetection> &det, const GazeAngles &angles,
                           const PulseMapping &pulse_map, ArmPulses &arm, double &servo_dt,
                           bool &publish_servos, geometry_msgs::msg::Twist &twist,
                           bool &publish_twist, bool &halt_after_unlock) {
@@ -1149,14 +1150,14 @@ class FollowTheCatNode : public rclcpp::Node {
   TargetState target_;
   sensor_msgs::msg::Image::ConstSharedPtr latest_image_;
   sensor_msgs::msg::CameraInfo::ConstSharedPtr latest_info_;
-  std::optional<PersonDetection> latest_det_;
+  std::optional<SubjectDetection> latest_det_;
   GazeAngles latest_angles_;
   rclcpp::Time started_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time phase_started_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_seen_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_fresh_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_walk_cmd_at_{0, 0, RCL_ROS_TIME};
-  std::optional<PersonDetection> coast_det_;
+  std::optional<SubjectDetection> coast_det_;
   rclcpp::Time lock_started_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time walk_started_at_{0, 0, RCL_ROS_TIME};
   bool lock_active_{false};
