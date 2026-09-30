@@ -482,7 +482,7 @@ A short Python script under `hexapod_kinematics` (not imported by the controller
 ## Work order
 
 1. **This commit.** The `hexapod_kinematics` package exists so this plan has a home (`PLAN.md`). No solver, no plug, no flag wiring in this commit. Commit the package before any of the math below is written.
-2. Library skeleton: `types`, `geometry` with the hip table, the length guesses, and `coxa_femur_z`.
+2. Library skeleton: `types`, `geometry` with the hip table, the length guesses, and `coxa_femur_z`. **In the tree:** `types.hpp`, `geometry.hpp`, `geometry.cpp`, and `test_geometry`. Joint zeros are still 0. Coxa is not started.
 3. `coxa` and `test_coxa`.
 4. `planar_leg` and `test_planar_leg`, including the unreachable case, the `near_singular` derivative with a stand-in `max_step_rad`, the `coxa_femur_z` shift, and the standing branch.
 5. `forward`, round trip, then adjust lengths, `coxa_femur_z`, and joint zeros until the 0.005 rad stand contract passes. Write the final numbers into `geometry.cpp` with a comment that names the test. Per-joint zeros only if the shared pair fails.
