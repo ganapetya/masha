@@ -12,7 +12,7 @@ Picture one leg. The first hinge, the coxa, only turns left and right, like a tu
 
 You can check the answer without switching the robot on. Fold the ruler from the angles you just computed (that direction is forward kinematics). The tip should land back on the foot you started with. If it does, the two maps are inverses of each other. That check is the heart of the tests.
 
-The new answer is behind a switch. With the switch off, hunter gait 15 keeps asking the closed binary, exactly as it does today. With the switch on, the same gait asks our module instead. Either way, every pose that gait tries to send is written down, and our module is not allowed to hand the servos a jump, an impossible foot, or an angle outside the travel the driver already enforces. A refused pose holds the last safe angles. It does not twitch a servo to "try."
+The new answer is behind a switch. With the switch off, hunter gait 15 keeps asking the closed binary, exactly as it does today. With the switch on, the same gait asks our module instead. Either way, every pose that gait tries to send is written down, and our module is not allowed to hand the servos a jump, an impossible foot, or an angle outside the travel the driver already enforces. A refused pose holds the last safe angles and holds the gait on that same foot. The step clock does not keep running while the legs are frozen. The trace row is handed to a background writer. The 20 ms loop does not wait on the disk.
 
 ## What you can learn from this module
 
@@ -30,7 +30,7 @@ Mathematical subjects, in the order the code meets them:
 
 6. **Two solutions, and a rule that is not part of the formula.** A triangle can be folded two ways. The book calls them lefty and righty. Both are mathematically legal. Standing Masha uses one of them (femur raised, tibia pointing down). Picking it is a separate function, so the formula stays the formula and the choice stays visible.
 
-7. **A workspace, and what an impossible question looks like.** From the femur hinge the foot must land in a ring: no closer than the difference of the two link lengths, no farther than their sum. Outside that ring the law of cosines asks for a cosine bigger than 1. The code reports "unreachable" instead of inventing an angle. That is the geometric meaning of a domain.
+7. **A workspace, and what an impossible question looks like.** From the femur hinge the foot must land in a ring: no closer than the difference of the two link lengths, no farther than their sum. Outside that ring the law of cosines asks for a cosine bigger than 1. The code reports "unreachable" instead of inventing an angle. That is the geometric meaning of a domain. Just inside the ring the knee angle changes wildly for a tiny move of the foot. That edge is refused too, with its own reason, using the derivative of the same cosine. Jazar §6.5 is that edge.
 
 8. **Units, and the meaning of zero.** Millimetres because the rest of the gait speaks millimetres. Radians because the circle's own unit is the radian; degrees appear only as a reading aid. "Zero" on the servo is the center of its travel, which is not automatically "femur horizontal" in the drawing. An offset written in `geometry` is the sentence that says where the drawing's zero sits relative to the servo's zero. It is a definition, not a fudge factor hidden in the formula.
 
@@ -106,10 +106,10 @@ Read the row before you read that file. The files do not exist yet. This is the 
 |---|---|
 | `geometry` | Kala §1.4.1–§1.4.2 and Figure 1.7. Lynch §3.1. Jazar §1.4.3. The hip coordinates, the link lengths, and the joint zeros are this robot. No chapter lists them. |
 | `coxa` | Lynch §3.1, then the `atan2` paragraph in the Chapter 6 opening (printed page 219). Jazar §2.1 if you want the one-axis matrix behind that subtraction. |
-| `planar_leg` | Lynch Chapter 6 opening and Figure 6.1 (printed pages 219–220). Then Jazar Chapter 6, Figures 6.1 and 6.3, so elbow up / elbow down lands on lefty / righty. |
+| `planar_leg` | Lynch Chapter 6 opening and Figure 6.1 (printed pages 219–220). Then Jazar Chapter 6, Figures 6.1 and 6.3, so elbow up / elbow down lands on lefty / righty. Jazar §6.5 is the straight-leg edge. |
 | `forward` | Kala §1.4.3 and Figure 1.8. Lynch Chapter 4 opening: forward kinematics is the opposite map. Jazar §5.3 is the classical chain. The file walks the three links geometrically. |
 | `leg_ik` | No new chapter. It calls `coxa`, then `planar_leg`, in that order. |
-| `safety` | Lynch §2.5 and Jazar §1.3.2, §6.4.1, and §6.5, for the idea "outside the workspace, do not invent an angle." The ±120° window is `JointControl`'s travel. `max_step_rad` is a measurement on this robot. Neither number is a formula from these books. |
+| `safety` | Lynch §2.5 and Jazar §1.3.2, §6.4.1, and §6.5, for the idea "outside the workspace, do not invent an angle." The ±120° window is `JointControl`'s travel. `max_step_rad` is a measurement on this robot. The generator freeze that stops a refusal from locking the leg out is in the 20 ms loop, described under Wiring. |
 
 ### Numbers that are not in any of the three books
 
@@ -214,14 +214,19 @@ Three kinds of number, written apart so a length is never hiding inside a formul
   Checked against the vendor coxa angle: at `DEFAULT_POSE` the LF foot `(163.6, 140.8, −70)` gives coxa **+6.91°**, and `atan2` from `(93.60, 50.805)` minus 45° lands on that. LM’s home foot gives coxa **0°**, which is a foot straight out from `(0, 73.535)` along +90°. Moving a foot only in z leaves the coxa angle unchanged. The URDF `leg_center` (LF is about `(104.6, 50.6, 16.6)` mm) is the mesh frame, a different point. This module does not solve the CAD chain. A comment in `geometry.cpp` says that, so a reader who opens `base.urdf.xacro` does not think the two hips should match.
 
 - **Link lengths**, shared by all six legs (the hardware is the same; mirror is the mount yaw). Starting guesses from the URDF joint-origin distances, to be confirmed by the round-trip in step 4, not left as unexplained literals:
-  - coxa, hip axis to femur axis: **45.0 mm**
+  - coxa, horizontal distance from the yaw axis to the femur hinge: **45.0 mm**
   - femur, femur axis to tibia axis: **77.1 mm**
   - tibia, tibia axis to foot tip: **115.6 mm**
-  - hip height in the same z as the foot coordinate: start at **0** and correct it if the round-trip needs a constant z shift. The comment records the final value and which test fixed it.
+  - `hip_z`: height of the coxa yaw axis in the same z as the foot coordinate. Start at **0**. This is the IK frame, which is the simplified hip in `build_in_pose.py`, not the CAD origin.
+  - `coxa_femur_z`: height of the femur hinge relative to that yaw axis, along the yaw axis. The planar triangle starts at the femur hinge. Figure 6.1 has no such offset, because its two joints lie in one plane and its first joint is the shoulder of the drawing. On a real leg the yaw axis and the femur axis need not meet.
 
-- **Joint zero**. Geometric angles (femur measured from horizontal, tibia measured from the femur) are not automatically the radians the servo driver expects. Three offsets live here. They are filled in when `solve_leg(DEFAULT_POSE)` is required to reproduce the known stand:
+    In `base.urdf.xacro` the left-front femur joint origin, written in the coxa link, is about `(45.04, −0.53, 1.13)` mm. The 45 mm is the coxa length above. The **1.13 mm** is `coxa_femur_z`'s starting value. The coxa link's z is the yaw axis (the joint's rpy is almost a pure yaw). The other five legs carry about the same 1.1 mm in that slot. It is small beside a foot at z = −70 mm, and it is still its own constant. Folding it into `L1` or `L2` makes the stand look right and then drags the foot when the leg reaches. A ruler on the robot confirms it: if the two hinges are built in one plane, the constant becomes **0** and the comment says the CAD millimetre was left unused. The sign is "femur hinge minus yaw-axis origin, along yaw." Forward adds the same constant back. A test changes only this number and checks that z moves by that amount.
+
+- **Joint zero**. Geometric angles (femur measured from horizontal, tibia measured from the femur) are not automatically the radians the servo driver expects. The offsets live here. They are filled in when `solve_leg(DEFAULT_POSE)` is required to reproduce the known stand. The contract is **0.005 rad** on each joint (about 0.3°). A gap of 0.02 rad is about 1.1°. The first gait-5 command would apply that gap in one tick while the robot is standing on the vendor pose, and a geared servo makes 1.1° a visible twitch.
 
   LF stand target, radians: coxa **0.1207**, femur **0.7555**, tibia **−0.650** (6.91°, 43.29°, −37.24°). The other five legs follow by mirror: coxa flips with the foot’s y, femur and tibia stay the same number. Right-side servos flip in `config.SERVOS` `direction`, which is `JointControl`’s job. This module must not add a second sign for the right femur.
+
+  First try is one shared femur zero and one shared tibia zero. The horn on each servo is a spline, so once it is screwed on, that servo's mechanical zero can sit a fraction of a tooth away from its neighbor. If the shared pair cannot meet 0.005 rad on every leg, `geometry` stores a zero per joint (18 numbers). Each extra number is the residual that forced it, written in the comment. They stay out of the law of cosines. Read the tooth count off Masha's servo before anyone turns "one tooth" into a number of degrees. The plan does not assume a tooth count.
 
 ### 2. `coxa` — yaw, one angle, horizontal plane only
 
@@ -247,10 +252,10 @@ After the coxa yaw is known, the foot lies in a vertical plane. Subtract the cox
 
 ```
 x_plane = hypot(dx, dy) - coxa_length
-z_plane = z_foot - hip_z
+z_plane = z_foot - hip_z - coxa_femur_z
 ```
 
-`x_plane` is the horizontal distance from the **femur axis** to the foot. `z_plane` is the book's `y`: vertical, negative when the foot is below the hip. A comment on those two lines says this renaming, so the drawing and the robot frame are not mixed up.
+`x_plane` is the horizontal distance from the **femur axis** to the foot. `z_plane` is the book's `y`: vertical, negative when the foot is below the hip. `coxa_femur_z` is the hinge offset from `geometry`. A comment on those two lines says this renaming, so the drawing and the robot frame are not mixed up.
 
 Write Figure 6.1 out, with the book's symbols, then name our joints underneath:
 
@@ -262,6 +267,22 @@ cos α = (r² + L1² − L2²) / (2 · L1 · r)
 ```
 
 If either cosine is outside `[−1, 1]`, the foot is outside the ring in Figure 6.1(a): inner radius `|L1 − L2|`, outer radius `L1 + L2`, measured from the femur axis. Return `ok = false` and the reason `"unreachable"`. Do not invent a clamped angle. That is the book's workspace, and it is the whole point of the check.
+
+The same cosine has a second failure just inside the ring. Differentiate `cos β = (L1² + L2² − r²) / (2 · L1 · L2)` with respect to `r`:
+
+```
+|dβ/dr| = r / (L1 · L2 · |sin β|)
+```
+
+`β` is the knee opening. At full stretch `β` goes to π and `sin β` goes to 0, so a fraction of a millimetre of foot motion asks for a large knee step. Jazar §6.5 is this configuration: the boundary, where the two folds meet and the joint rate blows up. Lynch §2.5 names the workspace whose boundary this is.
+
+Refuse when a foot error of the round-trip tolerance `δ = 0.5` mm would move the knee by more than `max_step_rad`:
+
+```
+|dβ/dr| · δ > max_step_rad
+```
+
+which is the same test as `|sin β| < r · δ / (L1 · L2 · max_step_rad)`. Reason `"near_singular"`. `δ` is the 0.5 mm already required of the round trip, so the margin is that tolerance and the measured step limit. It is not a cutoff such as 0.99, which would mean "about 8° from straight" for every leg length and would not say what foot error it is guarding. `max_step_rad` is the same named constant the safety gate uses. Until calibration fills it, tests pass a stand-in value. The stand pose is bent (the foot is far from `L1 + L2`), so the stand must pass this test. A point manufactured just inside the outer ring must fail it. `α` grows at the same boundary; the rate gate remains the backstop for `α` and for the coxa. The soft check lives here because it is a fact about the triangle, before any servo command exists.
 
 The book then gives both solutions (Figure 6.1):
 
@@ -281,7 +302,7 @@ Read first: Kala §1.4.3 and Figure 1.8, then the opening of Lynch Chapter 4. Ja
 Same constants, opposite direction:
 
 1. Start at the hip.
-2. Step `coxa_length` along `mount_yaw + q_coxa`.
+2. Step `coxa_length` along `mount_yaw + q_coxa`, and step `coxa_femur_z` along body z. The triangle starts at the femur hinge.
 3. Step the femur, then the tibia, in that vertical plane, using the geometric angles (joint zeros removed first).
 
 Output is a foot in the body frame, millimetres. Tests use this. Runtime gait does not.
@@ -299,24 +320,24 @@ Read first: no new chapter. This file calls `coxa`, then `planar_leg`.
 5. Apply joint zeros.
 6. Return `{ok, coxa, femur, tibia}` or `{ok: false, reason}`.
 
-No new formula in this file. A six-leg helper `solve_pose` loops legs 1..6 so the Python side can do one call per 20 ms tick. If any leg fails, the whole pose fails, with the leg id and the reason (`unreachable`, or a non-finite number). The Python binding returns that result. It does not raise. Raising would fall into the loop's existing `MOVING_POSE` handler, which drops the generator. The hunter's next Twist, 50 ms later, would build a new generator and try the same bad pose again. The plug below holds the last safe angles instead.
+No new formula in this file. A six-leg helper `solve_pose` loops legs 1..6 so the Python side can do one call per 20 ms tick. If any leg fails, the whole pose fails, with the leg id and the reason (`unreachable`, `near_singular`, or a non-finite number). The Python binding returns that result. It does not raise. Raising would fall into the loop's existing `MOVING_POSE` handler, which drops the generator. The hunter's next Twist, 50 ms later, would build a new generator and try the same bad pose again. The plug below holds the last safe angles and, under Wiring, holds the generator on the same frame.
 
 ### 6. `safety` — what is allowed to reach a servo
 
-Read first: Lynch §2.5 and Jazar §1.3.2, §6.4.1, and §6.5, for "a foot outside the reachable set has no angle." The ±120° window and `max_step_rad` are this robot's driver and a measurement. They are not a formula in these books.
+Read first: Lynch §2.5 and Jazar §1.3.2, §6.4.1, and §6.5, for "a foot outside the reachable set has no angle." The ±120° window and `max_step_rad` are this robot's driver and a measurement. They are not a formula in these books. The straight-leg derivative itself sits in `planar_leg`; this file only honors the reason that comes back.
 
 A separate file, `safety.hpp` / `safety.cpp`. It does not solve a triangle. It answers one question: given the angles we want now and the angles we last actually sent, may this pose be published?
 
 Checked in this order, all 18 joints, and the pose is one decision:
 
 1. **Finite.** Any NaN or infinity → refuse. Reason `non_finite`.
-2. **The solver agreed.** `solve_pose` returned `ok == false` → refuse. Reason kept from the solver (`unreachable`).
+2. **The solver agreed.** `solve_pose` returned `ok == false` → refuse. Reason kept from the solver (`unreachable` or `near_singular`).
 3. **Travel window, the same one the driver already uses.** `JointControl` rejects a joint when `|direction * (offset + radians)|` is greater than half of `max_radians`. In `config.py` that half-window is **±120°** (±2.094 rad), because the servo travels 240° around the center pulse 500. The gate applies that test to every joint **before** `set_multi_joints` is called. One joint outside the window refuses the whole pose. Reason `joint_limit`, and the log names the joint. The numbers are read from the same `SERVOS` table the driver uses. They are not a second, quieter limit.
 4. **Step size.** `|q_now − q_previous|` for every joint must be ≤ `max_step_rad`. This is the check that stops a lefty/righty flip: that flip moves a knee by about a radian in one 20 ms tick, which is a kick. A real hunter step moves a joint by only a few degrees per tick. `max_step_rad` is **measured, then written down**, not chosen to look round. The calibration script runs one gait-5 cycle with the vendor backend, no servos (`pseudo`), at the hunter's speeds (the Twist clamps: 0.12 m/s, 0.10 m/s, 0.6 rad/s, period 0.60 s) and records the largest `|Δq|` in one tick. `max_step_rad` is that peak times **1.5**. The comment in `safety.cpp` states the measured peak, the margin, and the command that produced them. A pose that fails is reason `rate_limit`, and the log names the joint and both angles.
 
 `q_previous` is the last pose this gate **sent**. `joints_state` is initialized to 0 in `StepController.__init__`, which is not where the servos actually are, so it is not the reference. `self.pose` starts as `DEFAULT_POSE`, and a hunt starts from that stand. The first sample of a bout is compared with `solve` of the current `self.pose` through the same backend. If that reference itself cannot be solved, send nothing and log `no_reference`.
 
-The gate returns `{allow, reason, joint_id}`. It never clamps an angle to the limit. A clamped angle would move the foot off the spot the gait asked for and hide the failure.
+The gate returns `{allow, reason, joint_id}`. It never clamps an angle to the limit. Clamping `q` to `q_previous ± max_step_rad` and sending that would move the foot off the spot the gait asked for, including a foot that is on the ground, and the trace would no longer show a refusal. That idea was considered and is not the implementation. Holding `q_previous` is safe only together with the frame freeze in Wiring. If the generator kept advancing while the servos held still, the next tick's gap would be about twice as large, the rate check would fail again, and the leg would freeze for the rest of the step. The freeze stops that doubling. A normal hunter step stays inside `1.5 ×` the measured peak, so a good walk does not enter this path. If a good walk does, the measured peak is wrong and the constant is what gets fixed.
 
 ## The plug
 
@@ -352,12 +373,14 @@ Two sinks. The screen stays readable. The file has every move.
 
 **Trace file**, one row per gait-5 pose, both backends. Path parameter `hexapod_ik_trace`, default `/home/ubuntu/ros2_ws/log/hexapod_ik_trace.csv`. Append. Write the header when the file is created.
 
+The 20 ms loop does not write the file. A write to the Jetson's eMMC can stall for tens of milliseconds, which is the whole tick, and the gait would stutter. The loop builds the row and puts it on a `queue.Queue` (bound 200, about four seconds of ticks). A daemon thread created in `StepController.__init__` is the only writer. It flushes about twice a second, or every 25 rows. If the queue is full, the loop drops the row, increments a counter, and continues. It does not block. A drop is one `WARN` per second, not one line per dropped row. On shutdown the thread gets a short chance to flush and is not allowed to hold up a halt. A ROS bag is the fallback if a real hunt shows drops: the columns we care about (`decision`, `reason`, the refused angles) are not a stock `JointState`, so the CSV stays the first path.
+
 Columns:
 
 - `t_s` — controller clock, seconds
 - `backend` — `hexapod` or `vendor`
 - `decision` — `sent`, `held`, or `rejected`
-- `reason` — empty when sent; otherwise `unreachable`, `joint_limit`, `rate_limit`, `non_finite`, `no_reference`
+- `reason` — empty when sent; otherwise `unreachable`, `near_singular`, `joint_limit`, `rate_limit`, `non_finite`, `no_reference`
 - `joint` — the joint id that failed, or empty
 - six feet, millimetres: `x1 y1 z1` … `x6 y6 z6`
 - eighteen angles, radians: `q1` … `q18` in kinematic servo order (coxa, femur, tibia, leg 1 then leg 2 …)
@@ -370,7 +393,7 @@ Columns:
 - Once, at node start: the flag, the trace path, the joint window (±120°), and `max_step_rad` with the measured peak beside it.
 - Once per gait-5 generator: `gait 5 backend=hexapod` or `backend=vendor`.
 - Every refusal: `WARN`, with reason, joint, the angle, and the foot of that leg. These are the lines you watch while standing next to the robot.
-- Five refusals in a row (100 ms): one `ERROR`, `holding last safe pose`. The generator is **not** dropped. Publishing stays off until a later tick passes the gate, or until a stand (`gait` -2) replaces the motion. The streak counter resets when a pose is sent.
+- Five refusals in a row (100 ms): one `ERROR`, `holding last safe pose, generator frame frozen`. The generator is **not** dropped. Publishing stays off. The same six feet are retried. A stand (`gait` -2) clears the generators the way a pose-set already does, and that is the way out. A new Twist waiting in `new_moving_generator` does not take over during the freeze, because takeover waits for `last_part`, and `last_part` arrives only from `send()`. The streak counter resets when a pose is sent.
 - A 1 Hz `INFO`: backend, last decision, and the largest `|dq|` in that second. The 50 Hz detail stays in the CSV.
 
 `pseudo=True` still solves, still gates, still writes a row with `decision=rejected` or `sent`, and still does not publish. A dry run is a trace with no motion.
@@ -381,10 +404,12 @@ Columns:
 
 At both places that send `moving_pose` to the servos (the 20 ms tick and the 50 ms first-slice blend): if `params` is a `CmdVelParams` and `params.gait == 5`, call the plug selected for this generator.
 
-- `allow`: `JointControl.set_multi_joints` with those radians, same ids 1..18 as today. Then remember them as `q_previous`.
-- `allow` false: publish nothing. Do not update `joints_state`. Write the trace row. Count the streak.
+- `allow`: `JointControl.set_multi_joints` with those radians, same ids 1..18 as today. Then remember them as `q_previous`. Clear the freeze.
+- `allow` false: publish nothing. Do not update `joints_state`. Do not integrate odometry for that tick. The integration sits in the same block as the moving pose (`linear_x`, `linear_y`, `angular_z` over 0.02 s). A frozen leg must leave that estimate where it was. Enqueue the trace row. Count the streak. Set the freeze.
 
-A comment above the branch: gait 5 is the hunter follow walk; `use_hexapod_kinematics` chooses who turns foot tips into angles; a refusal sends no pulses.
+The freeze: `FollowGaitGenerator` is one Python generator and one phase for all six feet. Each `send()` yields the next 20 ms frame and then advances `phase_index`. After a refusal the loop keeps the last yielded six feet and does not call `send()` again. The next tick solves that same pose. Pausing a single leg was considered and is not the implementation: the tripod shares this one phase, and one leg on an old frame while the others walk splits the step. The whole pose freezes together.
+
+A comment above the branch: gait 5 is the hunter follow walk; `use_hexapod_kinematics` chooses who turns foot tips into angles; a refusal sends no pulses and does not advance the generator.
 
 `follow_gait.hpp` and `FollowGaitGenerator` stay the source of the foot tips. Their comments that say the vendor function turns tips into angles get one sentence: with the flag on, `hexapod_kinematics` does that job, and the safety gate can refuse the result.
 
@@ -396,8 +421,12 @@ A comment above the branch: gait 5 is the hunter follow walk; `use_hexapod_kinem
 - Why a failed triangle returns `unreachable` instead of a quiet clamp.
 - Why joint zero is not inside the law of cosines.
 - Why pulses and `SERVOS['direction']` stay in Python.
-- Why a refusal publishes nothing, and why the generator is not dropped.
+- Why a refusal publishes nothing, why the generator frame is not advanced, and why the generator object is not dropped.
+- Why the CSV is written on a side thread.
+- Why `coxa_femur_z` is its own constant, with the URDF millimetre beside it.
+- Why `near_singular` uses `|dβ/dr|` and the 0.5 mm round-trip tolerance.
 - Why `max_step_rad` has a measured peak written next to it.
+- Why the stand contract is 0.005 rad, and why a joint zero may end up per servo.
 
 No comment that only repeats the syntax.
 
@@ -406,10 +435,10 @@ No comment that only repeats the syntax.
 Each test file matches one subproblem, so a failure names the piece.
 
 - **Coxa.** Foot on the mount ray from the LF hip → coxa 0. LF stand foot → coxa within 0.01 rad of +0.1207. Same foot with a different z → same coxa. LM home foot → coxa 0. Leg 6 is the mirror of leg 1.
-- **Planar.** One hand-built triangle from Figure 6.1 (pick `x_plane`, `z_plane`, compute `α`, `β`, `γ` on paper) → solver returns those angles. A point with `r > L1 + L2` → `ok == false`. Lefty and righty are both visible; `standing_branch` is the one with tibia negative when the foot is below the hip.
-- **Forward round trip.** For a grid around each `DEFAULT_POSE` foot (about ±40 mm in x and y, z from −100 to −40, which covers the hunter lift), `forward(solve_leg(p))` is within 0.5 mm of `p`. Skip points the solver marks unreachable.
-- **Stand contract.** `solve_leg` on all six `DEFAULT_POSE` feet matches the vendor stand radians within **0.02 rad** on each joint. Those target numbers are written in the test with the degree values beside them. This is the gate that says our zero is the servo’s zero.
-- **Safety.** A joint at 2.2 rad (past ±120°) → `joint_limit`, and the decision would publish nothing. A 1 rad jump from the previous sent pose → `rate_limit`. A step of a few hundredths of a radian inside the window → `allow`. A NaN → `non_finite`. The test does not call a servo.
+- **Planar.** One hand-built triangle from Figure 6.1 (pick `x_plane`, `z_plane`, compute `α`, `β`, `γ` on paper) → solver returns those angles. A point with `r > L1 + L2` → `ok == false`, reason `unreachable`. A point just inside the outer ring, with a stand-in `max_step_rad`, → `near_singular`. The stand foot, with that same limit, is not `near_singular`. Shifting `coxa_femur_z` by 1 mm shifts `z_plane` by 1 mm and leaves `x_plane` alone. Lefty and righty are both visible; `standing_branch` is the one with tibia negative when the foot is below the hip.
+- **Forward round trip.** For a grid around each `DEFAULT_POSE` foot (about ±40 mm in x and y, z from −100 to −40, which covers the hunter lift), `forward(solve_leg(p))` is within 0.5 mm of `p`. Skip points the solver marks `unreachable` or `near_singular`. The forward steps include `coxa_femur_z`.
+- **Stand contract.** `solve_leg` on all six `DEFAULT_POSE` feet matches the vendor stand radians within **0.005 rad** on each joint (about 0.3°). Those target numbers are written in the test with the degree values beside them. This is the gate that says our zero is the servo’s zero, tight enough that turning the flag on does not kick a standing robot. If a shared femur/tibia zero cannot pass, the test is what forces the per-joint zeros, and the comment names the residual.
+- **Safety.** A joint at 2.2 rad (past ±120°) → `joint_limit`, and the decision would publish nothing. A 1 rad jump from the previous sent pose → `rate_limit`. A step of a few hundredths of a radian inside the window → `allow`. A NaN → `non_finite`. A solver reason `near_singular` is kept and refused. The test does not call a servo. The frame freeze is Python: a small test beside `leg_ik.py` feeds a refused pose and asserts the next solve is given those same six feet, and that a following legal pose is what advances the frame.
 
 A short Python script under `hexapod_kinematics` (not imported by the controller) prints our angles next to `kinematics.set_leg_position` for the stand and a few offsets, and prints the peak `|Δq|` over one pseudo gait-5 cycle. That peak, times 1.5, is what gets written into `safety.cpp`. With the flag false, a live hunt still uses `kinematics.so`. With the flag true, the gait-5 path does not.
 
@@ -417,20 +446,20 @@ A short Python script under `hexapod_kinematics` (not imported by the controller
 
 1. `colcon build --packages-select hexapod_kinematics` and the four gtests.
 2. Build `controller` after the pybind module installs, import `hexapod_kinematics` from the sourced workspace.
-3. Run the calibration print. If any stand joint is outside 0.02 rad, fix lengths or joint zeros and re-run the gtests. Write the measured `max_step_rad` into `safety.cpp` and re-run `test_safety`. Do not turn the flag on while either gate fails.
+3. Run the calibration print. If any stand joint is outside 0.005 rad, fix lengths, `coxa_femur_z`, or joint zeros and re-run the gtests. Do not absorb `coxa_femur_z` into `L1` or `L2` to make the stand pass. Write the measured `max_step_rad` into `safety.cpp`, re-run `test_safety` and the `near_singular` case, and confirm the stand foot is still inside the soft edge. Do not turn the flag on while any of these fail.
 4. A hunt with the flag left false is the before-picture: the trace file fills with `backend=vendor`, and the walk is the one you already know.
-5. Live with the flag true, only after that and only when Peter asks: `ros2 param set /step_controller use_hexapod_kinematics true`, then start the hunter and let gait 15 walk a short follow, then halt. Halt still uses the vendor stand. Watch the WARN lines and the first rows of the trace. A `rate_limit` or `joint_limit` must leave the legs where they were. Joystick walk is unchanged and is the regression check that gait 2 still calls the `.so`.
+5. Live with the flag true, only after that and only when Peter asks: `ros2 param set /step_controller use_hexapod_kinematics true`, then start the hunter and let gait 15 walk a short follow, then halt. Halt still uses the vendor stand, and a halt is what clears a frozen generator. Watch the WARN lines and the first rows of the trace. A `rate_limit`, `near_singular`, or `joint_limit` must leave the legs on the last safe angles and must leave the generator on that same frame. Joystick walk is unchanged and is the regression check that gait 2 still calls the `.so`.
 
 ## Work order
 
 1. **This commit.** The `hexapod_kinematics` package exists so this plan has a home (`PLAN.md`). No solver, no plug, no flag wiring in this commit. Commit the package before any of the math below is written.
-2. Library skeleton: `types`, `geometry` with the hip table and the length guesses.
+2. Library skeleton: `types`, `geometry` with the hip table, the length guesses, and `coxa_femur_z`.
 3. `coxa` and `test_coxa`.
-4. `planar_leg` and `test_planar_leg`, including the unreachable case and the standing branch.
-5. `forward`, round trip, then adjust lengths and joint zeros until the stand contract passes. Write the final numbers into `geometry.cpp` with a comment that names the test.
+4. `planar_leg` and `test_planar_leg`, including the unreachable case, the `near_singular` derivative with a stand-in `max_step_rad`, the `coxa_femur_z` shift, and the standing branch.
+5. `forward`, round trip, then adjust lengths, `coxa_femur_z`, and joint zeros until the 0.005 rad stand contract passes. Write the final numbers into `geometry.cpp` with a comment that names the test. Per-joint zeros only if the shared pair fails.
 6. `leg_ik` composition and `solve_pose`. The binding returns the result and does not raise.
-7. `safety` and `test_safety`. `max_step_rad` stays a named constant with a comment; the calibration script fills the number before the flag may be turned on.
+7. `safety` and `test_safety`. `max_step_rad` stays a named constant with a comment; the calibration script fills the number before the flag may be turned on. Re-check `near_singular` with that number.
 8. pybind11 module, including the safety gate.
-9. `controller/leg_ik.py`: the two backends, the flag defaulting to false, the trace row on every gait-5 pose, WARN on each refusal, no publish when the gate says no.
-10. The `params.gait == 5` branch in the 20 ms loop, and the launch argument on `move_controller.launch.py`.
+9. `controller/leg_ik.py`: the two backends, the flag defaulting to false, the trace queue and writer thread, WARN on each refusal, no publish when the gate says no.
+10. The `params.gait == 5` branch in the 20 ms loop, the frame freeze, the skipped odometry step on a refusal, and the launch argument on `move_controller.launch.py`.
 11. Calibration print (stand error and the measured step peak), then stop for a live hunt. First hunt keeps the flag false. The flag-true hunt waits until you ask.
