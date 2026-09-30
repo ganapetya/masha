@@ -4,13 +4,15 @@
   <img src="images/cosmos-masha.jpeg" alt="Masha, a Hiwonder ROSpider hexapod, on an alien world" width="420">
 </p>
 
+<h2 align="center">
+  <a href="https://docs.google.com/document/d/1htNEsd6-288xz86QeZI_8CehXg5_2lO9QK0vWuy5Szk/edit?usp=sharing">Masha Internals and Workings Research</a>
+</h2>
+
 Masha is a **Hiwonder ROSpider** hexapod. This repository is her software image: ROS 2 Humble on a Jetson Orin NX. Git root is the robot home directory (`/home/ubuntu`). Develop on a Linux host, then `git pull` and `colcon build` on the Jetson.
 
 Sister robot **Savelij** will live in a separate repo. Shared world-level notes belong in [robots-world](https://github.com/ganapetya/robots-world).
 
 A denser filesystem memo is in [`ROSpider_WORKSPACE_MEMO.md`](ROSpider_WORKSPACE_MEMO.md). How Peter, Gemini Notebook, and grok-build work together is in [`AI_ROBOTICS_TRIO_COOPERATION.md`](AI_ROBOTICS_TRIO_COOPERATION.md) (v2, 2026-08-27). Agreements, plans, and progress files live in `/opt/src/learning-bots-sharing` — [`LEARNING_BOTS_SHARING.md`](LEARNING_BOTS_SHARING.md). Active plan: [`CURRENT_PLAN.md`](CURRENT_PLAN.md) (Quarter 1, Week 1 as of 2026-08-27). Host ↔ Masha paste/file drop-box is `~/host-clipboard.txt` — [`HOST_CLIPBOARD_TRANSPORT.md`](HOST_CLIPBOARD_TRANSPORT.md). Launch recipes live in [`ros2_ws/command`](ros2_ws/command).
-
-[Masha Internals and Workings Research](https://docs.google.com/document/d/1htNEsd6-288xz86QeZI_8CehXg5_2lO9QK0vWuy5Szk/edit?usp=sharing)
 
 ---
 
