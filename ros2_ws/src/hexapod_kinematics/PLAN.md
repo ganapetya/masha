@@ -36,27 +36,88 @@ Mathematical subjects, in the order the code meets them:
 
 Alongside the math, the C++ shape is there so the subjects stay separate: one file for the frame numbers, one for the turret angle, one for the triangle, one for the reverse map, one that only calls the others in order, and one that only decides whether those angles are safe to send. A failing test names the subject that broke. You can read a file without knowing ROS callbacks. The ROS part is only the last step, where the hunter's 20 ms loop asks this library for angles and the existing pulse code turns angles into servo commands.
 
+The chapter for each subject is in the reading map below. Read that short list beside the matching file. The rest of each book is later study, after this module makes sense on its own.
+
 ## Materials this plan follows
 
-**The formula comes from one book.** Kevin M. Lynch and Frank C. Park, *Modern Robotics: Mechanics, Planning, and Control*, Cambridge University Press, 2017. In our quarter plan this is Book 2 (`quarter-01-week-01-plan.md` already sends you to its sections 2.1, 2.2, and 3.1). The authors' free copy and the video supplements are at [modernrobotics.org](http://modernrobotics.org).
+Three books, three jobs. All three opened from the copies you linked, and all three are usable as personal reading beside this package. The PDFs stay on your machine. This package cites sections. It does not store the files, and the comments will not paste the books' prose. Page numbers below are the **printed** page numbers in each book's own contents. A PDF viewer counts the cover and the contents as extra pages, so the viewer's page number sits a little later than the printed one. Search the section number if the two disagree.
 
-| What you are looking at in the code | Where it is in the book |
+Nothing here is taken from the closed binary `kinematics.so`. There is no source to take it from.
+
+### 1. On-ramp — Kala, one chapter
+
+Rahul Kala, *Autonomous Mobile Robots: Planning, Navigation and Simulation*, Academic Press / Elsevier, 2024. ISBN 978-0-443-18908-1.
+
+Read **Chapter 1, §1.4 Kinematics**, and stop at the end of §1.4.3. This chapter names the ideas in plain language. It does not derive the triangle we will code.
+
+| Section | What it is for here |
 |---|---|
-| Body frame, "a point is coordinates in a chosen frame" | §2.1 and §2.2 |
-| A rotation changes the coordinates of a point. The coxa is the flat version: one angle about the vertical | §3.1, used here only in 2D |
-| Angles → foot tip (the `forward` file) | Chapter 4, the idea of forward kinematics. The code uses the three geometric steps, not the product-of-exponentials machinery |
-| Foot → femur and tibia angles | Chapter 6, opening example, **Figure 6.1** (planar two-link arm). Law of cosines, `atan2`, lefty and righty, and the ring-shaped workspace |
-| Coxa yaw before that triangle | Not a separate example in the figure. It is Figure 6.1's `γ = atan2(...)`, measured from the leg's mount direction instead of from the body's +X. The subtraction is the frame change from §2.1 |
+| §1.4.1 Transformations, Figures 1.3–1.6 | A point's three numbers change when you move the origin or turn the axes. That is why a foot in the body frame and the same foot measured from a hip are different triples. |
+| §1.4.2 TF tree, Figure 1.7 | Body, hip, and foot are frames chained together. ROS later calls this picture a TF tree. In this module it is only the picture: we do not publish transforms. |
+| §1.4.3 Manipulators, Figures 1.8 and 1.9 | Forward kinematics turns joint angles into a tip. Inverse kinematics turns a tip back into angles, and a planar arm can fold two ways (the book draws elbow up and elbow down). Denavit–Hartenberg parameters are named here. We recognize the name and we do not build a DH table for this leg. |
 
-The code comments in `planar_leg` use the book's names (`L1`, `L2`, `α`, `β`, `γ`, lefty, righty) next to our names (femur, tibia, standing branch), so you can hold Figure 6.1 beside the file.
+§1.4.4 is a rolling car. It is the wrong machine for a leg. Chapters after Chapter 1 (localization, mapping, graph search, potential fields, swarms) are a different course.
 
-**The numbers in the formula come from this robot, not from the book.** The book has no Masha link lengths.
+### 2. The formula — Lynch and Park
+
+Kevin M. Lynch and Frank C. Park, *Modern Robotics: Mechanics, Planning, and Control*, Cambridge University Press, 2017 (this copy is the 3 May 2017 preprint, ISBN 9781107156302). In the quarter plan this is Book 2. The authors' site, with videos, is [modernrobotics.org](http://modernrobotics.org). The preprint says it is for personal use. Figures may be reused when the citation is the Cambridge book.
+
+The code follows this book. Comments in `planar_leg` use its names (`L1`, `L2`, `α`, `β`, `γ`, lefty, righty) next to our names (femur, tibia, standing branch), so you can hold **Figure 6.1** beside the file.
+
+| Read this | Printed page | What it is for here |
+|---|---|---|
+| §3.1 Rigid-body motions in the plane | 62 | The coxa. One angle in the horizontal plane, and subtracting the leg's mount yaw, is a change of frame in that plane. |
+| §3.2.1 Rotation matrices | 68 | The same idea written as a matrix, once you want it. The coxa file itself uses `atan2`, which is the angle this matrix is built from. |
+| §2.1 and §2.2 | 12 and 15 | Degrees of freedom: a rigid body, then a robot made of joints. Useful as "a leg is three hinges." The quarter plan (`quarter-01-week-01-plan.md`) sends you here under the words "what is a coordinate frame." In this copy the frame picture is §3.1, above. |
+| §2.5 Task space and workspace | 32 | The set of feet a leg can actually reach. Short. |
+| Chapter 4, the opening, and §4.2 | 137 and 152 | Forward kinematics is the map that runs angles → tip. §4.2 is why a URDF (the CAD file) and the IK hips can be different frames. The code takes three geometric steps. It does not use the product-of-exponentials formula that fills the rest of the chapter. |
+| Chapter 6 opening, **Figure 6.1**, through the lefty and righty formulas | 219–220 | **This is the formula.** Law of cosines, `atan2`, the ring-shaped workspace, and the two folds. §6.1 starts on printed page 221 with a 6-joint PUMA arm. Stop before §6.1. |
+
+The coxa angle is Figure 6.1's `γ = atan2(...)`, measured from the leg's mount direction. Subtracting that mount yaw is the planar frame change from §3.1.
+
+Lynch's own paragraph on printed page 219 says the two folds are called lefty and righty, and also elbow-up and elbow-down. Jazar uses the second pair of names. Same two triangles.
+
+Chapters 5 and 7 onward (velocity, closed chains, dynamics, trajectories, motion planning, control) wait until this leg is clear.
+
+### 3. The second pass — Jazar
+
+Reza N. Jazar, *Theory of Applied Robotics: Kinematics, Dynamics, and Control*, 2nd edition, Springer, 2010. ISBN 978-1-4419-1749-2.
+
+This is the deeper kinematics textbook of the three. Read it after the matching Lynch section, when you want the same idea said with the classical names. The cooperation memo's `book1.pdf` is still an untitled filename, so this plan does not label Jazar as Book 1. If that file turns out to be this book, the map below is already the citation. If it is a different book, its matching sections get added when the file can be identified.
+
+| Read this | Printed page | What it is for here |
+|---|---|---|
+| §1.3.2 Workspace | 13 | Reachable workspace: where a tip can go. A cosine outside `[−1, 1]` is a foot outside that set. |
+| §1.4.3 Reference frame and coordinate system | 17 | Origin plus axes, in the classical wording. |
+| §2.1 Rotation about a global axis | 33 | One yaw, written as a matrix. Enough of Chapter 2 for the coxa. The later catalogue (Euler angles, roll-pitch-yaw) is a different topic. |
+| §4.1, §4.2, §4.4 | 149, 154, 168 | A rigid motion, one homogeneous transform, then a chain of them. This is Kala's TF tree written with matrices. |
+| §5.1 Denavit–Hartenberg, §5.3 Forward position kinematics | 233, 259 | The classical way to chain a whole arm. Read so you recognize it. This leg stays the planar triangle; the code does not fill in a DH table. |
+| Chapter 6, Figure 6.1 and Figure 6.3 | chapter starts 325 | Figure 6.1: a planar 2R has more than one inverse solution. Figure 6.3: elbow up and elbow down. That pair is our lefty and righty. |
+| §6.4.1 Existence and uniqueness | 361 | When a solution exists, and when two of them do. |
+| §6.5 Singular configuration | 363 | At the boundary of the ring the two folds meet. The code's answer is still the cosine test: outside the ring, refuse. |
+
+Jazar's later parts (dynamics, control) and the iterative inverse-kinematics techniques in §6.4.2 are outside this module. We have a triangle with a closed-form answer.
+
+### Which file to open with which pages
+
+Read the row before you read that file. The files do not exist yet. This is the order they will be written in.
+
+| Future file | Read first |
+|---|---|
+| `geometry` | Kala §1.4.1–§1.4.2 and Figure 1.7. Lynch §3.1. Jazar §1.4.3. The hip coordinates, the link lengths, and the joint zeros are this robot. No chapter lists them. |
+| `coxa` | Lynch §3.1, then the `atan2` paragraph in the Chapter 6 opening (printed page 219). Jazar §2.1 if you want the one-axis matrix behind that subtraction. |
+| `planar_leg` | Lynch Chapter 6 opening and Figure 6.1 (printed pages 219–220). Then Jazar Chapter 6, Figures 6.1 and 6.3, so elbow up / elbow down lands on lefty / righty. |
+| `forward` | Kala §1.4.3 and Figure 1.8. Lynch Chapter 4 opening: forward kinematics is the opposite map. Jazar §5.3 is the classical chain. The file walks the three links geometrically. |
+| `leg_ik` | No new chapter. It calls `coxa`, then `planar_leg`, in that order. |
+| `safety` | Lynch §2.5 and Jazar §1.3.2, §6.4.1, and §6.5, for the idea "outside the workspace, do not invent an angle." The ±120° window is `JointControl`'s travel. `max_step_rad` is a measurement on this robot. Neither number is a formula from these books. |
+
+### Numbers that are not in any of the three books
+
+The books have no Masha link lengths and no servo center.
 
 - Hip positions and the 45° / 90° / 135° mount angles: the offsets already named `X1`, `Y1`, `Y2` in `build_in_pose.py`, checked against the coxa angle the robot uses at the stand pose.
 - Starting link lengths: distances between joint origins in `rospider_description/urdf/base.urdf.xacro` (coxa about 45 mm, femur about 77 mm, tibia about 116 mm). The round-trip test is allowed to correct them. The comment will say which test fixed the final value.
 - What "zero" means to the servos: the three stand angles `set_leg_position` returns for `DEFAULT_POSE`. Those readings calibrate the offset. They are not the algorithm. With the flag on, the gait-15 path does not call `kinematics.so`. With the flag off, it still does.
-
-**Book 1** (`book1.pdf` in the cooperation memo) is not on this machine, and the memo does not give its title. This plan does not cite it. If you put that PDF where it can be read, the matching section gets added beside Figure 6.1. Nothing here is taken from the closed Rust source of `kinematics.so`. There is no source to take it from.
 
 ## What this is
 
@@ -135,6 +196,8 @@ Body frame, same as `follow_gait.hpp` and `DEFAULT_POSE`: **+X toward the head, 
 
 ### 1. `geometry` — the constants, and nothing else
 
+Read first: Kala §1.4.1–§1.4.2 (Figure 1.7), Lynch §3.1, Jazar §1.4.3. The numbers in this file are the robot's, not a chapter's.
+
 Three kinds of number, written apart so a length is never hiding inside a formula:
 
 - **Yaw pivot of each leg** (where the coxa servo axis meets the body). These are the points the foot coordinates are actually measured from, the same offsets `build_in_pose.py` names `X1`, `Y1`, `Y2`:
@@ -162,6 +225,8 @@ Three kinds of number, written apart so a length is never hiding inside a formul
 
 ### 2. `coxa` — yaw, one angle, horizontal plane only
 
+Read first: Lynch §3.1, and the `atan2` paragraph on printed page 219 of the Chapter 6 opening. Jazar §2.1 is the same yaw written as a matrix.
+
 Input: leg id and foot `(x, y)`. z is ignored.
 
 ```
@@ -175,6 +240,8 @@ Wrap into `(−π, π]`. `atan2` takes **(y, x)**, not `(x, y)`. The file commen
 This file does not know femur, tibia, or link length.
 
 ### 3. `planar_leg` — the knee triangle (Figure 6.1)
+
+Read first: Lynch, Chapter 6 opening and Figure 6.1, printed pages 219–220, and stop before §6.1. Then Jazar, Chapter 6, Figures 6.1 and 6.3. Lynch's page 219 says lefty/righty are also called elbow-up and elbow-down, which is Jazar's name for the same two folds. The code keeps Lynch's names.
 
 After the coxa yaw is known, the foot lies in a vertical plane. Subtract the coxa link along that heading. What remains is the planar arm in the book: femur is `L1`, tibia is `L2`, and the target `(x, y)` in the book's drawing is our `(x_plane, z_plane)`.
 
@@ -209,6 +276,8 @@ Then add the joint-zero offsets from `geometry`. Those offsets are not in Figure
 
 ### 4. `forward` — angles back to a foot
 
+Read first: Kala §1.4.3 and Figure 1.8, then the opening of Lynch Chapter 4. Jazar §5.3 is the classical chain. This file walks three links. It does not build the product of exponentials or a Denavit–Hartenberg table.
+
 Same constants, opposite direction:
 
 1. Start at the hip.
@@ -218,6 +287,8 @@ Same constants, opposite direction:
 Output is a foot in the body frame, millimetres. Tests use this. Runtime gait does not.
 
 ### 5. `leg_ik` — composition only
+
+Read first: no new chapter. This file calls `coxa`, then `planar_leg`.
 
 `solve_leg(leg_id, foot) -> IkResult`:
 
@@ -231,6 +302,8 @@ Output is a foot in the body frame, millimetres. Tests use this. Runtime gait do
 No new formula in this file. A six-leg helper `solve_pose` loops legs 1..6 so the Python side can do one call per 20 ms tick. If any leg fails, the whole pose fails, with the leg id and the reason (`unreachable`, or a non-finite number). The Python binding returns that result. It does not raise. Raising would fall into the loop's existing `MOVING_POSE` handler, which drops the generator. The hunter's next Twist, 50 ms later, would build a new generator and try the same bad pose again. The plug below holds the last safe angles instead.
 
 ### 6. `safety` — what is allowed to reach a servo
+
+Read first: Lynch §2.5 and Jazar §1.3.2, §6.4.1, and §6.5, for "a foot outside the reachable set has no angle." The ±120° window and `max_step_rad` are this robot's driver and a measurement. They are not a formula in these books.
 
 A separate file, `safety.hpp` / `safety.cpp`. It does not solve a triangle. It answers one question: given the angles we want now and the angles we last actually sent, may this pose be published?
 
