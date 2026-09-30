@@ -12,7 +12,7 @@ Picture one leg. The first hinge, the coxa, only turns left and right, like a tu
 
 You can check the answer without switching the robot on. Fold the ruler from the angles you just computed (that direction is forward kinematics). The tip should land back on the foot you started with. If it does, the two maps are inverses of each other. That check is the heart of the tests.
 
-The new answer is behind a switch. With the switch off, hunter gait 15 keeps asking the closed binary, exactly as it does today. With the switch on, the same gait asks our module instead. Either way, every pose that gait tries to send is written down, and our module is not allowed to hand the servos a jump, an impossible foot, or an angle outside the travel the driver already enforces. A refused pose holds the last safe angles and holds the gait on that same foot. The step clock does not keep running while the legs are frozen. The trace row is handed to a background writer. The 20 ms loop does not wait on the disk.
+The new answer is behind a switch. With the switch off, hunter gait 15 keeps asking the closed binary, exactly as it does today. With the switch on, the same gait asks our module instead. Either way, every pose that gait tries to send is written down, and our module is not allowed to hand the servos a jump, an impossible foot, or an angle outside the travel the driver already enforces. A step that is only too big is walked in smaller pieces along the line from the last sent feet to that frame, and the gait clock waits until the feet arrive. A step that is impossible, or at the straight-leg edge, holds the last safe angles and holds the gait on that foot until a halt. The trace row is handed to a background writer. The 20 ms loop does not wait on the disk, and a full queue does not block the tick.
 
 ## What you can learn from this module
 
@@ -109,7 +109,7 @@ Read the row before you read that file. The files do not exist yet. This is the 
 | `planar_leg` | Lynch Chapter 6 opening and Figure 6.1 (printed pages 219–220). Then Jazar Chapter 6, Figures 6.1 and 6.3, so elbow up / elbow down lands on lefty / righty. Jazar §6.5 is the straight-leg edge. |
 | `forward` | Kala §1.4.3 and Figure 1.8. Lynch Chapter 4 opening: forward kinematics is the opposite map. Jazar §5.3 is the classical chain. The file walks the three links geometrically. |
 | `leg_ik` | No new chapter. It calls `coxa`, then `planar_leg`, in that order. |
-| `safety` | Lynch §2.5 and Jazar §1.3.2, §6.4.1, and §6.5, for the idea "outside the workspace, do not invent an angle." The ±120° window is `JointControl`'s travel. `max_step_rad` is a measurement on this robot. The generator freeze that stops a refusal from locking the leg out is in the 20 ms loop, described under Wiring. |
+| `safety` | Lynch §2.5 and Jazar §1.3.2, §6.4.1, and §6.5, for the idea "outside the workspace, do not invent an angle." The ±120° window is `JointControl`'s travel. `max_step_rad` is a measurement on this robot. What the 20 ms loop does with a refusal (subdivide a too-big frame, or hold an illegal one) is under Wiring. The gate itself stays a yes or no. |
 
 ### Numbers that are not in any of the three books
 
@@ -337,7 +337,7 @@ Checked in this order, all 18 joints, and the pose is one decision:
 
 `q_previous` is the last pose this gate **sent**. `joints_state` is initialized to 0 in `StepController.__init__`, which is not where the servos actually are, so it is not the reference. `self.pose` starts as `DEFAULT_POSE`, and a hunt starts from that stand. The first sample of a bout is compared with `solve` of the current `self.pose` through the same backend. If that reference itself cannot be solved, send nothing and log `no_reference`.
 
-The gate returns `{allow, reason, joint_id}`. It never clamps an angle to the limit. Clamping `q` to `q_previous ± max_step_rad` and sending that would move the foot off the spot the gait asked for, including a foot that is on the ground, and the trace would no longer show a refusal. That idea was considered and is not the implementation. Holding `q_previous` is safe only together with the frame freeze in Wiring. If the generator kept advancing while the servos held still, the next tick's gap would be about twice as large, the rate check would fail again, and the leg would freeze for the rest of the step. The freeze stops that doubling. A normal hunter step stays inside `1.5 ×` the measured peak, so a good walk does not enter this path. If a good walk does, the measured peak is wrong and the constant is what gets fixed.
+The gate returns `{allow, reason, joint_id}`. It never clamps an angle to the limit, and it never chooses a different foot. Clamping `q` to `q_previous ± max_step_rad` would move the foot off the spot the gait asked for, including a foot that is on the ground. A yes/no gate also cannot shrink a gap by itself. If the caller freezes the generator and retries the same feet, the inputs never change, the refusal never clears, and the leg stays in the air until a person halts. That deadlock is real. The repair is in the Wiring section, outside this file: a frame that fails only the step-size check is subdivided in Cartesian space and offered to this same gate again. A frame that fails for any other reason is held. A normal hunter step stays inside `1.5 ×` the measured peak, so a good walk does not enter this path. If a good walk does, the measured peak is wrong and the constant is what gets fixed.
 
 ## The plug
 
@@ -353,7 +353,7 @@ class HexapodLegIk(LegIk):     # hexapod_kinematics.solve_pose, then safety.gate
 def make_leg_ik(use_hexapod: bool) -> LegIk: ...
 ```
 
-`IkDecision` is `allow`, the 18 radians if allowed, and a reason string either way. `VendorLegIk` does not run the new rate gate. Its angles are the reference the rate limit was measured from, and `JointControl` still enforces the ±120° window on them as it does today. `HexapodLegIk` runs the gate. On `allow == false` it returns the **previous sent** radians and `allow` stays false, so the caller publishes nothing.
+`IkDecision` is `allow`, the 18 radians if allowed, and a reason string either way. `VendorLegIk` does not run the new rate gate. Its angles are the reference the rate limit was measured from, and `JointControl` still enforces the ±120° window on them as it does today. `HexapodLegIk` runs the gate once on the feet it was given. It does not subdivide. The subdivision lives in a separate function in this same file, `approach_frame`, so a test can call it without a generator and the gate stays a pure yes or no. On a hard refusal the caller publishes nothing.
 
 The flag is a ROS parameter on the step_controller node:
 
@@ -373,43 +373,65 @@ Two sinks. The screen stays readable. The file has every move.
 
 **Trace file**, one row per gait-5 pose, both backends. Path parameter `hexapod_ik_trace`, default `/home/ubuntu/ros2_ws/log/hexapod_ik_trace.csv`. Append. Write the header when the file is created.
 
-The 20 ms loop does not write the file. A write to the Jetson's eMMC can stall for tens of milliseconds, which is the whole tick, and the gait would stutter. The loop builds the row and puts it on a `queue.Queue` (bound 200, about four seconds of ticks). A daemon thread created in `StepController.__init__` is the only writer. It flushes about twice a second, or every 25 rows. If the queue is full, the loop drops the row, increments a counter, and continues. It does not block. A drop is one `WARN` per second, not one line per dropped row. On shutdown the thread gets a short chance to flush and is not allowed to hold up a halt. A ROS bag is the fallback if a real hunt shows drops: the columns we care about (`decision`, `reason`, the refused angles) are not a stock `JointState`, so the CSV stays the first path.
+The 20 ms loop does not write the file. A write to the Jetson's eMMC can stall for tens of milliseconds, which is the whole tick, and the gait would stutter. The loop builds the row and puts it on a `queue.Queue` (bound 200, about four seconds of ticks). The put is `queue.put(row, block=False)`. A full queue raises `queue.Full`; the loop catches that, drops the row, and continues. Omitting `block=False` would stop the tick at the moment the queue hits 200, which is the stall this thread exists to avoid. A daemon thread created in `StepController.__init__` is the only writer. It flushes about twice a second, or every 25 rows. A drop is one `WARN` per second, not one line per dropped row. On shutdown the thread gets a short chance to flush and is not allowed to hold up a halt. A ROS bag is the fallback if a real hunt shows drops: the columns we care about (`decision`, `reason`, the refused angles) are not a stock `JointState`, so the CSV stays the first path.
 
 Columns:
 
 - `t_s` — controller clock, seconds
 - `backend` — `hexapod` or `vendor`
-- `decision` — `sent`, `held`, or `rejected`
-- `reason` — empty when sent; otherwise `unreachable`, `near_singular`, `joint_limit`, `rate_limit`, `non_finite`, `no_reference`
+- `decision` — `sent`, `partial`, or `held`
+- `alpha` — fraction of this generator frame actually solved this tick. `1` when the frame's own feet were sent, between `0` and `1` for a partial step, `0` when nothing was sent
+- `reason` — empty when `sent`; `rate_limit` when `partial`; otherwise `unreachable`, `near_singular`, `joint_limit`, `rate_limit`, `non_finite`, `no_reference`
 - `joint` — the joint id that failed, or empty
 - six feet, millimetres: `x1 y1 z1` … `x6 y6 z6`
 - eighteen angles, radians: `q1` … `q18` in kinematic servo order (coxa, femur, tibia, leg 1 then leg 2 …)
 - eighteen steps from the previous **sent** pose, radians: `dq1` … `dq18`
 
-`held` means the gate refused and no pulse went out; the `q` columns are the angles that were refused, so a later plot shows the command that was blocked. A streak is still one row per tick. Nothing is sampled out. A 0.60 s step at 20 ms is 30 rows.
+`held` means no pulse went out; the `q` columns are the angles that were refused, so a later plot shows the command that was blocked. `partial` means a pulse did go out, for a point between the last sent feet and this frame. The foot columns are the feet that were solved this tick. A streak is still one row per tick. Nothing is sampled out. A 0.60 s step at 20 ms is 30 rows, plus any partial rows that subdivided one frame.
 
 **ROS log**, on the step_controller logger:
 
 - Once, at node start: the flag, the trace path, the joint window (±120°), and `max_step_rad` with the measured peak beside it.
 - Once per gait-5 generator: `gait 5 backend=hexapod` or `backend=vendor`.
 - Every refusal: `WARN`, with reason, joint, the angle, and the foot of that leg. These are the lines you watch while standing next to the robot.
-- Five refusals in a row (100 ms): one `ERROR`, `holding last safe pose, generator frame frozen`. The generator is **not** dropped. Publishing stays off. The same six feet are retried. A stand (`gait` -2) clears the generators the way a pose-set already does, and that is the way out. A new Twist waiting in `new_moving_generator` does not take over during the freeze, because takeover waits for `last_part`, and `last_part` arrives only from `send()`. The streak counter resets when a pose is sent.
+- Five hard holds in a row (100 ms): one `ERROR`, `holding last safe pose, generator frame frozen`. A `partial` send is not a hold, and it resets the streak. The generator is **not** dropped. A stand (`gait` -2) clears the generators the way a pose-set already does, and that is the way out of a hard hold. A new Twist waiting in `new_moving_generator` does not take over while the frame is unfinished, because takeover waits for `last_part`, and `last_part` arrives only from `send()`.
 - A 1 Hz `INFO`: backend, last decision, and the largest `|dq|` in that second. The 50 Hz detail stays in the CSV.
 
-`pseudo=True` still solves, still gates, still writes a row with `decision=rejected` or `sent`, and still does not publish. A dry run is a trace with no motion.
+`pseudo=True` still solves, still gates, still enqueues a row with `decision=held`, `partial`, or `sent`, and still does not publish. A dry run is a trace with no motion.
 
 ## Wiring in the 20 ms loop
 
 `set_pose_base` stays the vendor path for every non-gait-5 caller.
 
-At both places that send `moving_pose` to the servos (the 20 ms tick and the 50 ms first-slice blend): if `params` is a `CmdVelParams` and `params.gait == 5`, call the plug selected for this generator.
+At both places that send `moving_pose` to the servos (the 20 ms tick and the 50 ms first-slice blend): if `params` is a `CmdVelParams` and `params.gait == 5`, call the plug selected for this generator. The generator is one phase for all six feet. Each `send()` yields the next 20 ms frame and then advances `phase_index`. While a frame is unfinished the loop keeps those six feet and does not call `send()`.
 
-- `allow`: `JointControl.set_multi_joints` with those radians, same ids 1..18 as today. Then remember them as `q_previous`. Clear the freeze.
-- `allow` false: publish nothing. Do not update `joints_state`. Do not integrate odometry for that tick. The integration sits in the same block as the moving pose (`linear_x`, `linear_y`, `angular_z` over 0.02 s). A frozen leg must leave that estimate where it was. Enqueue the trace row. Count the streak. Set the freeze.
+`approach_frame(feet_anchor, feet_frame, alpha_done)` in `leg_ik.py` is the only place that turns one refused frame into motion. `feet_anchor` is where this frame started (the last feet that were sent at `alpha = 1`, or the feet of `self.pose` at the start of a bout). `alpha_done` is how far along the segment we have already sent, in `[0, 1]`.
 
-The freeze: `FollowGaitGenerator` is one Python generator and one phase for all six feet. Each `send()` yields the next 20 ms frame and then advances `phase_index`. After a refusal the loop keeps the last yielded six feet and does not call `send()` again. The next tick solves that same pose. Pausing a single leg was considered and is not the implementation: the tripod shares this one phase, and one leg on an old frame while the others walk splits the step. The whole pose freezes together.
+1. Solve the frame's own feet (`alpha = 1`). If the gate allows them, send those angles, set `alpha_done = 1`, and the next tick may call `send()`.
+2. If the only failure is `rate_limit`, the feet are legal and the step is too big. Search a fraction `alpha` in `(alpha_done, 1]` by eight bisections, which keeps this tick bounded. The candidate feet are one shared fraction for all six legs:
 
-A comment above the branch: gait 5 is the hunter follow walk; `use_hexapod_kinematics` chooses who turns foot tips into angles; a refusal sends no pulses and does not advance the generator.
+```
+feet(alpha) = feet_anchor + alpha * (feet_frame - feet_anchor)
+```
+
+   Accept the largest `alpha` whose solve passes the whole gate, including the step-size check. Send that pose, remember it as `q_previous`, and store the new `alpha_done`. The generator stays on this frame until some later tick is allowed at `alpha = 1`.
+3. If the frame fails for any other reason (`unreachable`, `near_singular`, `joint_limit`, `non_finite`, `no_reference`), do not search. Publish nothing. Leave `q_previous` and `alpha_done` where they are.
+4. If the frame is only `rate_limit` but no `alpha` above `alpha_done` passes, that is the same hard hold. A branch flip is this case: the foot barely moves, the knee solution jumps by about a radian, and every fraction has that same jump because the standing branch does not change. Catch-up must not sneak into the other fold.
+
+The foot path of a partial step is the straight segment between two samples the generator already baked. The generator itself replaced the swing curve by a 20 ms chord. Subdividing that one chord is a finer sample of a segment the gait already accepted. It is not a new swing, and it is not a clamp in joint space.
+
+A Cartesian speed limit that still lets `send()` advance every tick was considered and is not the implementation. The foot would then chase a phase that keeps running, and a straight line between a late foot and a newer frame is not the film. The reachable set of one leg is a ring, which is not a filled disk, so a long chord can leave the ring even when both ends are inside. The bisection rejects those midpoints because they have to pass the same gate. The authority on "small enough" stays `max_step_rad`. A second millimetre limit could disagree with it near the straight leg.
+
+Odometry sits in the same block as the moving pose: `linear_x`, `linear_y`, and `angular_z` are integrated over 0.02 s. During catch-up, integrate only the fraction of this frame completed on this tick:
+
+```
+delta_alpha = alpha_done_now - alpha_done_at_tick_start
+position and yaw += twist * 0.02 * delta_alpha
+```
+
+Across the partials of one frame the deltas sum to 1, which is the same odometry as one ordinary tick. A hard hold has `delta_alpha = 0` and adds nothing. The tick that finally accepts `alpha = 1` adds only the remaining fraction. It does not add the time that was skipped, and the velocity fields written for that integration are the command twist scaled by `delta_alpha`, so they do not jump back to the full command for one line. The next frame, after `send()`, is a new 0.02 s of the full twist.
+
+A comment above the branch: gait 5 is the hunter follow walk; `use_hexapod_kinematics` chooses who turns foot tips into angles; a too-big legal frame is subdivided and the generator waits; any other refusal sends no pulses and does not advance the generator.
 
 `follow_gait.hpp` and `FollowGaitGenerator` stay the source of the foot tips. Their comments that say the vendor function turns tips into angles get one sentence: with the flag on, `hexapod_kinematics` does that job, and the safety gate can refuse the result.
 
@@ -421,7 +443,8 @@ A comment above the branch: gait 5 is the hunter follow walk; `use_hexapod_kinem
 - Why a failed triangle returns `unreachable` instead of a quiet clamp.
 - Why joint zero is not inside the law of cosines.
 - Why pulses and `SERVOS['direction']` stay in Python.
-- Why a refusal publishes nothing, why the generator frame is not advanced, and why the generator object is not dropped.
+- Why a `rate_limit` frame is subdivided along its own chord, why any other refusal is a hard hold, and why the generator object is not dropped.
+- Why odometry adds `twist * 0.02 * delta_alpha`, and why the finishing tick does not repay skipped time.
 - Why the CSV is written on a side thread.
 - Why `coxa_femur_z` is its own constant, with the URDF millimetre beside it.
 - Why `near_singular` uses `|dβ/dr|` and the 0.5 mm round-trip tolerance.
@@ -438,7 +461,8 @@ Each test file matches one subproblem, so a failure names the piece.
 - **Planar.** One hand-built triangle from Figure 6.1 (pick `x_plane`, `z_plane`, compute `α`, `β`, `γ` on paper) → solver returns those angles. A point with `r > L1 + L2` → `ok == false`, reason `unreachable`. A point just inside the outer ring, with a stand-in `max_step_rad`, → `near_singular`. The stand foot, with that same limit, is not `near_singular`. Shifting `coxa_femur_z` by 1 mm shifts `z_plane` by 1 mm and leaves `x_plane` alone. Lefty and righty are both visible; `standing_branch` is the one with tibia negative when the foot is below the hip.
 - **Forward round trip.** For a grid around each `DEFAULT_POSE` foot (about ±40 mm in x and y, z from −100 to −40, which covers the hunter lift), `forward(solve_leg(p))` is within 0.5 mm of `p`. Skip points the solver marks `unreachable` or `near_singular`. The forward steps include `coxa_femur_z`.
 - **Stand contract.** `solve_leg` on all six `DEFAULT_POSE` feet matches the vendor stand radians within **0.005 rad** on each joint (about 0.3°). Those target numbers are written in the test with the degree values beside them. This is the gate that says our zero is the servo’s zero, tight enough that turning the flag on does not kick a standing robot. If a shared femur/tibia zero cannot pass, the test is what forces the per-joint zeros, and the comment names the residual.
-- **Safety.** A joint at 2.2 rad (past ±120°) → `joint_limit`, and the decision would publish nothing. A 1 rad jump from the previous sent pose → `rate_limit`. A step of a few hundredths of a radian inside the window → `allow`. A NaN → `non_finite`. A solver reason `near_singular` is kept and refused. The test does not call a servo. The frame freeze is Python: a small test beside `leg_ik.py` feeds a refused pose and asserts the next solve is given those same six feet, and that a following legal pose is what advances the frame.
+- **Safety.** A joint at 2.2 rad (past ±120°) → `joint_limit`, and the decision would publish nothing. A 1 rad jump from the previous sent pose → `rate_limit`. A step of a few hundredths of a radian inside the window → `allow`. A NaN → `non_finite`. A solver reason `near_singular` is kept and refused. The test does not call a servo.
+- **Catch-up, in Python beside `leg_ik.py`.** A frame whose feet are legal but whose angles jump past `max_step_rad`: the first call returns `partial` with `alpha < 1`, and a later call on the same frame returns `sent` at `alpha = 1`. The alphas of one frame sum in their steps to 1. A `near_singular` or `unreachable` frame returns `held` and does not move `alpha`. A same-foot branch flip returns `held`. The odometry increment of the partials plus the finishing tick equals one ordinary 0.02 s of the twist, and the finishing tick's increment is only the leftover fraction.
 
 A short Python script under `hexapod_kinematics` (not imported by the controller) prints our angles next to `kinematics.set_leg_position` for the stand and a few offsets, and prints the peak `|Δq|` over one pseudo gait-5 cycle. That peak, times 1.5, is what gets written into `safety.cpp`. With the flag false, a live hunt still uses `kinematics.so`. With the flag true, the gait-5 path does not.
 
@@ -448,7 +472,7 @@ A short Python script under `hexapod_kinematics` (not imported by the controller
 2. Build `controller` after the pybind module installs, import `hexapod_kinematics` from the sourced workspace.
 3. Run the calibration print. If any stand joint is outside 0.005 rad, fix lengths, `coxa_femur_z`, or joint zeros and re-run the gtests. Do not absorb `coxa_femur_z` into `L1` or `L2` to make the stand pass. Write the measured `max_step_rad` into `safety.cpp`, re-run `test_safety` and the `near_singular` case, and confirm the stand foot is still inside the soft edge. Do not turn the flag on while any of these fail.
 4. A hunt with the flag left false is the before-picture: the trace file fills with `backend=vendor`, and the walk is the one you already know.
-5. Live with the flag true, only after that and only when Peter asks: `ros2 param set /step_controller use_hexapod_kinematics true`, then start the hunter and let gait 15 walk a short follow, then halt. Halt still uses the vendor stand, and a halt is what clears a frozen generator. Watch the WARN lines and the first rows of the trace. A `rate_limit`, `near_singular`, or `joint_limit` must leave the legs on the last safe angles and must leave the generator on that same frame. Joystick walk is unchanged and is the regression check that gait 2 still calls the `.so`.
+5. Live with the flag true, only after that and only when Peter asks: `ros2 param set /step_controller use_hexapod_kinematics true`, then start the hunter and let gait 15 walk a short follow, then halt. Halt still uses the vendor stand, and a halt is what clears a hard hold. Watch the WARN lines and the first rows of the trace. A `near_singular` or `joint_limit` must leave the legs on the last safe angles and must leave the generator on that same frame. A `rate_limit` on a legal far foot must show `partial` rows and then a `sent` row at `alpha = 1` before the generator moves on. Joystick walk is unchanged and is the regression check that gait 2 still calls the `.so`.
 
 ## Work order
 
@@ -460,6 +484,6 @@ A short Python script under `hexapod_kinematics` (not imported by the controller
 6. `leg_ik` composition and `solve_pose`. The binding returns the result and does not raise.
 7. `safety` and `test_safety`. `max_step_rad` stays a named constant with a comment; the calibration script fills the number before the flag may be turned on. Re-check `near_singular` with that number.
 8. pybind11 module, including the safety gate.
-9. `controller/leg_ik.py`: the two backends, the flag defaulting to false, the trace queue and writer thread, WARN on each refusal, no publish when the gate says no.
-10. The `params.gait == 5` branch in the 20 ms loop, the frame freeze, the skipped odometry step on a refusal, and the launch argument on `move_controller.launch.py`.
+9. `controller/leg_ik.py`: the two backends, `approach_frame`, the flag defaulting to false, the trace queue with `put(..., block=False)`, WARN on each hard hold, no publish on a hard hold.
+10. The `params.gait == 5` branch in the 20 ms loop, the unfinished-frame wait, the `delta_alpha` odometry step, and the launch argument on `move_controller.launch.py`.
 11. Calibration print (stand error and the measured step peak), then stop for a live hunt. First hunt keeps the flag false. The flag-true hunt waits until you ask.
