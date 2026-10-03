@@ -5,9 +5,9 @@
   <version>0.1.0</version>
   <description>
     Open-source leg inverse kinematics for Masha hunter gait 15.
-    This revision has the shared types and the geometry constants
-    (hip table, length guesses, coxa_femur_z). The coxa solver is not
-    in the tree yet. The reading plan is PLAN.md.
+    This revision has the shared types, the geometry constants
+    (hip table, length guesses, coxa_femur_z), and the coxa yaw.
+    The planar triangle is not in the tree yet. The reading plan is PLAN.md.
   </description>
   <maintainer email="ubuntu@todo.todo">ubuntu</maintainer>
   <license>Apache-2.0</license>
