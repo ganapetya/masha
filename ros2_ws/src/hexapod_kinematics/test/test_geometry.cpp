@@ -65,11 +65,13 @@ TEST(Geometry, LengthGuessesStaySeparate) {
   EXPECT_NE(links.coxa_femur_z_mm, 0.0);
 }
 
-TEST(Geometry, JointZeroIsUnfittedAndStandTapeIsSeparate) {
+TEST(Geometry, JointZeroIsFittedAndStandTapeIsSeparate) {
+  // The numbers LegIk.StandContract fitted. The tape below is the
+  // vendor stand, not this offset.
   const JointZero& zero = joint_zero();
   EXPECT_DOUBLE_EQ(zero.coxa_rad, 0.0);
-  EXPECT_DOUBLE_EQ(zero.femur_rad, 0.0);
-  EXPECT_DOUBLE_EQ(zero.tibia_rad, 0.0);
+  EXPECT_DOUBLE_EQ(zero.femur_rad, 0.144427);
+  EXPECT_DOUBLE_EQ(zero.tibia_rad, 1.481540);
 
   const StandTape& tape = stand_tape_lf();
   EXPECT_DOUBLE_EQ(tape.coxa_rad, 0.1207);

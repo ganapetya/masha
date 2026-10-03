@@ -5,9 +5,10 @@
   <version>0.1.0</version>
   <description>
     Open-source leg inverse kinematics for Masha hunter gait 15.
-    This revision has the shared types, the geometry constants,
-    the coxa yaw, and the knee triangle (Figure 6.1). Forward
-    kinematics is not in the tree yet. The reading plan is PLAN.md.
+    This revision has the coxa yaw, the knee triangle, forward
+    kinematics, and solve_leg. The shared joint zero is fitted to
+    the stand. solve_pose is not in the tree yet. The reading plan
+    is PLAN.md.
   </description>
   <maintainer email="ubuntu@todo.todo">ubuntu</maintainer>
   <license>Apache-2.0</license>

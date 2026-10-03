@@ -58,15 +58,34 @@ constexpr LinkLengths kLinks = {
     1.13,
 };
 
-// Not fitted. The stand contract (0.005 rad) is what will replace these.
-// Leaving them at 0 makes that failure obvious instead of hiding a guess.
-constexpr JointZero kJointZero = {0.0, 0.0, 0.0};
+// Fitted by LegIk.StandContract in test_leg_ik.cpp. That test requires
+// solve_leg on all six DEFAULT_POSE feet to land within 0.005 rad of
+// the angles set_leg_position returns.
+//
+// Coxa stays 0. The largest coxa residual is about 0.0037 rad, on the
+// corner legs, which is already inside 0.005. The middle legs match
+// with no offset.
+//
+// Femur 0.144427 rad (about 8.28 deg) and tibia 1.481540 rad (about
+// 84.89 deg) are one shared pair. They are the average gap, at the
+// stand, between the drawing and the servo. The drawing measures the
+// femur from horizontal and the tibia from straight. The servo measures
+// both from the center of its travel. The tibia gap is that definition.
+// It is not a second copy of a link length.
+//
+// Corner and middle feet are different triangles, about 4 mm apart in
+// the horizontal plane. The vendor tibia differs by about 0.037 rad
+// between those two shapes, and this model differs by about 0.036 rad,
+// so one shared tibia zero covers both. A per-leg table was not needed.
+// The URDF length guesses and coxa_femur_z were left as they are.
+// Moving them is not what closed the contract.
+constexpr JointZero kJointZero = {0.0, 0.144427, 1.481540};
 
-// Left-front vendor stand: 0.1207, 0.7555, -0.650 rad
-// (6.91 deg, 43.29 deg, -37.24 deg). Femur and tibia are the same number
-// on the other legs. Coxa mirrors across the body: middles are 0, and the
-// right side negates the left. That per-leg table is written when the
-// stand test exists. This tape is not added into a formula here.
+// Left-front vendor stand, rounded the way PLAN.md writes it:
+// 0.1207, 0.7555, -0.650 rad (6.91 deg, 43.29 deg, -37.24 deg).
+// The stand test writes the fuller six-leg readings. Middle femur and
+// tibia are not this pair. Coxa on the right negates the left, and the
+// middles are 0. This tape is not added into a formula.
 constexpr StandTape kStandLf = {0.1207, 0.7555, -0.650};
 
 }  // namespace

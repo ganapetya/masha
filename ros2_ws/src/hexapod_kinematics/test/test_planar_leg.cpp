@@ -34,8 +34,10 @@ TEST(Planar, HandBuiltEquilateralMatchesTheBook) {
   // are equal, so alpha = beta = 60 degrees and gamma = 0.
   //   righty: femur = -60 deg, tibia = +120 deg
   //   lefty:  femur = +60 deg, tibia = -120 deg
+  // A zero offset, so the commanded fold is the book fold. The robot's
+  // fitted offset is the stand contract, not this triangle.
   const PlaneTarget foot{100.0, 0.0};
-  const JointZero zero = joint_zero();
+  const JointZero zero{};
   const PlanarResult solved =
       solve_planar(foot, equal_links(), kStandInMaxStepRad, zero);
 
@@ -50,7 +52,6 @@ TEST(Planar, HandBuiltEquilateralMatchesTheBook) {
   EXPECT_NEAR(solved.lefty.femur_rad, kPi / 3.0, 1e-12);
   EXPECT_NEAR(solved.lefty.tibia_rad, -2.0 * kPi / 3.0, 1e-12);
 
-  // Joint zero is still 0, so the commanded fold is the book fold.
   EXPECT_EQ(solved.standing, KneeBranch::Lefty);
   EXPECT_DOUBLE_EQ(solved.standing_angles.femur_rad, solved.lefty.femur_rad);
   EXPECT_DOUBLE_EQ(solved.standing_angles.tibia_rad, solved.lefty.tibia_rad);
@@ -138,8 +139,11 @@ TEST(Planar, StandFootKeepsLeftyAndClearsTheSoftEdge) {
   EXPECT_LT(solved.lefty.tibia_rad, 0.0);
   EXPECT_LT(solved.righty.femur_rad, 0.0);
   EXPECT_GT(solved.righty.tibia_rad, 0.0);
-  EXPECT_DOUBLE_EQ(solved.standing_angles.femur_rad, solved.lefty.femur_rad);
-  EXPECT_DOUBLE_EQ(solved.standing_angles.tibia_rad, solved.lefty.tibia_rad);
+  const JointZero& zero = joint_zero();
+  EXPECT_DOUBLE_EQ(solved.standing_angles.femur_rad,
+                   solved.lefty.femur_rad + zero.femur_rad);
+  EXPECT_DOUBLE_EQ(solved.standing_angles.tibia_rad,
+                   solved.lefty.tibia_rad + zero.tibia_rad);
 }
 
 TEST(Planar, RaisingTheFootLiftsTheFemur) {

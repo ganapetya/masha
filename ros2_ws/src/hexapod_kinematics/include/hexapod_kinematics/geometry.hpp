@@ -36,9 +36,10 @@ struct LinkLengths {
 };
 
 // Added to the geometric angles before they are compared with a servo.
-// Zero here means "not fitted yet", not "the drawing's zero is the servo's
-// zero". One shared triple is the first try. A per-joint table is a later
-// change, and only if the stand contract cannot pass with this one.
+// The stand contract filled this shared triple. Coxa is 0. Femur and
+// tibia are the gap between the drawing's zero and the servo's zero.
+// A per-leg table was not needed. geometry.cpp names the test and the
+// residuals.
 struct JointZero {
   double coxa_rad = 0.0;
   double femur_rad = 0.0;

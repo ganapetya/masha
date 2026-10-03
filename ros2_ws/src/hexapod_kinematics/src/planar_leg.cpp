@@ -71,10 +71,10 @@ KneeBranch standing_branch() {
   // moves lefty to about +0.94 rad and -2.30 rad: the femur rises and
   // the tibia bends further down.
   //
-  // The vendor tape for that pose is femur +0.76 rad and tibia -0.65 rad.
-  // That tape is a different zero. It is not subtracted inside the
-  // cosines. Joint zero is still {0, 0, 0}; matching the tape is the
-  // stand contract, which is a later file.
+  // The vendor tape for that pose is femur about +0.76 rad and tibia
+  // about -0.65 rad. The gap is the shared joint zero in geometry.cpp,
+  // added after these book angles by add_joint_zero. The cosines do
+  // not contain it.
   return KneeBranch::Lefty;
 }
 
