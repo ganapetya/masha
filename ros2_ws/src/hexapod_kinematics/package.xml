@@ -6,15 +6,20 @@
   <description>
     Open-source leg inverse kinematics for Masha hunter gait 15.
     This revision has the coxa yaw, the knee triangle, forward
-    kinematics, solve_leg, the six-leg solve_pose, and the safety
-    gate. The shared joint zero is fitted to the stand. The step
-    limit is still the stand-in. The reading plan is PLAN.md.
+    kinematics, solve_leg, the six-leg solve_pose, the safety gate,
+    and a pybind11 module. The shared joint zero is fitted to the
+    stand. The step limit is still the stand-in. The reading plan
+    is PLAN.md.
   </description>
   <maintainer email="ubuntu@todo.todo">ubuntu</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+  <build_depend>pybind11-dev</build_depend>
+  <exec_depend>python3</exec_depend>
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

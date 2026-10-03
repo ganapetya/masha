@@ -7,9 +7,10 @@
 // standing angles.
 //
 // solve_pose is the call one 20 ms tick makes: six feet in, one decision
-// out. It loops legs 1..6 and calls solve_leg. A later Python binding
-// returns this result as a value. A refusal stays a filled PoseResult,
-// so the tick's handler keeps the generator instead of seeing an exception.
+// out. It loops legs 1..6 and calls solve_leg. The Python binding in
+// bindings.cpp returns this result as a value. A refusal stays a filled
+// PoseResult, so the tick's handler keeps the generator instead of
+// seeing an exception.
 
 #include "hexapod_kinematics/types.hpp"
 
