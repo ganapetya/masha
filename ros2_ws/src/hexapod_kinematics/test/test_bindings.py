@@ -111,14 +111,16 @@ def test_a_joint_past_the_window_is_joint_limit():
 
 
 def test_near_singular_reason_is_kept():
-    # 0.2 mm short of straight, level with the femur hinge, leg 6.
-    # Lengths are the URDF guesses in geometry.cpp.
+    # 0.02 mm short of straight, level with the femur hinge, leg 6.
+    # A 0.5 mm slip there moves the knee past the measured limit.
+    # A foot 0.2 mm short is allowed at that limit. Lengths are the
+    # URDF guesses in geometry.cpp.
     import math
 
     coxa = 45.0
     femur = 77.1
     tibia = 115.6
-    reach = coxa + femur + tibia - 0.2
+    reach = coxa + femur + tibia - 0.02
     yaw = -math.pi / 4.0
     feet = list(default_feet())
     feet[5] = (

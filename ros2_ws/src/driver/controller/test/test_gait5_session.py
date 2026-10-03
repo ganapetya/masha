@@ -172,8 +172,10 @@ def test_a_hold_does_not_move_alpha_or_release_the_boundary():
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
-def test_the_step_limit_is_still_the_stand_in():
-    assert read_max_step_rad() == pytest.approx(0.05)
+def test_the_step_limit_is_the_measured_peak_times_the_margin():
+    # Vendor pseudo cycle, Twist +0.12 m/s, +0.10 m/s, +0.6 rad/s,
+    # period 0.60 s, lift 35 mm. safety.cpp names that command.
+    assert read_max_step_rad() == pytest.approx(0.17622116866774196 * 1.5)
 
 
 def test_launch_argument_defaults_to_false():

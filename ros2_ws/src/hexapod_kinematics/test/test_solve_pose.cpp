@@ -105,12 +105,13 @@ TEST(SolvePose, FirstBadLegFailsTheWholePose) {
 }
 
 TEST(SolvePose, AStraightFootIsNearSingularAndNamesThatLeg) {
-  // Just inside the outer ring, level with the femur hinge. The same
-  // point the planar test refuses. Put it on leg 6 so five good legs
-  // are stored and the pose still comes back near_singular.
+  // 0.02 mm short of straight, level with the femur hinge. The same
+  // point the planar test refuses. A foot 0.2 mm short is under the
+  // measured limit. Put it on leg 6 so five good legs are stored and
+  // the pose still comes back near_singular.
   const LinkLengths& links = link_lengths();
   const Hip& mount = hip(LegId::Rf);
-  const double reach = links.coxa_mm + links.femur_mm + links.tibia_mm - 0.2;
+  const double reach = links.coxa_mm + links.femur_mm + links.tibia_mm - 0.02;
   std::array<Vec3, kLegCount> feet = default_pose();
   feet[static_cast<std::size_t>(leg_index(LegId::Rf))] = {
       mount.x_mm + reach * std::cos(mount.mount_yaw_rad),

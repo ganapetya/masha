@@ -17,8 +17,8 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 
 // The knee check and the safety gate share max_step_rad(). The value
-// is still the 0.05 rad stand-in. safety.cpp records why that number
-// sits between the stand and the near-straight foot.
+// is the measured gait-5 peak times 1.5. safety.cpp names the command.
+// The stand clears that limit. A foot 0.02 mm short of straight does not.
 
 LinkLengths equal_links() {
   LinkLengths links;
@@ -105,12 +105,13 @@ TEST(Planar, InsideTheInnerHoleIsUnreachable) {
 }
 
 TEST(Planar, JustInsideTheOuterRingIsNearSingular) {
-  // 0.2 mm short of L1 + L2, level with the femur hinge. The cosine is
-  // still inside [-1, 1], so an angle exists. A 0.5 mm slip would move
-  // the knee by more than the stand-in limit, and the two folds are
-  // already close to the same straight line.
+  // 0.02 mm short of L1 + L2, level with the femur hinge. The cosine
+  // is still inside [-1, 1], so an angle exists. A 0.5 mm slip at this
+  // radius moves the knee by about 0.37 rad, past the measured limit.
+  // A foot 0.2 mm short asks for about 0.116 rad and is allowed. The
+  // two folds are already close to the same straight line.
   const LinkLengths& links = link_lengths();
-  const PlaneTarget almost{links.femur_mm + links.tibia_mm - 0.2, 0.0};
+  const PlaneTarget almost{links.femur_mm + links.tibia_mm - 0.02, 0.0};
   const PlanarResult solved =
       solve_planar(almost, links, max_step_rad(), joint_zero());
 
@@ -122,7 +123,7 @@ TEST(Planar, JustInsideTheOuterRingIsNearSingular) {
 }
 
 TEST(Planar, StandFootKeepsLeftyAndClearsTheSoftEdge) {
-  // DEFAULT_POSE left-front foot. The knee is bent, so the same stand-in
+  // DEFAULT_POSE left-front foot. The knee is bent, so the same measured
   // limit that refused the near-straight point allows this one.
   // Lefty is femur-up and tibia-down. Righty is the other fold.
   const Vec3 foot{163.6, 140.8, -70.0};

@@ -103,7 +103,8 @@ TEST(Safety, ServoTableMatchesTheDriverLegRows) {
   EXPECT_STREQ(leg_servo_or_null(1)->name, "coxa_joint_LF");
   EXPECT_STREQ(leg_servo_or_null(11)->name, "femur_joint_RR");
   EXPECT_STREQ(leg_servo_or_null(18)->name, "tibia_joint_RF");
-  EXPECT_NEAR(max_step_rad(), 0.05, 0.0);
+  // The measured gait-5 peak times 1.5. safety.cpp names the command.
+  EXPECT_NEAR(max_step_rad(), 0.17622116866774196 * 1.5, 0.0);
 }
 
 TEST(Safety, AJointPastTheHalfWindowIsJointLimit) {
@@ -208,11 +209,13 @@ TEST(Safety, ANanIsNonFiniteBeforeTheWindow) {
 }
 
 TEST(Safety, SolverNearSingularIsKept) {
-  // The foot is 0.2 mm short of straight, on leg 6. solve_pose refuses
-  // it. The gate repeats that reason and does not re-label it.
+  // 0.02 mm short of straight, on leg 6. A 0.5 mm slip there moves
+  // the knee by about 0.37 rad, past the measured limit, so solve_pose
+  // refuses. A foot 0.2 mm short asks for about 0.116 rad and is
+  // allowed at this limit. The gate repeats the solver's reason.
   const LinkLengths& links = link_lengths();
   const Hip& mount = hip(LegId::Rf);
-  const double reach = links.coxa_mm + links.femur_mm + links.tibia_mm - 0.2;
+  const double reach = links.coxa_mm + links.femur_mm + links.tibia_mm - 0.02;
   std::array<Vec3, kLegCount> feet = default_feet();
   feet[static_cast<std::size_t>(leg_index(LegId::Rf))] = {
       mount.x_mm + reach * std::cos(mount.mount_yaw_rad),

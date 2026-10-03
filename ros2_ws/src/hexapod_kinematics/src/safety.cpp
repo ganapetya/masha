@@ -28,22 +28,26 @@ constexpr double kPi = 3.14159265358979323846;
 // Full travel of a leg servo. config.py writes math.radians(240).
 constexpr double kLegTravelRad = 240.0 * kPi / 180.0;
 
-// Stand-in step limit. Not a measured peak.
+// Measured step limit. scripts/calibrate_max_step.py, vendor backend,
+// no servos (pseudo). One FollowGaitGenerator cycle from DEFAULT_POSE,
+// hunter lift 35 mm, period 0.60 s, Twist clamps vx = +0.12 m/s,
+// vy = +0.10 m/s, wz = +0.6 rad/s. Thirty frames. The largest |Δq|
+// in one tick of that cycle is 0.17622116866774196 rad, on femur_LF
+// (joint 2), the step into frame 5. The other seven sign combinations
+// of those clamps land on the same peak, mirrored onto another femur.
+// Each axis alone is smaller. This constant is that peak times 1.5.
 //
-// Work order item 11 runs one gait-5 cycle on the vendor backend, with
-// no servos (pseudo), at the hunter Twist clamps 0.12 m/s, 0.10 m/s,
-// 0.6 rad/s, period 0.60 s. It records the largest |Δq| in one tick.
-// The number that replaces this stand-in is that peak times 1.5.
-// The comment that replaces this one names the measured peak, the 1.5
-// margin, and that command. Until that comment is here, the hunt flag
-// stays off.
+// The first tick of that same command, from the stand into the intro
+// splice, is about 0.328 rad. That is a catch-up, not a reason to
+// raise this number. A knee flip is still about a radian.
 //
-// 0.05 rad is the value the triangle tests were written against.
-// At these link lengths a 0.5 mm foot error asks the knee for about
-// 0.0066 rad at the left-front stand, and about 0.116 rad when the
-// foot is 0.2 mm short of a straight leg. 0.05 sits between them, so
-// the stand clears the soft edge and that near-straight foot does not.
-constexpr double kMaxStepRad = 0.05;
+// A 0.5 mm foot error asks the knee for about 0.0066 rad at the
+// left-front stand, so the stand stays inside the soft edge. The same
+// error asks for about 0.116 rad when the foot is 0.2 mm short of
+// straight, which is under this limit, and about 0.37 rad when the
+// foot is 0.02 mm short, which is over it. The near_singular tests
+// use that closer foot.
+constexpr double kMaxStepRad = 0.17622116866774196 * 1.5;
 
 // Index 0 is kinematic joint 1. Brace order is name, direction,
 // offset, full travel. Directions are the driver's, including the

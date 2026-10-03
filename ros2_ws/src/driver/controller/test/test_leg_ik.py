@@ -105,11 +105,13 @@ class ScriptedIk(object):
 
 
 def _near_straight_feet():
-    # 0.2 mm short of straight, level with the femur hinge, leg 6.
+    # 0.02 mm short of straight, level with the femur hinge, leg 6.
+    # That close, a 0.5 mm slip moves the knee past the measured
+    # step limit. A foot 0.2 mm short does not.
     coxa = 45.0
     femur = 77.1
     tibia = 115.6
-    reach = coxa + femur + tibia - 0.2
+    reach = coxa + femur + tibia - 0.02
     yaw = -math.pi / 4.0
     feet = list(default_feet())
     feet[5] = (
@@ -150,13 +152,16 @@ def test_the_flag_defaults_to_the_vendor_backend():
     assert isinstance(make_leg_ik(False), VendorLegIk)
 
 
-def test_startup_line_names_the_unset_peak():
-    text = startup_line(False, TRACE_PATH_DEFAULT, 0.05)
+def test_startup_line_names_the_measured_peak():
+    missing = startup_line(False, TRACE_PATH_DEFAULT, "unavailable")
+    assert "measured_peak=unset" in missing
+    text = startup_line(False, TRACE_PATH_DEFAULT, 0.06)
     assert "use_hexapod_kinematics=False" in text
     assert TRACE_PATH_DEFAULT in text
     assert "±120°" in text
-    assert "max_step_rad=0.05" in text
-    assert "measured_peak=unset" in text
+    assert "max_step_rad=0.06" in text
+    # safety.cpp stores 1.5 times the peak, so 0.06 names 0.04.
+    assert "measured_peak=0.04" in text
 
 
 def test_step_one_solves_the_generator_feet_and_0996_stays_partial():

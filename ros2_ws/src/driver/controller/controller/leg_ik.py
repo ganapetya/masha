@@ -473,11 +473,11 @@ class Gait5Session(object):
 def read_max_step_rad():
     """The step limit safety.cpp returns, or None if the import fails.
 
-    The startup line prints this number once. HexapodLegIk still
-    imports the module on its own first solve. None means the
-    controller can still walk with the closed solver: joystick
-    gaits do not need this module. The measured peak is a later
-    edit of safety.cpp. This function does not invent one.
+    The startup line prints this number once, and prints the peak
+    as that number divided by 1.5, which is how safety.cpp defines
+    it. HexapodLegIk still imports the module on its own first
+    solve. None means the controller can still walk with the closed
+    solver: joystick gaits do not need this module.
     """
     try:
         import hexapod_kinematics as hk
@@ -486,18 +486,30 @@ def read_max_step_rad():
     return hk.max_step_rad()
 
 
+def _measured_peak(max_step_rad):
+    """The gait-5 peak implied by the step limit, or 'unset'.
+
+    safety.cpp stores 1.5 times the measured peak. A startup value
+    that is not a number means the import failed, and there is no
+    peak to print. A bool is an int in Python, and it is not a limit.
+    """
+    if isinstance(max_step_rad, bool) or not isinstance(max_step_rad, (int, float)):
+        return "unset"
+    return "%.8g" % (float(max_step_rad) / 1.5)
+
+
 def startup_line(use_hexapod, trace_path, max_step_rad):
     """The one line at node start.
 
     The window is the driver's ±120°. max_step_rad is whatever
-    safety.cpp currently returns. The measured peak is not written
-    yet, so the line says it is unset. While it is unset the flag
-    that is passed in stays false.
+    safety.cpp currently returns. The peak beside it is that number
+    divided by 1.5. The flag passed in is the caller's flag.
     """
     return (
         "use_hexapod_kinematics=%s trace=%s window=±120° "
-        "max_step_rad=%s measured_peak=unset"
-        % (True if use_hexapod else False, trace_path, max_step_rad))
+        "max_step_rad=%s measured_peak=%s"
+        % (True if use_hexapod else False, trace_path, max_step_rad,
+           _measured_peak(max_step_rad)))
 
 
 class HoldWatch(object):
