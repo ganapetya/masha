@@ -206,6 +206,9 @@ struct FollowErrors {
 
 struct LidarSector {
   double d_min{0.0};  // +inf if no finite hit in the front sector
+  // Bearing of that closest return, radians, from base_link.
+  // 0 is straight ahead. Positive is to Masha's left.
+  double d_min_bearing{0.0};
   double left_median{0.0};
   double right_median{0.0};
   bool have_hit{false};

@@ -68,6 +68,9 @@ double pd_axis(double e, double e_dot, double kp, double kd, double deadband, do
 // Project each LD19 return into base_link, keep the front 90° sector.
 // The scan is in the lidar frame; lidar_x (~10 cm) is the mount offset
 // so "0.55 m in front of Masha" is not "0.55 m in front of the puck".
+// The same offset pulls a side ray into the wedge: a return at 53° in
+// the lidar frame can sit at 44° from the body, and ±45° still counts
+// as "in front". d_min_bearing is that body angle of the closest return.
 LidarSector lidar_front(const ScanView &scan, const HunterConfig &cfg) {
   LidarSector out;
   out.d_min = std::numeric_limits<double>::infinity();
@@ -96,7 +99,10 @@ LidarSector lidar_front(const ScanView &scan, const HunterConfig &cfg) {
     }
     const double d = std::hypot(x_b, y_b);
     out.have_hit = true;
-    out.d_min = std::min(out.d_min, d);
+    if (d < out.d_min) {
+      out.d_min = d;
+      out.d_min_bearing = bearing;
+    }
     if (bearing > 0.0) {
       left.push_back(d);
     } else {

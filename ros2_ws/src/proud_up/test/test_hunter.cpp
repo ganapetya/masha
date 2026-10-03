@@ -271,6 +271,34 @@ TEST(Hunter, LidarFrontTransformsToBaseLink) {
   const auto s = lidar_front(scan, cfg);
   EXPECT_TRUE(s.have_hit);
   EXPECT_NEAR(s.d_min, 0.50, 1e-6);
+  EXPECT_NEAR(s.d_min_bearing, 0.0, 1e-6);
+}
+
+TEST(Hunter, LidarFrontKeepsASideWallInsideTheFrontWedge) {
+  // Default sector is ±45° from the body, not from the lidar puck.
+  // A ray at 50° in the lidar frame, 0.47 m out, lands near 42° from
+  // base_link because the puck sits 10 cm forward. That is still
+  // "in front", so a wall beside her can be the stop.
+  const float side[] = {0.47f};
+  ScanView scan;
+  scan.ranges = side;
+  scan.n = 1;
+  scan.angle_min = 50.0 * kHunterPi / 180.0;
+  scan.angle_increment = 0.0;
+  scan.range_max = 10.0;
+  HunterConfig cfg;
+  cfg.lidar_x = 0.102;
+  cfg.lidar_ignore_below = 0.20;
+  const auto kept = lidar_front(scan, cfg);
+  EXPECT_TRUE(kept.have_hit);
+  EXPECT_LT(kept.d_min, 0.55);
+  EXPECT_GT(kept.d_min_bearing, 35.0 * kHunterPi / 180.0);
+  EXPECT_LT(kept.d_min_bearing, 45.0 * kHunterPi / 180.0);
+
+  // Farther around, past the wedge, the same range is not a stop.
+  scan.angle_min = 80.0 * kHunterPi / 180.0;
+  const auto dropped = lidar_front(scan, cfg);
+  EXPECT_FALSE(dropped.have_hit);
 }
 
 TEST(Hunter, SaveliPlugNeedsMatchingTag) {

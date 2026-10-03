@@ -636,6 +636,10 @@ class MashaHunterNode : public rclcpp::Node {
     double d_min = std::numeric_limits<double>::infinity();
     double left_open = 0.0;
     double right_open = 0.0;
+    // Kept so the 1 Hz line can name the bearing of the closest return.
+    // The stop itself still uses only d_min, inside Hunter::tick.
+    LidarSector sector;
+    sector.d_min = d_min;
     if (scan && !scan->ranges.empty()) {
       ScanView view;
       view.ranges = scan->ranges.data();
@@ -644,7 +648,7 @@ class MashaHunterNode : public rclcpp::Node {
       view.angle_increment = scan->angle_increment;
       view.range_min = scan->range_min;
       view.range_max = scan->range_max;
-      const auto sector = lidar_front(view, hunter_.config());
+      sector = lidar_front(view, hunter_.config());
       if (sector.have_hit) {
         d_min = sector.d_min;
       }
@@ -686,6 +690,51 @@ class MashaHunterNode : public rclcpp::Node {
       // not SelectGait15 / Twist toward a pose that is still (0, 0).
       out.legs = legs_for_metric_target(out.legs, hit);
       play = out.play_name;
+      // One line when the legs stand for the lidar, and one line a second
+      // while she is hunting. The front wedge is ±45° from the body, so a
+      // wall beside her can be the closest return. pan=frozen is the tag
+      // lock (or this stop): Hunt is the only phase that sweeps the head.
+      if (out.phase == HunterPhase::Stopped && prev != HunterPhase::Stopped) {
+        const double bearing_deg =
+            sector.have_hit ? sector.d_min_bearing * 180.0 / kHunterPi : 0.0;
+        RCLCPP_WARN(get_logger(),
+                    "LIDAR stop. closest %.2f m at %+.0f deg "
+                    "(0 forward, + left, wedge ±45, d_stop %.2f). "
+                    "tag r=%.2f th=%+.0f. Head stays.",
+                    sector.have_hit ? sector.d_min : -1.0, bearing_deg,
+                    hunter_.config().d_stop, out.r, out.theta * 180.0 / kHunterPi);
+      }
+      if (out.phase != HunterPhase::Idle) {
+        const char *why = "walk";
+        if (out.phase == HunterPhase::Stopped) {
+          why = "lidar";
+        } else if (out.at_standoff) {
+          why = "standoff";
+        } else if (out.phase == HunterPhase::Name) {
+          why = "name";
+        } else if (out.phase == HunterPhase::Hunt) {
+          why = "search";
+        } else if (out.legs == LegCommandKind::Halt) {
+          why = "halt";
+        }
+        const double bearing_deg =
+            sector.have_hit ? sector.d_min_bearing * 180.0 / kHunterPi : 0.0;
+        const char *legs = "none";
+        if (out.legs == LegCommandKind::Halt) {
+          legs = "halt";
+        } else if (out.legs == LegCommandKind::Twist) {
+          legs = "twist";
+        } else if (out.legs == LegCommandKind::SelectGait15) {
+          legs = "gait15";
+        }
+        RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "phase=%s why=%s pan=%s legs=%s d_min=%.2f at %+.0f deg "
+            "tag r=%.2f th=%+.0f",
+            hunter_phase_name(out.phase), why, out.pan_head ? "sweep" : "frozen", legs,
+            sector.have_hit ? sector.d_min : -1.0, bearing_deg, out.r,
+            out.theta * 180.0 / kHunterPi);
+      }
       if (out.phase == HunterPhase::Hunt && prev != HunterPhase::Hunt) {
         pan_sweep_done_ = false;
         const double period = pan_period_s_ > 1.0 ? pan_period_s_ : 10.0;
