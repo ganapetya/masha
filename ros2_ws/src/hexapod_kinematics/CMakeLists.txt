@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
 project(hexapod_kinematics)
 
-# Pure leg geometry. No rclcpp. Coxa, the knee triangle, forward, and
-# solve_leg are in this library. solve_pose, the safety gate, and the
-# Python plug are later steps. See PLAN.md.
+# Pure leg geometry. No rclcpp. Coxa, the knee triangle, forward,
+# solve_leg, and solve_pose are in this library. The safety gate and
+# the Python plug are later steps. See PLAN.md.
 # -O3 so hypot / atan2 / acos can inline once those files exist.
 # No -ffast-math: the later gate treats NaN and a cosine outside [-1, 1]
 # as real failures, and fast-math is allowed to break both.
@@ -57,6 +57,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_forward ${PROJECT_NAME})
   ament_add_gtest(test_leg_ik test/test_leg_ik.cpp)
   target_link_libraries(test_leg_ik ${PROJECT_NAME})
+  ament_add_gtest(test_solve_pose test/test_solve_pose.cpp)
+  target_link_libraries(test_solve_pose ${PROJECT_NAME})
 endif()
 
 ament_package()
