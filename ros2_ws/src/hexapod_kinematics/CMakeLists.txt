@@ -3,8 +3,9 @@ project(hexapod_kinematics)
 
 # Pure leg geometry. No rclcpp. Coxa, the knee triangle, forward,
 # solve_leg, solve_pose, the safety gate, and the pybind11 module are
-# in this package. controller/leg_ik.py is the plug. The 20 ms loop
-# does not call it yet. See PLAN.md.
+# in this package. controller/leg_ik.py is the plug. StepController.loop
+# calls it when params.gait == 5 and use_hexapod_kinematics is true.
+# The flag defaults to false. See PLAN.md.
 # -O3 so hypot / atan2 / acos can inline. The Python module gets the
 # same flag. No -ffast-math: the gate treats NaN, and the knee treats
 # a cosine outside [-1, 1], as real failures. Fast-math is allowed to
@@ -73,7 +74,7 @@ install(TARGETS ${PROJECT_NAME}
 install(DIRECTORY include/
   DESTINATION include
 )
-install(FILES PLAN.md README.md
+install(FILES PLAN.md README.md learning-from-code.md
   DESTINATION share/${PROJECT_NAME}
 )
 

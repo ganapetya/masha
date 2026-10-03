@@ -153,7 +153,7 @@ PYBIND11_MODULE(hexapod_kinematics, m) {
       .def_readonly("q_now_rad", &hk::SafetyDecision::q_now_rad)
       .def_readonly("q_previous_rad", &hk::SafetyDecision::q_previous_rad);
 
-  // The stand-in step, radians. solve_pose uses this. The gate uses
+  // The measured step, radians. solve_pose uses this. The gate uses
   // this. The tick does not pass a second copy.
   m.def("max_step_rad", &hk::max_step_rad);
 

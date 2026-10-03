@@ -22,8 +22,8 @@ namespace hexapod_kinematics {
 // because a guessed mount yaw would aim the foot along the wrong ray.
 //
 // The reference is read during this call and not stored.
-// gtest calls this directly. The 20 ms gait loop will call it later,
-// once per leg, from leg_ik.
+// gtest calls this directly. solve_leg calls it once per leg.
+// The 20 ms loop reaches it through solve_pose.
 double solve_coxa(LegId id, const Vec3& foot);
 
 }  // namespace hexapod_kinematics

@@ -22,7 +22,8 @@ namespace hexapod_kinematics {
 //
 // id must be one of the six legs. foot is +X head, +Y left, +Z up.
 // max_step_rad is the knee step a 0.5 mm foot error may still ask for.
-// The measured value belongs to the safety gate. Tests pass a stand-in.
+// The measured value is max_step_rad() in the safety gate. Tests pass
+// that same function.
 //
 // ok is true only when reason is None. The angles may then be commanded.
 // On a refusal the angles stay 0, which means "not computed", and the

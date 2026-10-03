@@ -42,9 +42,8 @@ const ServoLimit* leg_servo_or_null(int joint_id);
 
 // The step a hunter tick is still allowed to take, radians.
 //
-// This is the stand-in. The calibration script has not written a
-// measured peak yet. safety.cpp says what has to be written here
-// before the hunt flag may be turned on. The knee's near_singular
+// safety.cpp stores 1.5 times the peak measured by
+// scripts/calibrate_max_step.py. The knee's near_singular
 // check uses this same number.
 double max_step_rad();
 
@@ -81,7 +80,7 @@ struct SafetyDecision {
 // Otherwise allow is true and reason is None.
 //
 // This function does not raise. gtest calls it directly. The 20 ms
-// loop will call it later, once per tick, after solve_pose.
+// loop calls it once per tick, after solve_pose, through the binding.
 SafetyDecision gate(const PoseResult& command,
                     const std::array<JointAngles, kLegCount>* previous);
 

@@ -71,7 +71,7 @@ struct PlanarResult {
 // are read for this call and not stored.
 //
 // This step does not decide whether the triangle exists. gtest calls it
-// directly. leg_ik will call it once per leg, after the coxa yaw.
+// directly. solve_leg calls it once per leg, after the coxa yaw.
 PlaneTarget plane_target(const Hip& hip, const Vec3& foot, const LinkLengths& links);
 
 // The fold a standing Masha uses, for every foot.
@@ -85,13 +85,13 @@ KneeBranch standing_branch();
 // target is the book's (x, y) in millimetres. links.femur_mm is L1 and
 // links.tibia_mm is L2. Both lengths must be positive millimetres.
 // max_step_rad is the knee step that a 0.5 mm foot error is still
-// allowed to ask for. Tests pass a stand-in. The measured constant
-// belongs to the safety gate, which is a later file.
+// allowed to ask for. Tests pass max_step_rad() from the safety gate.
+// That constant is the measured peak times 1.5.
 // zero is applied to the standing fold only, after theta1 and theta2
 // exist. The coxa component of zero is not used here.
 //
-// gtest calls this directly. The 20 ms loop will call it later from
-// leg_ik, once per leg per tick.
+// gtest calls this directly. solve_leg calls it once per leg per tick.
+// The 20 ms loop reaches it through solve_pose.
 PlanarResult solve_planar(const PlaneTarget& target,
                           const LinkLengths& links,
                           double max_step_rad,

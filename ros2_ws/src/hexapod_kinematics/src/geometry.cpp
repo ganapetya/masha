@@ -5,7 +5,8 @@
 //   1. Where each yaw axis sits, and which way "coxa = 0" points.
 //   2. How long the links are, including the small vertical gap between
 //      the yaw axis and the femur hinge.
-//   3. The still-unfitted shift from the drawing's zero to the servo's zero.
+//   3. The shift from the drawing's zero to the servo's zero.
+//      LegIk.StandContract fitted the shared femur and tibia zeros.
 //
 // Body frame: +X head, +Y left, +Z up, millimetres.
 // The hip xy values are build_in_pose.py's X1, Y1, Y2. The URDF

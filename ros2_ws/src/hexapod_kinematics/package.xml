@@ -5,12 +5,13 @@
   <version>0.1.0</version>
   <description>
     Open-source leg inverse kinematics for Masha hunter gait 15.
-    This revision has the coxa yaw, the knee triangle, forward
-    kinematics, solve_leg, the six-leg solve_pose, the safety gate,
-    and a pybind11 module. The controller plug is
-    controller/leg_ik.py and the 20 ms loop does not call it yet.
-    The shared joint zero is fitted to the stand. The step limit
-    is still the stand-in. The reading plan is PLAN.md.
+    StepController.loop calls it for gait 5 when
+    use_hexapod_kinematics is true. The flag defaults to false, and
+    every other gait stays on kinematics.so. The controller plug is
+    controller/leg_ik.py. The shared joint zero is fitted to the
+    stand. The step limit is 1.5 times the measured gait-5 peak.
+    The reading plan is PLAN.md. The study path is
+    learning-from-code.md.
   </description>
   <maintainer email="ubuntu@todo.todo">ubuntu</maintainer>
   <license>Apache-2.0</license>
