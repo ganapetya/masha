@@ -7,7 +7,11 @@
   <maintainer email="1270161395@qq.com">ubuntu</maintainer>
   <license>TODO: License declaration</license>
 
+  <!-- Gait 5 may call this. The flag in leg_ik.py defaults to false. -->
+  <exec_depend>hexapod_kinematics</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
+  <test_depend>hexapod_kinematics</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>

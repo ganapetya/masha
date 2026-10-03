@@ -3,7 +3,8 @@ project(hexapod_kinematics)
 
 # Pure leg geometry. No rclcpp. Coxa, the knee triangle, forward,
 # solve_leg, solve_pose, the safety gate, and the pybind11 module are
-# in this package. The controller plug is a later step. See PLAN.md.
+# in this package. controller/leg_ik.py is the plug. The 20 ms loop
+# does not call it yet. See PLAN.md.
 # -O3 so hypot / atan2 / acos can inline. The Python module gets the
 # same flag. No -ffast-math: the gate treats NaN, and the knee treats
 # a cosine outside [-1, 1], as real failures. Fast-math is allowed to
@@ -44,12 +45,21 @@ target_compile_options(${PROJECT_NAME} PRIVATE -O3)
 Python3_add_library(hexapod_kinematics_py MODULE WITH_SOABI src/bindings.cpp)
 target_link_libraries(hexapod_kinematics_py PRIVATE ${PROJECT_NAME} pybind11::headers)
 target_compile_options(hexapod_kinematics_py PRIVATE -O3)
+ament_get_python_install_dir(PYTHON_INSTALL_DIR)
+# install(TARGETS) does not publish PYTHONPATH. The hook is what a
+# sourced workspace uses, the same one ament_python_install_module
+# registers. Without it, import hexapod_kinematics fails after source.
+_ament_cmake_python_register_environment_hook()
+# purelib on this prefix is several directories below the prefix, and
+# the C++ library is in lib/. The relative step is computed so the
+# extension finds the library from its own location.
+file(RELATIVE_PATH _hexapod_py_to_lib
+  "${CMAKE_INSTALL_PREFIX}/${PYTHON_INSTALL_DIR}"
+  "${CMAKE_INSTALL_PREFIX}/lib")
 set_target_properties(hexapod_kinematics_py PROPERTIES
   OUTPUT_NAME hexapod_kinematics
-  # site-packages sits two directories under lib/, next to the C++ library.
-  INSTALL_RPATH "$ORIGIN/../.."
+  INSTALL_RPATH "$ORIGIN/${_hexapod_py_to_lib}"
 )
-ament_get_python_install_dir(PYTHON_INSTALL_DIR)
 install(TARGETS hexapod_kinematics_py
   DESTINATION ${PYTHON_INSTALL_DIR}
 )

@@ -100,7 +100,7 @@ Jazar's later parts (dynamics, control) and the iterative inverse-kinematics tec
 
 ### Which file to open with which pages
 
-Read the row before you read that file. `geometry`, `coxa`, `planar_leg`, `forward`, `solve_leg`, `solve_pose`, `safety`, and `bindings.cpp` are in the tree. The controller plug and the rows below it are still to be written.
+Read the row before you read that file. `geometry`, `coxa`, `planar_leg`, `forward`, `solve_leg`, `solve_pose`, `safety`, `bindings.cpp`, and `controller/leg_ik.py` are in the tree. The 20 ms loop does not call the plug yet. The rows below the plug are still to be written.
 
 | Future file | Read first |
 |---|---|
@@ -489,6 +489,6 @@ A short Python script under `hexapod_kinematics` (not imported by the controller
 6. `leg_ik` composition and `solve_pose`. The binding returns the result and does not raise. **In the tree:** `solve_pose` in `leg_ik.hpp` / `leg_ik.cpp`, and `test_solve_pose`. Legs are solved in order 1..6. The first refusal fails the pose and names that leg. The function returns the result and does not throw. pybind is not started.
 7. `safety` and `test_safety`. `max_step_rad` stays a named constant with a comment; the calibration script fills the number before the flag may be turned on. Re-check `near_singular` with that number. **In the tree:** `safety.hpp`, `safety.cpp`, and `test_safety`. The gate checks finite numbers, the solver's reason, the driver ±120° window, then the step from the last sent pose. `max_step_rad()` is the 0.05 rad stand-in. The measured peak is not written yet. The planar `near_singular` case reads that same function. pybind is not started.
 8. pybind11 module, including the safety gate. Library target `-O3`, no `-ffast-math`. **In the tree:** `src/bindings.cpp` and `test/test_bindings.py`. `import hexapod_kinematics` exposes `solve_pose`, `gate`, and `max_step_rad`. A refusal is a returned object. The module and the C++ library are both compiled `-O3`, without `-ffast-math`. The controller plug is not started.
-9. `controller/leg_ik.py`: the two backends, `approach_frame`, the flag defaulting to false, the trace queue with `put(..., block=False)`, WARN on each hard hold, no publish on a hard hold.
+9. `controller/leg_ik.py`: the two backends, `approach_frame`, the flag defaulting to false, the trace queue with `put(..., block=False)`, WARN on each hard hold, no publish on a hard hold. **In the tree:** `controller/leg_ik.py` and `test/test_leg_ik.py`. `make_leg_ik()` defaults to the vendor backend. `approach_frame` subdivides only a `rate_limit` frame and returns `held` without publishing for every other refusal. A bisected fraction such as 0.996 stays `partial`. The trace queue drops with `put(..., block=False)` and warns once a second. The 20 ms loop, the ROS parameter, and the launch argument are not started.
 10. The `params.gait == 5` branch in the 20 ms loop, the unfinished-frame wait, the `delta_alpha` odometry step, and the launch argument on `move_controller.launch.py`.
 11. Calibration print (stand error and the measured step peak), then stop for a live hunt. First hunt keeps the flag false. The flag-true hunt waits until you ask.
