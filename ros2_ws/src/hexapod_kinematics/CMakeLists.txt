@@ -2,11 +2,11 @@ cmake_minimum_required(VERSION 3.10)
 project(hexapod_kinematics)
 
 # Pure leg geometry. No rclcpp. Coxa, the knee triangle, forward,
-# solve_leg, and solve_pose are in this library. The safety gate and
-# the Python plug are later steps. See PLAN.md.
-# -O3 so hypot / atan2 / acos can inline once those files exist.
-# No -ffast-math: the later gate treats NaN and a cosine outside [-1, 1]
-# as real failures, and fast-math is allowed to break both.
+# solve_leg, solve_pose, and the safety gate are in this library.
+# The Python plug is a later step. See PLAN.md.
+# -O3 so hypot / atan2 / acos can inline.
+# No -ffast-math: the gate treats NaN, and the knee treats a cosine
+# outside [-1, 1], as real failures. Fast-math is allowed to break both.
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -23,6 +23,7 @@ add_library(${PROJECT_NAME} SHARED
   src/planar_leg.cpp
   src/forward.cpp
   src/leg_ik.cpp
+  src/safety.cpp
 )
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -59,6 +60,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_leg_ik ${PROJECT_NAME})
   ament_add_gtest(test_solve_pose test/test_solve_pose.cpp)
   target_link_libraries(test_solve_pose ${PROJECT_NAME})
+  ament_add_gtest(test_safety test/test_safety.cpp)
+  target_link_libraries(test_safety ${PROJECT_NAME})
 endif()
 
 ament_package()

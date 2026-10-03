@@ -100,7 +100,7 @@ Jazar's later parts (dynamics, control) and the iterative inverse-kinematics tec
 
 ### Which file to open with which pages
 
-Read the row before you read that file. `geometry`, `coxa`, `planar_leg`, `forward`, `solve_leg`, and `solve_pose` are in the tree. `safety` and the rows below it are still to be written.
+Read the row before you read that file. `geometry`, `coxa`, `planar_leg`, `forward`, `solve_leg`, `solve_pose`, and `safety` are in the tree. The Python binding and the rows below it are still to be written.
 
 | Future file | Read first |
 |---|---|
@@ -487,7 +487,7 @@ A short Python script under `hexapod_kinematics` (not imported by the controller
 4. `planar_leg` and `test_planar_leg`, including the unreachable case, the `near_singular` derivative with a stand-in `max_step_rad`, the `coxa_femur_z` shift, and the standing branch. **In the tree:** `planar_leg.hpp`, `planar_leg.cpp`, and `test_planar_leg`. The standing branch is lefty.
 5. `forward`, round trip, then adjust lengths, `coxa_femur_z`, and joint zeros until the 0.005 rad stand contract passes. Write the final numbers into `geometry.cpp` with a comment that names the test. Per-joint zeros only if the shared pair fails. **In the tree:** `forward.hpp`, `forward.cpp`, `test_forward`, and `solve_leg` (the round trip and the stand contract are defined on that call). Lengths and `coxa_femur_z` stayed at the URDF guesses. The shared joint zero is coxa 0, femur 0.144427, tibia 1.481540.
 6. `leg_ik` composition and `solve_pose`. The binding returns the result and does not raise. **In the tree:** `solve_pose` in `leg_ik.hpp` / `leg_ik.cpp`, and `test_solve_pose`. Legs are solved in order 1..6. The first refusal fails the pose and names that leg. The function returns the result and does not throw. pybind is not started.
-7. `safety` and `test_safety`. `max_step_rad` stays a named constant with a comment; the calibration script fills the number before the flag may be turned on. Re-check `near_singular` with that number.
+7. `safety` and `test_safety`. `max_step_rad` stays a named constant with a comment; the calibration script fills the number before the flag may be turned on. Re-check `near_singular` with that number. **In the tree:** `safety.hpp`, `safety.cpp`, and `test_safety`. The gate checks finite numbers, the solver's reason, the driver ±120° window, then the step from the last sent pose. `max_step_rad()` is the 0.05 rad stand-in. The measured peak is not written yet. The planar `near_singular` case reads that same function. pybind is not started.
 8. pybind11 module, including the safety gate. Library target `-O3`, no `-ffast-math`.
 9. `controller/leg_ik.py`: the two backends, `approach_frame`, the flag defaulting to false, the trace queue with `put(..., block=False)`, WARN on each hard hold, no publish on a hard hold.
 10. The `params.gait == 5` branch in the 20 ms loop, the unfinished-frame wait, the `delta_alpha` odometry step, and the launch argument on `move_controller.launch.py`.

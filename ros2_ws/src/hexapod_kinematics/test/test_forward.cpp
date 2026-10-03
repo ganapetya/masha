@@ -6,6 +6,7 @@
 #include "hexapod_kinematics/forward.hpp"
 #include "hexapod_kinematics/geometry.hpp"
 #include "hexapod_kinematics/leg_ik.hpp"
+#include "hexapod_kinematics/safety.hpp"
 
 #include <cmath>
 
@@ -14,9 +15,8 @@
 namespace hexapod_kinematics {
 namespace {
 
-// Same stand-in the planar tests use. The measured limit is not in
-// this package yet. Around the stand, 0.05 rad does not refuse a foot.
-constexpr double kStandInMaxStepRad = 0.05;
+// Same step limit the safety gate holds. Around the stand it does not
+// refuse a foot.
 
 // build_in_pose.py DEFAULT_POSE. INITIAL_X 70, INITIAL_Y 110, height 70.
 // X1 93.60, Y1 50.805, Y2 73.535.
@@ -83,7 +83,7 @@ TEST(Forward, RoundTripAroundDefaultPose) {
       for (double dy : kOffsets) {
         for (double z : kHeights) {
           const Vec3 foot{home.x_mm + dx, home.y_mm + dy, z};
-          const IkResult answer = solve_leg(leg, foot, kStandInMaxStepRad);
+          const IkResult answer = solve_leg(leg, foot, max_step_rad());
           if (!answer.ok) {
             EXPECT_TRUE(answer.reason == IkReason::Unreachable ||
                         answer.reason == IkReason::NearSingular);

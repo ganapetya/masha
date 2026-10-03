@@ -4,6 +4,7 @@
 
 #include "hexapod_kinematics/geometry.hpp"
 #include "hexapod_kinematics/leg_ik.hpp"
+#include "hexapod_kinematics/safety.hpp"
 
 #include <array>
 #include <cmath>
@@ -13,8 +14,6 @@
 
 namespace hexapod_kinematics {
 namespace {
-
-constexpr double kStandInMaxStepRad = 0.05;
 
 constexpr std::array<LegId, kLegCount> kOrder = {
     LegId::Lf, LegId::Lm, LegId::Lr, LegId::Rr, LegId::Rm, LegId::Rf};
@@ -67,13 +66,13 @@ void expect_angles_zero(const JointAngles& got, LegId id) {
 TEST(SolvePose, DefaultPoseMatchesEachSolveLeg) {
   // No new triangle. Each slot is the one-leg answer for that foot.
   const std::array<Vec3, kLegCount> feet = default_pose();
-  const PoseResult pose = solve_pose(feet, kStandInMaxStepRad);
+  const PoseResult pose = solve_pose(feet, max_step_rad());
 
   ASSERT_TRUE(pose.ok);
   EXPECT_EQ(pose.reason, IkReason::None);
   for (LegId id : kOrder) {
     const IkResult one = solve_leg(id, feet[static_cast<std::size_t>(leg_index(id))],
-                                   kStandInMaxStepRad);
+                                   max_step_rad());
     ASSERT_TRUE(one.ok) << static_cast<int>(id);
     expect_angles_match(pose.angles[static_cast<std::size_t>(leg_index(id))], one.angles, id);
   }
@@ -88,7 +87,7 @@ TEST(SolvePose, FirstBadLegFailsTheWholePose) {
   feet[static_cast<std::size_t>(leg_index(LegId::Rr))] = {0.0, 0.0, 500.0};
   feet[static_cast<std::size_t>(leg_index(LegId::Rf))] = {0.0, 0.0, 500.0};
 
-  const PoseResult pose = solve_pose(feet, kStandInMaxStepRad);
+  const PoseResult pose = solve_pose(feet, max_step_rad());
 
   EXPECT_FALSE(pose.ok);
   EXPECT_EQ(pose.reason, IkReason::Unreachable);
@@ -96,7 +95,7 @@ TEST(SolvePose, FirstBadLegFailsTheWholePose) {
 
   for (LegId id : {LegId::Lf, LegId::Lm, LegId::Lr}) {
     const IkResult one = solve_leg(id, feet[static_cast<std::size_t>(leg_index(id))],
-                                   kStandInMaxStepRad);
+                                   max_step_rad());
     ASSERT_TRUE(one.ok) << static_cast<int>(id);
     expect_angles_match(pose.angles[static_cast<std::size_t>(leg_index(id))], one.angles, id);
   }
@@ -118,14 +117,14 @@ TEST(SolvePose, AStraightFootIsNearSingularAndNamesThatLeg) {
       mount.y_mm + reach * std::sin(mount.mount_yaw_rad),
       links.hip_z_mm + links.coxa_femur_z_mm};
 
-  const PoseResult pose = solve_pose(feet, kStandInMaxStepRad);
+  const PoseResult pose = solve_pose(feet, max_step_rad());
 
   EXPECT_FALSE(pose.ok);
   EXPECT_EQ(pose.reason, IkReason::NearSingular);
   EXPECT_EQ(pose.leg, LegId::Rf);
   expect_angles_zero(pose.angles[static_cast<std::size_t>(leg_index(LegId::Rf))], LegId::Rf);
   for (LegId id : {LegId::Lf, LegId::Lm, LegId::Lr, LegId::Rr, LegId::Rm}) {
-    const IkResult one = solve_leg(id, default_foot(id), kStandInMaxStepRad);
+    const IkResult one = solve_leg(id, default_foot(id), max_step_rad());
     ASSERT_TRUE(one.ok) << static_cast<int>(id);
     expect_angles_match(pose.angles[static_cast<std::size_t>(leg_index(id))], one.angles, id);
   }
@@ -139,13 +138,13 @@ TEST(SolvePose, ANonFiniteFootNamesThatLegAndDoesNotThrow) {
   feet[static_cast<std::size_t>(leg_index(LegId::Lm))].y_mm =
       std::numeric_limits<double>::quiet_NaN();
 
-  const PoseResult pose = solve_pose(feet, kStandInMaxStepRad);
+  const PoseResult pose = solve_pose(feet, max_step_rad());
 
   EXPECT_FALSE(pose.ok);
   EXPECT_EQ(pose.reason, IkReason::NonFinite);
   EXPECT_EQ(pose.leg, LegId::Lm);
 
-  const IkResult first = solve_leg(LegId::Lf, default_foot(LegId::Lf), kStandInMaxStepRad);
+  const IkResult first = solve_leg(LegId::Lf, default_foot(LegId::Lf), max_step_rad());
   ASSERT_TRUE(first.ok);
   expect_angles_match(pose.angles[static_cast<std::size_t>(leg_index(LegId::Lf))], first.angles,
                       LegId::Lf);

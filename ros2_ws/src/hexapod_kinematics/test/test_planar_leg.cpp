@@ -4,6 +4,7 @@
 // Forward kinematics and the 0.005 rad stand contract are later files.
 
 #include "hexapod_kinematics/planar_leg.hpp"
+#include "hexapod_kinematics/safety.hpp"
 
 #include <cmath>
 #include <limits>
@@ -15,12 +16,9 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-// Stand-in for the measured max_step_rad. safety.cpp does not hold that
-// constant yet. With the current lengths, a 0.5 mm error at the
-// left-front stand asks the knee for about 0.0066 rad. The same error
-// 0.2 mm inside full stretch asks for about 0.116 rad. 0.05 rad sits
-// between them, so the stand passes and that near-straight foot fails.
-constexpr double kStandInMaxStepRad = 0.05;
+// The knee check and the safety gate share max_step_rad(). The value
+// is still the 0.05 rad stand-in. safety.cpp records why that number
+// sits between the stand and the near-straight foot.
 
 LinkLengths equal_links() {
   LinkLengths links;
@@ -39,7 +37,7 @@ TEST(Planar, HandBuiltEquilateralMatchesTheBook) {
   const PlaneTarget foot{100.0, 0.0};
   const JointZero zero{};
   const PlanarResult solved =
-      solve_planar(foot, equal_links(), kStandInMaxStepRad, zero);
+      solve_planar(foot, equal_links(), max_step_rad(), zero);
 
   ASSERT_TRUE(solved.ok);
   EXPECT_EQ(solved.reason, IkReason::None);
@@ -67,7 +65,7 @@ TEST(Planar, JointZeroIsAddedAfterTheBookAngles) {
   zero.tibia_rad = -0.3;
   const PlaneTarget foot{100.0, 0.0};
   const PlanarResult solved =
-      solve_planar(foot, equal_links(), kStandInMaxStepRad, zero);
+      solve_planar(foot, equal_links(), max_step_rad(), zero);
 
   ASSERT_TRUE(solved.ok);
   EXPECT_NEAR(solved.lefty.femur_rad, kPi / 3.0, 1e-12);
@@ -83,7 +81,7 @@ TEST(Planar, OutsideTheOuterRingIsUnreachable) {
   const LinkLengths& links = link_lengths();
   const PlaneTarget far{links.femur_mm + links.tibia_mm + 10.0, 0.0};
   const PlanarResult solved =
-      solve_planar(far, links, kStandInMaxStepRad, joint_zero());
+      solve_planar(far, links, max_step_rad(), joint_zero());
 
   EXPECT_FALSE(solved.ok);
   EXPECT_EQ(solved.reason, IkReason::Unreachable);
@@ -99,7 +97,7 @@ TEST(Planar, InsideTheInnerHoleIsUnreachable) {
   const double inner = std::fabs(links.femur_mm - links.tibia_mm);
   const PlaneTarget hole{inner * 0.25, 0.0};
   const PlanarResult solved =
-      solve_planar(hole, links, kStandInMaxStepRad, joint_zero());
+      solve_planar(hole, links, max_step_rad(), joint_zero());
 
   EXPECT_FALSE(solved.ok);
   EXPECT_EQ(solved.reason, IkReason::Unreachable);
@@ -114,7 +112,7 @@ TEST(Planar, JustInsideTheOuterRingIsNearSingular) {
   const LinkLengths& links = link_lengths();
   const PlaneTarget almost{links.femur_mm + links.tibia_mm - 0.2, 0.0};
   const PlanarResult solved =
-      solve_planar(almost, links, kStandInMaxStepRad, joint_zero());
+      solve_planar(almost, links, max_step_rad(), joint_zero());
 
   EXPECT_FALSE(solved.ok);
   EXPECT_EQ(solved.reason, IkReason::NearSingular);
@@ -130,7 +128,7 @@ TEST(Planar, StandFootKeepsLeftyAndClearsTheSoftEdge) {
   const Vec3 foot{163.6, 140.8, -70.0};
   const PlaneTarget target = plane_target(hip(LegId::Lf), foot, link_lengths());
   const PlanarResult solved =
-      solve_planar(target, link_lengths(), kStandInMaxStepRad, joint_zero());
+      solve_planar(target, link_lengths(), max_step_rad(), joint_zero());
 
   ASSERT_TRUE(solved.ok);
   EXPECT_EQ(solved.reason, IkReason::None);
@@ -154,9 +152,9 @@ TEST(Planar, RaisingTheFootLiftsTheFemur) {
   const Vec3 low{163.6, 140.8, -70.0};
   const Vec3 raised{163.6, 140.8, -50.0};
   const PlanarResult at_stand = solve_planar(
-      plane_target(lf, low, links), links, kStandInMaxStepRad, joint_zero());
+      plane_target(lf, low, links), links, max_step_rad(), joint_zero());
   const PlanarResult higher = solve_planar(
-      plane_target(lf, raised, links), links, kStandInMaxStepRad, joint_zero());
+      plane_target(lf, raised, links), links, max_step_rad(), joint_zero());
 
   ASSERT_TRUE(at_stand.ok);
   ASSERT_TRUE(higher.ok);
@@ -186,7 +184,7 @@ TEST(Planar, CoxaFemurZMovesOnlyTheBookVertical) {
 TEST(Planar, ANonFiniteTargetIsRefused) {
   const PlaneTarget bad{std::numeric_limits<double>::quiet_NaN(), -70.0};
   const PlanarResult solved =
-      solve_planar(bad, link_lengths(), kStandInMaxStepRad, joint_zero());
+      solve_planar(bad, link_lengths(), max_step_rad(), joint_zero());
   EXPECT_FALSE(solved.ok);
   EXPECT_EQ(solved.reason, IkReason::NonFinite);
 }

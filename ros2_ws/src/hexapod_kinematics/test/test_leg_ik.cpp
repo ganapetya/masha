@@ -5,13 +5,13 @@
 // test is what would force a per-leg table if that zero could not pass.
 
 #include "hexapod_kinematics/leg_ik.hpp"
+#include "hexapod_kinematics/safety.hpp"
 
 #include "gtest/gtest.h"
 
 namespace hexapod_kinematics {
 namespace {
 
-constexpr double kStandInMaxStepRad = 0.05;
 constexpr double kContractRad = 0.005;
 
 // build_in_pose.py DEFAULT_POSE. Same expressions as test_forward.
@@ -67,7 +67,7 @@ constexpr StandTarget kStand[] = {
 
 TEST(LegIk, StandContractWithinHalfAHundredthOfARadian) {
   for (const StandTarget& target : kStand) {
-    const IkResult solved = solve_leg(target.leg, default_foot(target.leg), kStandInMaxStepRad);
+    const IkResult solved = solve_leg(target.leg, default_foot(target.leg), max_step_rad());
     ASSERT_TRUE(solved.ok) << target.name;
     EXPECT_EQ(solved.reason, IkReason::None) << target.name;
     EXPECT_NEAR(solved.angles.coxa_rad, target.coxa_rad, kContractRad) << target.name;
@@ -78,7 +78,7 @@ TEST(LegIk, StandContractWithinHalfAHundredthOfARadian) {
 
 TEST(LegIk, AFarFootIsUnreachableAndDoesNotThrow) {
   const Vec3 far{163.6, 140.8, 500.0};
-  const IkResult solved = solve_leg(LegId::Lf, far, kStandInMaxStepRad);
+  const IkResult solved = solve_leg(LegId::Lf, far, max_step_rad());
   EXPECT_FALSE(solved.ok);
   EXPECT_EQ(solved.reason, IkReason::Unreachable);
   EXPECT_DOUBLE_EQ(solved.angles.femur_rad, 0.0);
