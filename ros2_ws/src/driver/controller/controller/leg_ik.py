@@ -5,8 +5,9 @@
 # uses today. HexapodLegIk asks hexapod_kinematics.solve_pose and
 # then the safety gate. make_leg_ik picks one of them. The default
 # is the vendor. This file does not read a ROS parameter and it
-# does not publish a servo pulse. The loop, the launch argument,
-# and the unfinished-frame wait are the next step.
+# does not publish a servo pulse. StepController reads the
+# parameter when a gait-5 generator starts, and Gait5Session is
+# the unfinished frame that generator is still walking.
 #
 # A refused pose comes back as a decision object. An exception here
 # would fall into the loop's moving-pose handler and drop the
@@ -247,6 +248,24 @@ def begin_generator(use_hexapod=USE_HEXAPOD_KINEMATICS_DEFAULT):
     return ik, backend, "gait 5 backend=%s" % backend
 
 
+def start_gait5(generator, use_hexapod=USE_HEXAPOD_KINEMATICS_DEFAULT):
+    """Build the session for one gait-5 generator.
+
+    Call this when that generator starts, with the flag value from
+    that moment. Keep the session until the generator object is
+    replaced. A later param change does not come back here: a second
+    session would swap the formula under a moving foot. The next
+    generator, at the next Twist after a step boundary or at the
+    next hunt bout, is the next call.
+
+    The returned line is logged once by the caller. attach() is
+    separate so constructing the vendor backend does not load
+    kinematics.so until the stance is actually solved.
+    """
+    ik, backend, line = begin_generator(use_hexapod)
+    return Gait5Session(generator, ik, backend), line
+
+
 def approach_frame(ik, feet_anchor, feet_frame, alpha_done):
     """Walk one generator frame as far as the gate allows.
 
@@ -363,6 +382,108 @@ def odometry_increment(linear_x, linear_y, angular_z, delta_alpha,
     wz = angular_z * delta_alpha
     return (vx, vy, wz, linear_x * scale, linear_y * scale,
             angular_z * scale)
+
+
+class Gait5Session(object):
+    """One gait-5 generator, and the film frame it has not finished.
+
+    send() on the generator yields six feet and then moves the
+    cursor. While waiting() is true the loop keeps those feet and
+    does not call send(). A new Twist sitting in the queue does not
+    take over either: takeover waits for last_part, and last_part is
+    honored only when this frame is accepted at alpha 1.
+
+    alpha_done is how far along the open frame has been sent. It
+    becomes 1 only when the generator's own feet pass the gate.
+    A bisected fraction stays below 1, and the cursor stays put.
+    """
+
+    def __init__(self, generator, ik, backend):
+        self.generator = generator
+        self.ik = ik
+        self.backend = backend
+        # 1 and no frame: the loop may call send(). A fresh session
+        # has not opened a frame yet.
+        self.alpha_done = 1.0
+        self.anchor = None
+        self.frame = None
+        self.params = None
+        self.slow = None
+        self.last_part = False
+
+    def attach(self, pose):
+        """Solve the stance the body is already standing on.
+
+        Nothing is published. Those angles become the previous sent
+        pose, so the first moving frame is measured from the stand
+        and not from zeros. The anchor is this pose: the start of
+        the bout. A stance the backend refuses leaves previous
+        empty, and the next frame holds with that reason.
+        """
+        self.anchor = pose
+        return self.ik.establish_reference(pose)
+
+    def waiting(self):
+        """True while this frame has not been accepted at alpha 1."""
+        return self.frame is not None and self.alpha_done < 1.0
+
+    def held(self):
+        """Feet, params, and the slow word to reuse instead of send()."""
+        return self.frame, self.params, self.slow
+
+    def open_frame(self, feet, params, slow, last_part):
+        """A send() just yielded these feet. They are the open frame.
+
+        last_part is stored and not acted on. The loop honors it
+        only when step() reports the boundary. Calling this again
+        on a frame that is still waiting would throw away the
+        fraction already sent. The loop calls it only after send().
+        """
+        if self.anchor is None:
+            self.anchor = feet
+        self.frame = feet
+        self.params = params
+        self.slow = slow
+        self.last_part = bool(last_part)
+        self.alpha_done = 0.0
+
+    def step(self):
+        """Walk the open frame as far as the gate allows.
+
+        Returns the FrameStep, the fraction completed on this tick
+        (delta_alpha), and whether the generator boundary may run.
+        A hold returns delta 0 and does not release the boundary.
+        A partial keeps the same frame. A sent frame moves the
+        anchor to the generator's own feet and clears the hold, so
+        the next tick may call send().
+        """
+        before = self.alpha_done
+        taken = approach_frame(
+            self.ik, self.anchor, self.frame, self.alpha_done)
+        self.alpha_done = taken.alpha_done
+        finished = taken.decision == "sent"
+        boundary = finished and self.last_part
+        if finished:
+            self.anchor = self.frame
+            self.frame = None
+            self.last_part = False
+        return taken, self.alpha_done - before, boundary
+
+
+def read_max_step_rad():
+    """The step limit safety.cpp returns, or None if the import fails.
+
+    The startup line prints this number once. HexapodLegIk still
+    imports the module on its own first solve. None means the
+    controller can still walk with the closed solver: joystick
+    gaits do not need this module. The measured peak is a later
+    edit of safety.cpp. This function does not invent one.
+    """
+    try:
+        import hexapod_kinematics as hk
+    except Exception:
+        return None
+    return hk.max_step_rad()
 
 
 def startup_line(use_hexapod, trace_path, max_step_rad):

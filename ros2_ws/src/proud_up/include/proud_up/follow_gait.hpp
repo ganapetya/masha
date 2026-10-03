@@ -7,7 +7,9 @@
 //   φ ∈ [0, 2π)  →  six foot tips in millimetres
 //
 // that StepController samples every 20 ms. Vendor kinematics.set_leg_position
-// then turns each tip into three joint angles. We never call
+// then turns each tip into three joint angles. With use_hexapod_kinematics
+// on, hexapod_kinematics does that job, and the safety gate can refuse
+// the result. We never call
 // kinematics.set_step_mode(..., gait=5, ...): the .so does not know 5.
 //
 // Frame (same as move.py / DEFAULT_POSE):

@@ -17,6 +17,19 @@ from interfaces.msg import CmdParam
 from rclpy.executors import MultiThreadedExecutor
 
 from controller import build_in_pose
+from controller.leg_ik import (
+    TRACE_PATH_DEFAULT,
+    USE_HEXAPOD_KINEMATICS_DEFAULT,
+    HoldWatch,
+    SecondLog,
+    TraceWriter,
+    odometry_increment,
+    read_max_step_rad,
+    should_publish,
+    start_gait5,
+    startup_line,
+    trace_row,
+)
 from kinematics import kinematics, config, kinematics_calculate
 from kinematics.x_joint_control import JointControl
 from servo_controller.action_group_controller import ActionGroupController
@@ -88,13 +101,145 @@ class StepController(Node):
         self.cmd_height = 20
         self.cmd_period = 1.0
 
+        # ROS parameter, not the Python constant. ros2 param set
+        # /step_controller use_hexapod_kinematics true changes it.
+        # The value is read when a gait-5 generator starts. A change
+        # mid-step does not rebuild the session already walking.
+        # Default false keeps kinematics.so. The launch argument of
+        # the same name arrives as an override. This node is created
+        # with automatically_declare_parameters_from_overrides, so
+        # that override is already declared. Declaring it again raises.
+        self._declare_if_needed(
+            'use_hexapod_kinematics', USE_HEXAPOD_KINEMATICS_DEFAULT)
+        self._declare_if_needed('hexapod_ik_trace', TRACE_PATH_DEFAULT)
+        self._gait5 = None
+        self._hold_watch = HoldWatch()
+        self._second_log = SecondLog()
+        use_hexapod = bool(
+            self.get_parameter('use_hexapod_kinematics').value)
+        trace_path = self.get_parameter('hexapod_ik_trace').value
+        limit = read_max_step_rad()
+        if limit is None:
+            limit = "unavailable"
+        self.get_logger().info(
+            startup_line(use_hexapod, trace_path, limit))
+        # Daemon writer. The 20 ms loop only queues rows.
+        self._trace = TraceWriter(trace_path, self.get_logger())
+
         self.loop_thread = threading.Thread(target=self.loop, daemon=True)
         self.loop_enable = True
         self.loop_thread.start()
         self.joint_control = JointControl()
 
         self.create_subscription(CmdParam, '/step_controller/cmd_param', self.cmd_param_callback, 1)
-        
+
+    def _declare_if_needed(self, name, default):
+        """Declare name unless an override already declared it."""
+        if not self.has_parameter(name):
+            self.declare_parameter(name, default)
+
+    def destroy_node(self):
+        """Stop the 20 ms loop and give the trace a short flush.
+
+        close() waits at most a fifth of a second. A halt is not
+        held up by the disk. The loop thread is a daemon; clearing
+        loop_enable is what keeps it from queueing another row
+        after the writer has gone.
+        """
+        self.loop_enable = False
+        writer = getattr(self, "_trace", None)
+        if writer is not None:
+            writer.close()
+        super().destroy_node()
+
+    def _drop_gait5_if_replaced(self):
+        """Forget the session when its generator is no longer current.
+
+        A pose-set, a halt, and a finished boundary all replace
+        cur_moving_generator. The next gait-5 start reads the flag
+        again. The hold streak belongs to the generator that is
+        walking, so a replacement clears that too.
+        """
+        if self._gait5 is None:
+            return
+        if self._gait5.generator is self.cur_moving_generator:
+            return
+        self._gait5 = None
+        self._hold_watch = HoldWatch()
+
+    def _begin_gait5(self, generator, pose):
+        """Return this generator's session, creating it on the first tick.
+
+        The flag is read here, once. attach() solves the stance and
+        does not publish it. The same generator keeps this object
+        through partial frames and through a cycle wrap that does
+        not swap the generator.
+        """
+        if self._gait5 is not None and self._gait5.generator is generator:
+            return self._gait5
+        flag = bool(self.get_parameter('use_hexapod_kinematics').value)
+        session, line = start_gait5(generator, flag)
+        self.get_logger().info(line)
+        session.attach(pose)
+        self._gait5 = session
+        self._hold_watch = HoldWatch()
+        return session
+
+    def _record_gait5(self, session, step):
+        """WARN, the 1 Hz line, and one CSV row. None of these block.
+
+        The row is queued with block=False. A full queue drops it
+        inside TraceWriter and warns once a second. The clock is
+        the node's clock, so a sim time would land in the same
+        column as a wall-clock run.
+        """
+        t_s = self.get_clock().now().nanoseconds * 1e-9
+        self._hold_watch.note(self.get_logger(), step)
+        self._second_log.note(
+            self.get_logger(), t_s, session.backend,
+            step.decision, step.dq)
+        self._trace.put(trace_row(t_s, session.backend, step))
+
+    def _integrate_fraction(self, params, delta_alpha):
+        """Add twist * 0.02 * delta_alpha to the body odometry.
+
+        A hold passes delta 0 and adds nothing. The tick that
+        reaches alpha 1 adds only the leftover fraction. It does
+        not repay the seconds the partials already covered. The
+        velocity fields stored on the node are the command scaled
+        by that same fraction, so a partial line is not a full
+        command for one sample. The yaw rotation into the world
+        frame stays here. The next frame, after send(), is a fresh
+        0.02 s of the full twist.
+        """
+        command_x = params.velocity_x / 1000.0
+        command_y = params.velocity_y / 1000.0
+        vx, vy, wz, dx, dy, dyaw = odometry_increment(
+            command_x, command_y, params.angular_z, delta_alpha)
+        self.linear_x = vx
+        self.linear_y = vy
+        self.angular_z = wz
+        yaw = self.real_pose_yaw if self.real_pose_yaw else self.pose_yaw
+        x = math.cos(yaw) * dx - math.sin(yaw) * dy
+        y = math.sin(yaw) * dx + math.cos(yaw) * dy
+        self.position = (
+            self.position[0] + x, self.position[1] + y, self.position[2])
+        self.pose_yaw += dyaw
+
+    def _publish_leg_radians(self, angles, duration):
+        """Send 18 radians, ids 1..18, in set_leg_position order.
+
+        JointControl applies SERVOS['direction'] and writes the
+        pulse. This does not call kinematics.so, and it does not
+        replace self.pose. A gait tick leaves the stance object
+        alone so the generator does not rebake on the next send().
+        """
+        joints_data = [
+            [joint_id, radian]
+            for joint_id, radian in zip(range(1, 19), angles)]
+        self.joints_state = self.joint_control.set_multi_joints(
+            duration, joints_data, self.joints_state)
+
     def cmd_param_callback(self, msg):
         """CmdParam: named built-in pose plus the gait/height/period that later cmd_vel will use."""
         with self.lock:
@@ -183,50 +328,73 @@ class StepController(Node):
             # 所以我们让机器人在开始一步之后总是要走完完整一步再停止(So we make the robot always finish a complete step before stopping after starting a new one)
             params = None
             last_part = False
-            
+            reused = False
+
+            def honor_boundary(slow_word):
+                # Swap or wind down. A gait-5 partial does not call this.
+                # last_part came from send(), and send() is what moves
+                # the film cursor. Honoring it while alpha is still
+                # short would start the next frame early.
+                nonlocal send_status, last_status, temp
+                if slow_word == 'move':
+                    # discrete-step generator: swap on the step boundary
+                    if self.cur_moving_generator is not self.new_moving_generator:
+                        self.cur_moving_generator = self.new_moving_generator
+                    # no generator left: zero the published twist
+                    if self.cur_moving_generator is None:
+                        self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
+                else:
+                    # cmd_vel generator: do not swap mid-cycle. After a wrap,
+                    # either keep running, or tell it 'finish' so it can park
+                    # the feet and hand finish_ps to the next generator.
+                    send_status = 'running'
+                    if self.cur_moving_generator is not self.new_moving_generator:
+                        if last_status != 'finish':
+                            last_status = 'stop'
+                            send_status = 'finish'
+                            temp = self.new_moving_generator
+                    if self.cur_moving_generator is None:
+                        self.linear_x, self.linear_y, self.angular_z = 0, 0, -1
+                    if last_status == 'finish':
+                        send_status = 'first'
+                        last_status = 'start'
+                        self.cur_moving_generator = temp
+
             if self.cur_moving_generator is None:
                 if self.new_moving_generator is not None:
                     self.cur_moving_generator = self.new_moving_generator
+            self._drop_gait5_if_replaced()
 
             if self.cur_moving_generator is not None:
-                try:
-                    moving_pose, last_part, params, slow = self.cur_moving_generator.send((pose, send_status))
-                    
-                except StopIteration as e:
-                    # 生成器已自然结束(generator exhausted: no more frames)
-                    self.cur_moving_generator = None
-                except Exception as e:
-                    # 其他异常（如类型错误、数值错误等）(any other error: drop this generator)
-                    self.get_logger().error("GENERATE ERROR: " + repr(e))
-                    self.cur_moving_generator = None
-
-                if last_part:
-                    if slow == 'move':
-                        # discrete-step generator: swap on the step boundary
-                        if self.cur_moving_generator is not self.new_moving_generator:
-                            self.cur_moving_generator = self.new_moving_generator
-                        # 如果没有移动生成器，重置线性和角速度(no generator left: zero the published twist)
-                        if self.cur_moving_generator is None:
-                            self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
+                # Unfinished gait-5 frame: keep the six feet. send()
+                # would advance phase_index and drop this frame.
+                if self._gait5 is not None and self._gait5.waiting():
+                    moving_pose, params, slow = self._gait5.held()
+                    last_part = False
+                    reused = True
+                else:
+                    try:
+                        moving_pose, last_part, params, slow = (
+                            self.cur_moving_generator.send(
+                                (pose, send_status)))
+                    except StopIteration:
+                        # 生成器已自然结束(generator exhausted: no more frames)
+                        self.cur_moving_generator = None
+                    except Exception as e:
+                        # 其他异常（如类型错误、数值错误等）(any other error: drop this generator)
+                        self.get_logger().error("GENERATE ERROR: " + repr(e))
+                        self.cur_moving_generator = None
                     else:
-                        # cmd_vel generator: do not swap mid-cycle. After a wrap,
-                        # either keep running, or tell it 'finish' so it can park
-                        # the feet and hand finish_ps to the next generator.
-                        send_status = 'running'
-                        if self.cur_moving_generator is not self.new_moving_generator:
-                            if last_status != 'finish':
-                                last_status = 'stop'
-                                send_status = 'finish'
-                                temp = self.new_moving_generator
-                        if self.cur_moving_generator is None:
-                            self.linear_x, self.linear_y, self.angular_z = 0, 0, -1
-                        if last_status == 'finish':
-                            send_status = 'first'
-                            last_status = 'start'
-                            self.cur_moving_generator = temp
+                        # Gait 5 defers this until the frame is accepted
+                        # at alpha 1. Other gaits keep today's order.
+                        hunter_now = (
+                            isinstance(params, CmdVelParams)
+                            and params.gait == 5)
+                        if last_part and not hunter_now:
+                            honor_boundary(slow)
             else:
                 self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
-                        
+
             # 应用新的姿态(apply new posture)
             # Identity check: PoseTransformer yields a new pose object. If a
             # gait is also running, pseudo=True so this only updates self.pose
@@ -240,8 +408,35 @@ class StepController(Node):
                     self.cur_pose_transformer = None
 
             if moving_pose is not None:
-                try: 
-                    if send_status == 'first' and slow == 'cmd_true':
+                try:
+                    # Gait 5 is the hunter follow walk. use_hexapod_kinematics
+                    # chooses who turns these foot tips into angles. A
+                    # too-big legal frame is subdivided and the generator
+                    # waits. Any other refusal sends no pulses and does
+                    # not advance the generator. Other gaits stay on
+                    # set_pose_base and kinematics.set_leg_position.
+                    hunter = (
+                        isinstance(params, CmdVelParams) and params.gait == 5)
+                    if hunter:
+                        session = self._begin_gait5(
+                            self.cur_moving_generator, pose)
+                        if not reused:
+                            session.open_frame(
+                                moving_pose, params, slow, last_part)
+                        step, delta, boundary = session.step()
+                        self._record_gait5(session, step)
+                        if boundary:
+                            honor_boundary(session.slow)
+                        # First-slice blend is 50 ms. Every other tick,
+                        # including a partial of a later frame, is 20 ms.
+                        # The thread still sleeps 20 ms either way.
+                        if send_status == 'first' and slow == 'cmd_true':
+                            duration = 0.05
+                        else:
+                            duration = 0.02
+                        if should_publish(step):
+                            self._publish_leg_radians(step.angles, duration)
+                    elif send_status == 'first' and slow == 'cmd_true':
                         # large foot jump from the previous cycle: 50 ms blend instead of 20 ms
                         self.set_pose_base(moving_pose, 0.05, pseudo=False, update_pose=False)
                         # time.sleep(0.02)
@@ -250,7 +445,9 @@ class StepController(Node):
                     if last_status == 'stop':
                         last_status = 'finish'
                     self.transform = transform
-                    if isinstance(params, CmdVelParams):
+                    if hunter:
+                        self._integrate_fraction(params, delta)
+                    elif isinstance(params, CmdVelParams):
                         # mm/s → m/s, then integrate 20 ms of body velocity into odom x,y,yaw
                         self.linear_x = params.velocity_x / 1000.0
                         self.linear_y = params.velocity_y / 1000.0

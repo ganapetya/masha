@@ -315,8 +315,10 @@ def CmdVelGenerator(params, log=None):
 # below. This file does not include that header and does not call it.
 #
 # FollowGaitGenerator does not call kinematics.set_step_mode or
-# cmd_vel_new_point. StepController still owns the 20 ms loop and the IK
-# (set_leg_position).
+# cmd_vel_new_point. StepController still owns the 20 ms loop and turns
+# the tips into angles. With use_hexapod_kinematics on,
+# hexapod_kinematics does that job, and the safety gate can refuse
+# the result. With the flag off, the closed set_leg_position still does.
 #
 # Same handshake as CmdVelGenerator so a halt can finish a cycle and a new
 # Twist can splice on last_part without teleporting the feet.
@@ -411,7 +413,9 @@ def sample_follow_gait(phi, vx, vy, wz, lift, period, nominal, stride_max=55.0, 
 def FollowGaitGenerator(params, log=None):
     """Yield omnidirectional-tripod poses for gait=5 / cmd_gait=5.
 
-    Never calls kinematics.set_step_mode. IK stays in StepController.
+    Never calls kinematics.set_step_mode. StepController turns the tips
+    into angles. With use_hexapod_kinematics on, hexapod_kinematics does
+    that job, and the safety gate can refuse the result.
 
     Python generator: `yield` freezes this function and hands one value to
     StepController. The controller's 20 ms loop is the projector. This
