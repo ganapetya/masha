@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
 project(hexapod_kinematics)
 
-# Pure leg geometry. No rclcpp. The coxa yaw is in this library.
-# The triangle, the safety gate, and the Python plug are later steps.
-# See PLAN.md.
+# Pure leg geometry. No rclcpp. The coxa yaw and the knee triangle are
+# in this library. Forward kinematics, the safety gate, and the Python
+# plug are later steps. See PLAN.md.
 # -O3 so hypot / atan2 / acos can inline once those files exist.
 # No -ffast-math: the later gate treats NaN and a cosine outside [-1, 1]
 # as real failures, and fast-math is allowed to break both.
@@ -20,6 +20,7 @@ find_package(ament_cmake REQUIRED)
 add_library(${PROJECT_NAME} SHARED
   src/geometry.cpp
   src/coxa.cpp
+  src/planar_leg.cpp
 )
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -48,6 +49,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_geometry ${PROJECT_NAME})
   ament_add_gtest(test_coxa test/test_coxa.cpp)
   target_link_libraries(test_coxa ${PROJECT_NAME})
+  ament_add_gtest(test_planar_leg test/test_planar_leg.cpp)
+  target_link_libraries(test_planar_leg ${PROJECT_NAME})
 endif()
 
 ament_package()
