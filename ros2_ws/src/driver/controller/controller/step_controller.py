@@ -42,6 +42,76 @@ from controller.move import (
     FollowGaitGenerator,
 )
 from servo_controller_msgs.msg import ServosPosition
+
+
+def _is_hunter_gait(params):
+    """Return True when this frame is the hunter follow walk, gait 5."""
+    return isinstance(params, CmdVelParams) and params.gait == 5
+
+
+class _WalkHandshake:
+    """Cmd_vel switch state for the life of the loop thread.
+
+    send_status is the word passed into generator.send. last_status
+    is how far a wind-down has got. pending is the next generator,
+    held while the current one plays its finish slice.
+    """
+
+    def __init__(self):
+        # 'first' plays the resume slice, 'running' the full cycle,
+        # 'finish' the wind-down slice that stashes finish_ps.
+        self.send_status = 'first'
+        # 'start', then 'stop' while the finish slice is playing,
+        # then 'finish' once that slice has been applied.
+        self.last_status = 'start'
+        self.pending = None
+
+    def honor_boundary(self, step, slow_word):
+        """Swap or wind down on a step boundary the walker accepted.
+
+        A discrete generator (slow_word 'move') swaps on this call.
+        A cmd_vel generator is told 'finish' first, and the queued
+        generator starts only on the later boundary. Gait 5 calls
+        this after the gate has accepted the frame. An earlier call
+        would start the next frame while these feet were still short.
+        """
+        if slow_word == 'move':
+            if step.cur_moving_generator is not step.new_moving_generator:
+                step.cur_moving_generator = step.new_moving_generator
+            if step.cur_moving_generator is None:
+                step.linear_x, step.linear_y, step.angular_z = 0, 0, 0
+            return
+        self.send_status = 'running'
+        if step.cur_moving_generator is not step.new_moving_generator:
+            if self.last_status != 'finish':
+                self.last_status = 'stop'
+                self.send_status = 'finish'
+                self.pending = step.new_moving_generator
+        if step.cur_moving_generator is None:
+            step.linear_x, step.linear_y, step.angular_z = 0, 0, -1
+        if self.last_status == 'finish':
+            self.send_status = 'first'
+            self.last_status = 'start'
+            step.cur_moving_generator = self.pending
+
+
+class _MovingFrame:
+    """One tick of feet from a step generator.
+
+    moving_pose is None when this tick has no feet. hunter is gait 5.
+    reused means the gait-5 gate has not accepted the open frame, so
+    send() was not called and the cursor did not move.
+    """
+
+    def __init__(self):
+        self.moving_pose = None
+        self.params = None
+        self.slow = None
+        self.last_part = False
+        self.reused = False
+        self.hunter = False
+
+
 class StepController(Node):
     """50 Hz gait/pose loop. Callers queue work on the new_* slots; loop()
     promotes them to cur_* and drives Python generators at 20 ms.
@@ -52,6 +122,11 @@ class StepController(Node):
     Pose-set wins: applying a new pose clears every generator (stand, then idle).
     Walking never aborts mid-step: the current generator is swapped only when
     it reports last_part (a full step / cycle wrap).
+
+    Two walkers share that rule. The legacy walker is MovingGenerator
+    and CmdVelGenerator, the walks from before the hunter, and it
+    publishes through set_pose_base. The hunter walker is gait 5,
+    FollowGaitGenerator, and it can hold one frame across ticks.
     """
     
     RIPPLE_GAIT = 1
@@ -267,208 +342,222 @@ class StepController(Node):
         self.cur_moving_generator = None
 
     def loop(self):
-        """
-        实际执行具体操作的线程循环(the thread loop that actually performs the specific operation)
+        """Run one 20 ms tick: a pose command, then exactly one walker.
+
+        The legacy walker is every step generator from before the
+        hunter: MovingGenerator (set_step_mode) and CmdVelGenerator
+        (cmd_vel while cmd_gait is not 5). The hunter walker is
+        gait 5 only, FollowGaitGenerator. A tick with no feet
+        clears the published twist and drives neither walker.
         """
         os.system("sudo renice -n -19 -p " + str(os.getpid()))
-        # CmdVelGenerator handshake (MovingGenerator ignores status and always
-        # yields slow=='move'). send_status is what we pass into .send();
-        # last_status is this loop's own phase of a generator switch:
-        #   send_status 'first'   — play the resume slice (steps1)
-        #   send_status 'running' — full cycle
-        #   send_status 'finish'  — play the wind-down slice (steps2), stash finish_ps
-        #   last_status 'start' → on last_part + queued replacement → 'stop' and send 'finish'
-        #   last_status 'stop'  → after the pose is applied → 'finish'
-        #   last_status 'finish'→ promote temp (the queued generator), send 'first' again
-        last_status = 'start'
-        send_status = 'first'
-        temp = None  # queued CmdVelGenerator held while the current one winds down
+        handshake = _WalkHandshake()
         while self.loop_enable:
-            # 设置姿态(set posture)
-            try:
-                if self.new_pose_setter is not None:
-                    self.cur_pose_setter = self.new_pose_setter
-                    self.new_pose_setter = None
-                if self.cur_pose_setter is not None:
-                    pose, transform, duration = self.cur_pose_setter
-                    if pose is None or transform is None:
-                        # set_pose(None, None, t) from stop_running: hold current pose, then drop all generators
-                        self.set_pose_base(self.pose, duration, update_pose=True)
-                    else:
-                        self.set_pose_base(pose, duration, update_pose=True)
-                        self.transform = transform
-                    self.reset_all_cur_gen()
-                    self.reset_all_new_gen()
-            except Exception as e:
-                self.get_logger().error("SET POSE " + str(e))
+            if not self._consume_pose_setter():
+                continue
+            pose, transform = self._step_pose_transformer()
+            frame = self._pull_moving_frame(pose, handshake)
+            self._apply_shifted_body_pose(pose, transform, frame.moving_pose)
+            if frame.moving_pose is None:
+                self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
+            elif frame.hunter:
+                self._tick_hunter_gait(frame, pose, transform, handshake)
+            else:
+                self._tick_legacy_gait(frame, transform, handshake)
+            self._mark_idle()
+            time.sleep(0.02)
+
+    def _consume_pose_setter(self):
+        """Apply a queued stand, then drop every generator.
+
+        Returns False when the apply raised. This tick stops there,
+        including the 20 ms sleep, and the next iteration tries again.
+        set_pose(None, None, t) holds the current feet for duration.
+        """
+        try:
+            if self.new_pose_setter is not None:
+                self.cur_pose_setter = self.new_pose_setter
+                self.new_pose_setter = None
+            if self.cur_pose_setter is not None:
+                pose, transform, duration = self.cur_pose_setter
+                if pose is None or transform is None:
+                    self.set_pose_base(self.pose, duration, update_pose=True)
+                else:
+                    self.set_pose_base(pose, duration, update_pose=True)
+                    self.transform = transform
                 self.reset_all_cur_gen()
                 self.reset_all_new_gen()
-                continue
-            pose = self.pose
-            transform = self.transform
-            moving_pose = None
+        except Exception as e:
+            self.get_logger().error("SET POSE " + str(e))
+            self.reset_all_cur_gen()
+            self.reset_all_new_gen()
+            return False
+        return True
 
-            # 进行姿态变换(perform posture transformation)
-            try:
-                if self.new_pose_transformer is not None:
-                    self.cur_pose_transformer = self.new_pose_transformer # 如果没有新的变换任务， 那么new_pose_transformer 就是 None(If there is no new transformation task, then new_pose_transformer is None)
-                    self.new_pose_transformer = None
+    def _step_pose_transformer(self):
+        """Advance a body lean by one frame.
 
-                if self.cur_pose_transformer is not None:
-                    pose, transform, last_part = self.cur_pose_transformer.send((pose, transform))
-                    if last_part:
-                        self.cur_pose_transformer = None
-            except Exception as e:
-                self.get_logger().error("TRANSFORM " + str(e))
-                self.cur_pose_transformer = None
-
-            # 进行步态处理(perform gait processing)
-            # 走路有点特殊， 停止前总是要先走当前的完一整步，这样可以简化逻辑。(Walking is a bit special in that the robot always needs to finish the current step before stopping, which simplifies the logic)
-            # 当然可以总是重新计算并实时更新步态路径,但是这样会带来些别的问题。(Of course, we could always recalculate and update the gait path in real-time, but that would introduce other issues)
-            # 所以我们让机器人在开始一步之后总是要走完完整一步再停止(So we make the robot always finish a complete step before stopping after starting a new one)
-            params = None
-            last_part = False
-            reused = False
-
-            def honor_boundary(slow_word):
-                # Swap or wind down. A gait-5 partial does not call this.
-                # last_part came from send(), and send() is what moves
-                # the film cursor. Honoring it while alpha is still
-                # short would start the next frame early.
-                nonlocal send_status, last_status, temp
-                if slow_word == 'move':
-                    # discrete-step generator: swap on the step boundary
-                    if self.cur_moving_generator is not self.new_moving_generator:
-                        self.cur_moving_generator = self.new_moving_generator
-                    # no generator left: zero the published twist
-                    if self.cur_moving_generator is None:
-                        self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
-                else:
-                    # cmd_vel generator: do not swap mid-cycle. After a wrap,
-                    # either keep running, or tell it 'finish' so it can park
-                    # the feet and hand finish_ps to the next generator.
-                    send_status = 'running'
-                    if self.cur_moving_generator is not self.new_moving_generator:
-                        if last_status != 'finish':
-                            last_status = 'stop'
-                            send_status = 'finish'
-                            temp = self.new_moving_generator
-                    if self.cur_moving_generator is None:
-                        self.linear_x, self.linear_y, self.angular_z = 0, 0, -1
-                    if last_status == 'finish':
-                        send_status = 'first'
-                        last_status = 'start'
-                        self.cur_moving_generator = temp
-
-            if self.cur_moving_generator is None:
-                if self.new_moving_generator is not None:
-                    self.cur_moving_generator = self.new_moving_generator
-            self._drop_gait5_if_replaced()
-
-            if self.cur_moving_generator is not None:
-                # Unfinished gait-5 frame: keep the six feet. send()
-                # would advance phase_index and drop this frame.
-                if self._gait5 is not None and self._gait5.waiting():
-                    moving_pose, params, slow = self._gait5.held()
-                    last_part = False
-                    reused = True
-                else:
-                    try:
-                        moving_pose, last_part, params, slow = (
-                            self.cur_moving_generator.send(
-                                (pose, send_status)))
-                    except StopIteration:
-                        # 生成器已自然结束(generator exhausted: no more frames)
-                        self.cur_moving_generator = None
-                    except Exception as e:
-                        # 其他异常（如类型错误、数值错误等）(any other error: drop this generator)
-                        self.get_logger().error("GENERATE ERROR: " + repr(e))
-                        self.cur_moving_generator = None
-                    else:
-                        # Gait 5 defers this until the frame is accepted
-                        # at alpha 1. Other gaits keep today's order.
-                        hunter_now = (
-                            isinstance(params, CmdVelParams)
-                            and params.gait == 5)
-                        if last_part and not hunter_now:
-                            honor_boundary(slow)
-            else:
-                self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
-
-            # 应用新的姿态(apply new posture)
-            # Identity check: PoseTransformer yields a new pose object. If a
-            # gait is also running, pseudo=True so this only updates self.pose
-            # and the actual servos are driven by moving_pose below.
-            if pose is not self.pose:
-                try:
-                    self.set_pose_base(pose, 0.02, pseudo=(moving_pose is not None), update_pose=True)
-                    self.transform = transform
-                except Exception as e:
-                    self.get_logger().info("POSE " + str(e))
+        Returns the pose and transform the walker should read.
+        A failed send drops the transformer and keeps the stored pose.
+        """
+        pose = self.pose
+        transform = self.transform
+        try:
+            if self.new_pose_transformer is not None:
+                self.cur_pose_transformer = self.new_pose_transformer
+                self.new_pose_transformer = None
+            if self.cur_pose_transformer is not None:
+                pose, transform, last_part = self.cur_pose_transformer.send(
+                    (pose, transform))
+                if last_part:
                     self.cur_pose_transformer = None
+        except Exception as e:
+            self.get_logger().error("TRANSFORM " + str(e))
+            self.cur_pose_transformer = None
+        return pose, transform
 
-            if moving_pose is not None:
-                try:
-                    # Gait 5 is the hunter follow walk. use_hexapod_kinematics
-                    # chooses who turns these foot tips into angles. A
-                    # too-big legal frame is subdivided and the generator
-                    # waits. Any other refusal sends no pulses and does
-                    # not advance the generator. Other gaits stay on
-                    # set_pose_base and kinematics.set_leg_position.
-                    hunter = (
-                        isinstance(params, CmdVelParams) and params.gait == 5)
-                    if hunter:
-                        session = self._begin_gait5(
-                            self.cur_moving_generator, pose)
-                        if not reused:
-                            session.open_frame(
-                                moving_pose, params, slow, last_part)
-                        step, delta, boundary = session.step()
-                        self._record_gait5(session, step)
-                        if boundary:
-                            honor_boundary(session.slow)
-                        # First-slice blend is 50 ms. Every other tick,
-                        # including a partial of a later frame, is 20 ms.
-                        # The thread still sleeps 20 ms either way.
-                        if send_status == 'first' and slow == 'cmd_true':
-                            duration = 0.05
-                        else:
-                            duration = 0.02
-                        if should_publish(step):
-                            self._publish_leg_radians(step.angles, duration)
-                    elif send_status == 'first' and slow == 'cmd_true':
-                        # large foot jump from the previous cycle: 50 ms blend instead of 20 ms
-                        self.set_pose_base(moving_pose, 0.05, pseudo=False, update_pose=False)
-                        # time.sleep(0.02)
-                    else:
-                        self.set_pose_base(moving_pose, 0.02, pseudo=False, update_pose=False)
-                    if last_status == 'stop':
-                        last_status = 'finish'
-                    self.transform = transform
-                    if hunter:
-                        self._integrate_fraction(params, delta)
-                    elif isinstance(params, CmdVelParams):
-                        # mm/s → m/s, then integrate 20 ms of body velocity into odom x,y,yaw
-                        self.linear_x = params.velocity_x / 1000.0
-                        self.linear_y = params.velocity_y / 1000.0
-                        self.angular_z = params.angular_z
-                        yaw = self.real_pose_yaw if self.real_pose_yaw else self.pose_yaw
-                        x = math.cos(yaw) * (self.linear_x) * 0.02 - math.sin(yaw) * self.linear_y * 0.02
-                        y = math.sin(yaw) * (self.linear_x) * 0.02 + math.cos(yaw) * self.linear_y * 0.02
-                        self.position = self.position[0] + x, self.position[1] + y, self.position[2]
-                        self.pose_yaw += self.angular_z * 0.02
+    def _pull_moving_frame(self, pose, handshake):
+        """Take one frame from the current step generator.
 
+        A queued generator is promoted first. Legacy generators
+        always send(), and a last_part swaps or winds down before
+        this returns. Gait 5 does not. While its gate has not
+        accepted the open frame, the same six feet are returned
+        and send() is not called, because send() would drop them.
+        Its last_part is left for the hunter tick.
+        """
+        frame = _MovingFrame()
+        if self.cur_moving_generator is None:
+            if self.new_moving_generator is not None:
+                self.cur_moving_generator = self.new_moving_generator
+        self._drop_gait5_if_replaced()
+        if self.cur_moving_generator is None:
+            return frame
+        if self._gait5 is not None and self._gait5.waiting():
+            frame.moving_pose, frame.params, frame.slow = self._gait5.held()
+            frame.reused = True
+            frame.hunter = _is_hunter_gait(frame.params)
+            return frame
+        try:
+            frame.moving_pose, frame.last_part, frame.params, frame.slow = (
+                self.cur_moving_generator.send((pose, handshake.send_status)))
+        except StopIteration:
+            self.cur_moving_generator = None
+            return frame
+        except Exception as e:
+            self.get_logger().error("GENERATE ERROR: " + repr(e))
+            self.cur_moving_generator = None
+            return frame
+        frame.hunter = _is_hunter_gait(frame.params)
+        if frame.last_part and not frame.hunter:
+            handshake.honor_boundary(self, frame.slow)
+        return frame
 
-                except Exception as e:
-                    self.get_logger().info("MOVING_POSE " + str(e))
-                    self.cur_moving_generator = None
-                    self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
+    def _apply_shifted_body_pose(self, pose, transform, moving_pose):
+        """Publish a pose-transformer step when the object changed.
+
+        The transformer yields a new object. While a walk is also
+        running, pseudo=True stores that pose and does not move
+        the servos. The walker frame is what moves them.
+        """
+        if pose is self.pose:
+            return
+        try:
+            self.set_pose_base(
+                pose, 0.02, pseudo=(moving_pose is not None),
+                update_pose=True)
+            self.transform = transform
+        except Exception as e:
+            self.get_logger().info("POSE " + str(e))
+            self.cur_pose_transformer = None
+
+    def _tick_legacy_gait(self, frame, transform, handshake):
+        """Drive MovingGenerator or CmdVelGenerator for one tick.
+
+        This is the walk from before the hunter. Feet go through
+        set_pose_base and kinematics.set_leg_position. The first
+        slice of a cmd_vel cycle blends for 50 ms. Every other
+        frame blends for 20 ms. CmdVelParams integrates a full
+        20 ms of the command. A discrete step (slow 'move') does
+        not integrate here. A raised error drops the generator.
+        """
+        try:
+            if handshake.send_status == 'first' and frame.slow == 'cmd_true':
+                # First slice after a cycle splice: 50 ms blend.
+                self.set_pose_base(
+                    frame.moving_pose, 0.05, pseudo=False, update_pose=False)
             else:
-                self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
-                
-            if self.cur_moving_generator is None and self.cur_pose_setter is None and self.cur_pose_transformer is None and self.cur_actionset_runner is None:
-                self.stopped.set()
-            time.sleep(0.02)
+                self.set_pose_base(
+                    frame.moving_pose, 0.02, pseudo=False, update_pose=False)
+            if handshake.last_status == 'stop':
+                handshake.last_status = 'finish'
+            self.transform = transform
+            if isinstance(frame.params, CmdVelParams):
+                # mm/s to m/s, then 20 ms of that body velocity into odom.
+                self.linear_x = frame.params.velocity_x / 1000.0
+                self.linear_y = frame.params.velocity_y / 1000.0
+                self.angular_z = frame.params.angular_z
+                yaw = self.real_pose_yaw if self.real_pose_yaw else self.pose_yaw
+                x = (math.cos(yaw) * self.linear_x * 0.02
+                     - math.sin(yaw) * self.linear_y * 0.02)
+                y = (math.sin(yaw) * self.linear_x * 0.02
+                     + math.cos(yaw) * self.linear_y * 0.02)
+                self.position = (
+                    self.position[0] + x,
+                    self.position[1] + y,
+                    self.position[2])
+                self.pose_yaw += self.angular_z * 0.02
+        except Exception as e:
+            self.get_logger().info("MOVING_POSE " + str(e))
+            self.cur_moving_generator = None
+            self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
+
+    def _tick_hunter_gait(self, frame, stance, transform, handshake):
+        """Drive gait 5, the hunter follow walk, for one tick.
+
+        use_hexapod_kinematics chooses who turns the six tips into
+        angles. A legal frame that steps too far is shortened and
+        the generator waits. Any other refusal publishes nothing
+        and does not advance the generator. The boundary swap runs
+        only when the gate accepted the generator's own feet.
+        Odometry adds the fraction of the 20 ms frame that was sent.
+        """
+        try:
+            session = self._begin_gait5(self.cur_moving_generator, stance)
+            if not frame.reused:
+                session.open_frame(
+                    frame.moving_pose, frame.params, frame.slow,
+                    frame.last_part)
+            step, delta, boundary = session.step()
+            self._record_gait5(session, step)
+            if boundary:
+                handshake.honor_boundary(self, session.slow)
+            # First-slice blend is 50 ms. A later frame, including a
+            # partial, is 20 ms. The thread still sleeps 20 ms.
+            if handshake.send_status == 'first' and frame.slow == 'cmd_true':
+                duration = 0.05
+            else:
+                duration = 0.02
+            if should_publish(step):
+                self._publish_leg_radians(step.angles, duration)
+            if handshake.last_status == 'stop':
+                handshake.last_status = 'finish'
+            self.transform = transform
+            self._integrate_fraction(frame.params, delta)
+        except Exception as e:
+            self.get_logger().info("MOVING_POSE " + str(e))
+            self.cur_moving_generator = None
+            self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
+
+    def _mark_idle(self):
+        """Signal stopped when no pose, lean, walk, or action is in flight."""
+        idle = (
+            self.cur_moving_generator is None
+            and self.cur_pose_setter is None
+            and self.cur_pose_transformer is None
+            and self.cur_actionset_runner is None)
+        if idle:
+            self.stopped.set()
 
     def stop_running(self, timeout=0, callback=None):
         """
