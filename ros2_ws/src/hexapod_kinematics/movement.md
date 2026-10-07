@@ -127,7 +127,7 @@ is gait 5, `FollowGaitGenerator`.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Loop as loop() in step_controller.py
+    participant Legs as leg thread in step_controller.py
     participant Pull as _pull_moving_frame() in step_controller.py
     participant Hand as honor_boundary() in step_controller.py
     participant Legacy as _tick_legacy_gait() in step_controller.py
@@ -136,10 +136,10 @@ sequenceDiagram
     participant So as set_leg_position in kinematics.so
     participant Servo as JointControl in x_joint_control.py
 
-    Note over Loop: time.sleep(0.02) ended. This is one leg tick.
-    Loop->>Pull: current stance, send_status
+    Note over Legs: time.sleep(0.02) ended. This is one leg tick.
+    Legs->>Pull: current stance, send_status
     alt a gait-5 page is still open
-        Pull-->>Loop: the same six feet, reused, hunter
+        Pull-->>Legs: the same six feet, reused, hunter
         Note over Pull: send() is not called. The bookmark stays.
     else a generator is playing
         Pull->>Pull: generator.send(stance, send_status)
@@ -150,17 +150,17 @@ sequenceDiagram
             Note over Hand: left for the hunter tick, after the gate accepts the page
         end
     else nothing is playing
-        Pull-->>Loop: no feet
-        Loop->>Loop: published twist becomes 0, 0, 0
+        Pull-->>Legs: no feet
+        Legs->>Legs: published twist becomes 0, 0, 0
     end
 
     alt no feet
         Note over Legacy,Hunter: neither walker runs
     else hunter, gait 5
-        Loop->>Hunter: frame, stance, handshake
+        Legs->>Hunter: frame, stance, handshake
         Note over Hunter: Diagram 4. May publish eighteen radians, or nothing.
     else legacy
-        Loop->>Legacy: frame, handshake
+        Legs->>Legacy: frame, handshake
         alt send_status is first and slow is cmd_true
             Legacy->>Base: six feet, duration 0.05 s
         else every other legacy frame
@@ -171,7 +171,7 @@ sequenceDiagram
         Base->>Servo: set_multi_joints, those radians, that duration
         Note over Legacy: CmdVelParams adds a full 0.02 s of the command to odometry. A discrete step, slow move, does not.
     end
-    Loop->>Loop: time.sleep(0.02)
+    Legs->>Legs: time.sleep(0.02)
 ```
 
 Legacy `last_part` is handled inside the pull, before the servos
@@ -198,21 +198,21 @@ during the bake.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Loop as loop() in step_controller.py
+    participant Legs as leg thread in step_controller.py
     participant Film as FollowGaitGenerator in move.py
     participant Sample as sample_follow_gait() in move.py
 
-    Loop->>Film: first send(stance, "first") after send(None)
+    Legs->>Film: first send(stance, "first") after send(None)
     Note over Film: Stance object changed, or this is the first bake. The for-loop below does not yield.
     loop one phase per 20 ms of the period
         Film->>Sample: phase, vx, vy, wz, height, period, six homes
         Sample-->>Film: six feet, millimetres
     end
-    Note over Film: steps[] is the whole cycle. steps1 is the intro, steps2 the wind-down.
-    Film-->>Loop: yield steps1[0], last_part, params, slow
-    Note over Loop,Film: About 20 ms later
-    Loop->>Film: send(stance, status)
-    Film-->>Loop: yield the next stored frame
+    Note over Film: the steps list is the whole cycle. steps1 is the intro, steps2 the wind-down.
+    Film-->>Legs: yield the first intro frame, last_part, params, slow
+    Note over Legs,Film: About 20 ms later
+    Legs->>Film: send(stance, status)
+    Film-->>Legs: yield the next stored frame
     Note over Sample: not called. The table already exists.
 ```
 
@@ -232,18 +232,18 @@ swaps at once.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Loop as loop() in step_controller.py
+    participant Legs as leg thread in step_controller.py
     participant Move as MovingGenerator in move.py
     participant So as kinematics.set_step_mode in kinematics.so
 
-    Loop->>Move: send(stance, status)
+    Legs->>Move: send(stance, status)
     Note over Move: New stance object. Bake six parts before the next yield.
     loop part i from 0 to 5
         Move->>So: sub_action_num, part i, start pose, gait, stride, height
         So-->>Move: several frames of six feet
     end
-    Move-->>Loop: yield frame 0 of part 0
-    Note over Loop,Move: Each later send yields the next stored frame. last_part is true only when part and sub-frame both wrap to 0.
+    Move-->>Legs: yield frame 0 of part 0
+    Note over Legs,Move: Each later send yields the next stored frame. last_part is true only when part and sub-frame both wrap to 0.
 ```
 
 ## 4. The hunter tick and the gate
@@ -330,33 +330,33 @@ legal. One 20 ms jump is not.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Loop as loop() in step_controller.py
+    participant Legs as leg thread in step_controller.py
     participant Pull as _pull_moving_frame() in step_controller.py
     participant Film as FollowGaitGenerator in move.py
     participant Gate as gate() in safety.cpp
     participant Servo as JointControl in x_joint_control.py
 
-    Note over Loop: Tick A, 20 ms
-    Loop->>Pull: session is not waiting
+    Note over Legs: Tick A, 20 ms
+    Legs->>Pull: session is not waiting
     Pull->>Film: send()
     Film-->>Pull: this page, bookmark moves
-    Pull-->>Loop: six feet, hunter
-    Loop->>Gate: angles of the whole page, against the last sent angles
-    Gate-->>Loop: rate_limit, the jump is 0.40 rad
-    Note over Loop: Bisect in foot space. All six feet move the same fraction.
-    Loop->>Gate: angles of the halfway feet
-    Gate-->>Loop: allow, leftover turn is about 0.20 rad
-    Loop->>Servo: eighteen angles of the halfway pose, duration 0.02 s
+    Pull-->>Legs: six feet, hunter
+    Legs->>Gate: angles of the whole page, against the last sent angles
+    Gate-->>Legs: rate_limit, the jump is 0.40 rad
+    Note over Legs: Bisect in foot space. All six feet move the same fraction.
+    Legs->>Gate: angles of the halfway feet
+    Gate-->>Legs: allow, leftover turn is about 0.20 rad
+    Legs->>Servo: eighteen angles of the halfway pose, duration 0.02 s
     Note over Film: Bookmark stays. send() will not be called next tick.
 
-    Note over Loop: Tick B, 20 ms later
-    Loop->>Pull: waiting() is true
-    Pull-->>Loop: the same six feet
+    Note over Legs: Tick B, 20 ms later
+    Legs->>Pull: waiting() is true
+    Pull-->>Legs: the same six feet
     Note over Film: not woken
-    Loop->>Gate: angles of the whole page, against the halfway angles
-    Gate-->>Loop: allow, the remainder fits
-    Loop->>Servo: eighteen angles of the generator's own feet
-    Note over Loop: alpha is 1. If the page was last_part, the book may change now.
+    Legs->>Gate: angles of the whole page, against the halfway angles
+    Gate-->>Legs: allow, the remainder fits
+    Legs->>Servo: eighteen angles of the generator's own feet
+    Note over Legs: alpha is 1. If the page was last_part, the book may change now.
 ```
 
 The second tick cures the refusal because the feet already moved.
@@ -381,13 +381,13 @@ sequenceDiagram
     participant Film as CmdVelGenerator or FollowGaitGenerator in move.py
     participant Tick as legacy tick or hunter tick in step_controller.py
     participant Servo as JointControl in x_joint_control.py
-    participant Loop as loop() in step_controller.py
+    participant Legs as leg thread in step_controller.py
 
     Film-->>Tick: first frame, slow = cmd_true
     Tick->>Servo: eighteen targets, duration 0.05 s
-    Loop->>Loop: sleep 0.02 s
+    Legs->>Legs: sleep 0.02 s
     Note over Servo: The 50 ms blend is still in progress.
-    Loop->>Film: send() or, for gait 5, reuse the open page
+    Legs->>Film: send() or, for gait 5, reuse the open page
     Film-->>Tick: the next command
     Tick->>Servo: new targets, usually duration 0.02 s
     Note over Servo: This message replaces the 50 ms one.
