@@ -66,16 +66,17 @@ class _WalkHandshake:
         self.last_status = 'start'
         self.pending = None
 
-    def honor_boundary(self, step, slow_word):
+    def honor_boundary(self, step, params):
         """Swap or wind down on a step boundary the walker accepted.
 
-        A discrete generator (slow_word 'move') swaps on this call.
-        A cmd_vel generator is told 'finish' first, and the queued
+        A counted step (MovingParams) swaps on this call. A velocity
+        walk (CmdVelParams) is told 'finish' first, and the queued
         generator starts only on the later boundary. Gait 5 calls
         this after the gate has accepted the frame. An earlier call
         would start the next frame while these feet were still short.
+        The blend flag is not consulted here.
         """
-        if slow_word == 'move':
+        if isinstance(params, MovingParams):
             if step.cur_moving_generator is not step.new_moving_generator:
                 step.cur_moving_generator = step.new_moving_generator
             if step.cur_moving_generator is None:
@@ -100,7 +101,8 @@ class _MovingFrame:
 
     moving_pose is None when this tick has no feet. hunter is gait 5.
     reused means the gait-5 gate has not accepted the open frame, so
-    send() was not called and the cursor did not move.
+    send() was not called and the cursor did not move. slow is a bool:
+    True asks for a 50 ms servo blend on this pose.
     """
 
     def __init__(self):
@@ -450,7 +452,7 @@ class StepController(Node):
             return frame
         frame.hunter = _is_hunter_gait(frame.params)
         if frame.last_part and not frame.hunter:
-            handshake.honor_boundary(self, frame.slow)
+            handshake.honor_boundary(self, frame.params)
         return frame
 
     def _apply_shifted_body_pose(self, pose, transform, moving_pose):
@@ -476,13 +478,14 @@ class StepController(Node):
 
         This is the walk from before the hunter. Feet go through
         set_pose_base and kinematics.set_leg_position. The first
-        slice of a cmd_vel cycle blends for 50 ms. Every other
-        frame blends for 20 ms. CmdVelParams integrates a full
-        20 ms of the command. A discrete step (slow 'move') does
-        not integrate here. A raised error drops the generator.
+        slice of a cmd_vel cycle blends for 50 ms when slow is True.
+        Every other frame blends for 20 ms. CmdVelParams integrates
+        a full 20 ms of the command. A counted step carries
+        MovingParams, so it does not integrate here. A raised error
+        drops the generator.
         """
         try:
-            if handshake.send_status == 'first' and frame.slow == 'cmd_true':
+            if handshake.send_status == 'first' and frame.slow:
                 # First slice after a cycle splice: 50 ms blend.
                 self.set_pose_base(
                     frame.moving_pose, 0.05, pseudo=False, update_pose=False)
@@ -531,10 +534,11 @@ class StepController(Node):
             step, delta, boundary = session.step()
             self._record_gait5(session, step)
             if boundary:
-                handshake.honor_boundary(self, session.slow)
-            # First-slice blend is 50 ms. A later frame, including a
-            # partial, is 20 ms. The thread still sleeps 20 ms.
-            if handshake.send_status == 'first' and frame.slow == 'cmd_true':
+                handshake.honor_boundary(self, session.params)
+            # First-slice blend is 50 ms when slow is True. A later
+            # frame, including a partial, is 20 ms. The thread still
+            # sleeps 20 ms.
+            if handshake.send_status == 'first' and frame.slow:
                 duration = 0.05
             else:
                 duration = 0.02

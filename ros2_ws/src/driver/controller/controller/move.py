@@ -12,7 +12,10 @@ import copy
 #      (out_pose, last_part, params, slow)
 # last_part is True when a full step/cycle just wrapped, so the outer
 # loop in step_controller can swap or stop generators on a step boundary.
-# slow tells the servo loop which timing to use ('move' / 'cmd_true' / 'cmd_false').
+# slow is a bool. True asks for a 50 ms servo blend on this one pose.
+# False keeps the usual 20 ms command. A counted step always yields
+# False. The boundary tells a counted step from a velocity walk by the
+# params object (MovingParams versus CmdVelParams), not by this flag.
 
 
 class MovingParams:
@@ -68,7 +71,6 @@ def MovingGenerator(params, log=None):
     """
 
     # 根据是相对高度还是绝对高度计算实际的高度(actual lift height is computed later from relative_h vs absolute)
-    slow = 'move'  # tag so step_controller treats this as a discrete-step generator, not cmd_vel
     org_pose = None
     part_index = 0
     sub_index = 0
@@ -141,8 +143,10 @@ def MovingGenerator(params, log=None):
                     # wrapped a full step; forever keeps repeat at 0 so the outer while stays true
                     params.repeat = max(params.repeat - 1, 0)
             # log.info(f'{part_index} {sub_index}')
-            # last_part is True only at the wrap (part 0, sub 0): a complete-step boundary
-            cur_pose, status = yield out_pose, part_index == 0 and sub_index == 0, params, slow
+            # last_part is True only at the wrap (part 0, sub 0): a complete-step boundary.
+            # False: this counted step never asks for the 50 ms blend. The
+            # boundary sees MovingParams and swaps on the wrap.
+            cur_pose, status = yield out_pose, part_index == 0 and sub_index == 0, params, False
 
             # 两次初始姿态变了我们需要重算(stance pose object changed: break inner loop and recompute the 6 parts)
             # Identity check (is not), not a value compare: set_pose_base assigns a new tuple.
@@ -171,12 +175,12 @@ def total_dist_sq(a_pts, b_pts):
 # yield into finish_ps, every finish tick, so the last one is the pose the
 # feet were given when that slice wrapped. The next generator searches its
 # new cycle for the frame nearest that pose and starts there (avoids a jump).
-# slow is the servo-timing tag returned with each pose ('cmd_true' asks for
-# a 50 ms blend, 'cmd_false' keeps the usual 20 ms command).
+# slow is the blend flag yielded with each pose. True asks the servo
+# loop for a 50 ms blend; False keeps the usual 20 ms command.
 # stop means "we refused to splice at frame 0". finish_index is the cursor
 # after a finish yield; no other function reads it.
 finish_ps = []
-slow = 'cmd_false'
+slow = False
 stop = False   
 finish_index = None
 
@@ -284,10 +288,10 @@ def CmdVelGenerator(params, log=None):
                     # largest per-foot jump from the previous generator's last pose
                     distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, finish_ps)])
                     if distances > 7 or stop:
-                        slow = 'cmd_true'  # ask the servo loop for a slower 50 ms blend
+                        slow = True  # ask the servo loop for a 50 ms blend
                     finish_ps = []
                 else:
-                    slow = 'cmd_false'    
+                    slow = False    
                 phase_index = (phase_index + 1) % (len(steps) - idx)
             elif status == 'finish':
                 # play the leftover prefix so the gait can halt near a stable pose
@@ -560,7 +564,7 @@ def FollowGaitGenerator(params, log=None):
                 # Same empty-outro guard as the hand-off path. This branch
                 # does not arm the slow blend: finish_ps is empty, so the
                 # 'first' tick below takes the other arm and writes
-                # slow = 'cmd_false'.
+                # slow = False.
                 idx = 1
                 stop = True
             else:
@@ -586,17 +590,17 @@ def FollowGaitGenerator(params, log=None):
                     # largest single-toe jump to this frame, in millimetres.
                     # Over 7 mm, or we skipped the seam (stop), asks
                     # StepController for a 50 ms command on this one frame
-                    # (slow == 'cmd_true'). The thread still sleeps 20 ms;
+                    # (slow is True). The thread still sleeps 20 ms;
                     # the next tick replaces that pulse.
                     distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, finish_ps)])
                     if distances > 7 or stop:
-                        slow = 'cmd_true'
+                        slow = True
                     # Drop the stash now, or every later 'first' tick would
                     # run this test again.
                     finish_ps = []
                 else:
                     # Later 'first' ticks, and a cold start: ordinary timing.
-                    slow = 'cmd_false'
+                    slow = False
                 # Advance inside the intro. Its length is phase_num − idx,
                 # which is len(steps1). Wrapping this modulo is what makes
                 # phase_index == 0 at the end of the intro.

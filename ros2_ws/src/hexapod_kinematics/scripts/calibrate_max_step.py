@@ -135,7 +135,7 @@ def cycle_frames(vx_mm_s, vy_mm_s, wz_rad_s, stance):
 
     move.finish_ps = []
     move.stop = False
-    move.slow = "cmd_false"
+    move.slow = False
     params = move.CmdVelParams(
         gait=5,
         velocity_x=vx_mm_s,

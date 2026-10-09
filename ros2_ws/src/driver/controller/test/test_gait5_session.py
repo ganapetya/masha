@@ -87,7 +87,7 @@ def test_an_allowed_frame_finishes_in_one_tick_and_releases_the_boundary():
     session = Gait5Session("generator", ik, "vendor")
     assert session.attach(stance).allow is True
     assert session.anchor is stance
-    session.open_frame(frame, "params", "cmd_false", last_part=True)
+    session.open_frame(frame, "params", False, last_part=True)
     assert session.waiting() is True
     step, delta, boundary = session.step()
     assert step.decision == "sent"
@@ -97,7 +97,7 @@ def test_an_allowed_frame_finishes_in_one_tick_and_releases_the_boundary():
     assert session.waiting() is False
     assert session.anchor is frame
     # The next film frame is a new open. The boundary does not stick.
-    session.open_frame(stance, "params", "cmd_false", last_part=False)
+    session.open_frame(stance, "params", False, last_part=False)
     step, delta, boundary = session.step()
     assert step.decision == "sent"
     assert delta == 1.0
@@ -113,7 +113,7 @@ def test_a_partial_frame_stays_open_and_the_boundary_waits():
     session = Gait5Session("generator", ik, "hexapod")
     assert session.attach(anchor).allow is True
     frame = _rate_limit_frame(ik, anchor)
-    session.open_frame(frame, "params", "cmd_true", last_part=True)
+    session.open_frame(frame, "params", True, last_part=True)
     deltas = []
     boundary = False
     step = None
@@ -122,7 +122,7 @@ def test_a_partial_frame_stays_open_and_the_boundary_waits():
         held_feet, params, slow = session.held()
         assert held_feet is frame
         assert params == "params"
-        assert slow == "cmd_true"
+        assert slow is True
         step, delta, boundary = session.step()
         deltas.append(delta)
         if step.decision == "sent":
@@ -154,7 +154,7 @@ def test_a_hold_does_not_move_alpha_or_release_the_boundary():
     ik = HoldIk(frame)
     session = Gait5Session("generator", ik, "hexapod")
     session.attach(stance)
-    session.open_frame(frame, "params", "cmd_false", last_part=True)
+    session.open_frame(frame, "params", False, last_part=True)
     step, delta, boundary = session.step()
     assert step.decision == "held"
     assert step.reason == "unreachable"

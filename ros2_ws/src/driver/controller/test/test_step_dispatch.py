@@ -98,7 +98,7 @@ def test_discrete_boundary_swaps_immediately():
     nxt = object()
     step.cur_moving_generator = object()
     step.new_moving_generator = nxt
-    _WalkHandshake().honor_boundary(step, 'move')
+    _WalkHandshake().honor_boundary(step, MovingParams(gait=2))
     assert step.cur_moving_generator is nxt
     assert step.linear_x == 1
 
@@ -107,7 +107,7 @@ def test_discrete_boundary_with_nothing_queued_zeros_twist():
     step = _step()
     step.cur_moving_generator = object()
     step.new_moving_generator = None
-    _WalkHandshake().honor_boundary(step, 'move')
+    _WalkHandshake().honor_boundary(step, MovingParams(gait=2))
     assert step.cur_moving_generator is None
     assert (step.linear_x, step.linear_y, step.angular_z) == (0, 0, 0)
 
@@ -119,13 +119,13 @@ def test_cmd_vel_boundary_winds_down_before_the_swap():
     step.cur_moving_generator = current
     step.new_moving_generator = nxt
     handshake = _WalkHandshake()
-    handshake.honor_boundary(step, 'cmd_false')
+    handshake.honor_boundary(step, CmdVelParams(gait=2))
     assert step.cur_moving_generator is current
     assert handshake.send_status == 'finish'
     assert handshake.last_status == 'stop'
     assert handshake.pending is nxt
     handshake.last_status = 'finish'
-    handshake.honor_boundary(step, 'cmd_false')
+    handshake.honor_boundary(step, CmdVelParams(gait=2))
     assert step.cur_moving_generator is nxt
     assert handshake.send_status == 'first'
     assert handshake.last_status == 'start'
@@ -135,7 +135,7 @@ def test_legacy_last_part_is_honored_before_the_tick():
     step = _step()
     nxt = object()
     feet = ((1, 2, 3),)
-    step.cur_moving_generator = _Gen((feet, True, MovingParams(gait=2), 'move'))
+    step.cur_moving_generator = _Gen((feet, True, MovingParams(gait=2), False))
     step.new_moving_generator = nxt
     frame = StepController._pull_moving_frame(step, 'pose', _WalkHandshake())
     assert frame.hunter is False
@@ -145,7 +145,7 @@ def test_legacy_last_part_is_honored_before_the_tick():
 
 def test_hunter_last_part_does_not_swap_during_the_pull():
     step = _step()
-    gen = _Gen(((1, 2, 3), True, CmdVelParams(gait=5), 'cmd_false'))
+    gen = _Gen(((1, 2, 3), True, CmdVelParams(gait=5), False))
     nxt = object()
     step.cur_moving_generator = gen
     step.new_moving_generator = nxt
@@ -160,7 +160,7 @@ def test_waiting_hunter_frame_is_not_sent_again():
     step = _step()
     params = CmdVelParams(gait=5)
     feet = ((4, 5, 6),)
-    step._gait5 = _Hold(feet, params, 'cmd_false')
+    step._gait5 = _Hold(feet, params, False)
     gen = _Gen(error=AssertionError('send dropped the open frame'))
     step.cur_moving_generator = gen
     frame = StepController._pull_moving_frame(step, 'pose', _WalkHandshake())
@@ -174,7 +174,7 @@ def test_vendor_cmd_vel_is_a_legacy_frame():
     step = _step()
     params = CmdVelParams(gait=2, velocity_x=100)
     feet = ((1, 0, 0),)
-    gen = _Gen((feet, False, params, 'cmd_false'))
+    gen = _Gen((feet, False, params, False))
     step.cur_moving_generator = gen
     frame = StepController._pull_moving_frame(step, 'pose', _WalkHandshake())
     assert frame.hunter is False
@@ -200,7 +200,7 @@ def test_legacy_tick_uses_set_pose_base_and_a_full_20_ms():
     frame = _MovingFrame()
     frame.moving_pose = ((1, 2, 3),)
     frame.params = CmdVelParams(gait=2, velocity_x=1000, velocity_y=0, angular_z=0)
-    frame.slow = 'cmd_false'
+    frame.slow = False
     handshake = _WalkHandshake()
     handshake.send_status = 'running'
     StepController._tick_legacy_gait(step, frame, 'lean', handshake)
@@ -221,12 +221,12 @@ def test_legacy_first_slice_blends_for_50_ms_and_a_move_does_not_integrate():
     frame = _MovingFrame()
     frame.moving_pose = ((1, 2, 3),)
     frame.params = MovingParams(gait=2)
-    frame.slow = 'move'
+    frame.slow = False
     StepController._tick_legacy_gait(step, frame, 'lean', _WalkHandshake())
     assert calls == [0.02]
     assert step.linear_x == 1
 
-    frame.slow = 'cmd_true'
+    frame.slow = True
     frame.params = CmdVelParams(gait=2, velocity_x=0, velocity_y=0, angular_z=0)
     StepController._tick_legacy_gait(step, frame, 'lean', _WalkHandshake())
     assert calls == [0.02, 0.05]
@@ -239,7 +239,7 @@ def test_hunter_tick_opens_a_new_frame_and_publishes_radians():
     integrated = []
 
     class Session:
-        slow = 'cmd_false'
+        slow = False
 
         def open_frame(self, pose, params, slow, last_part):
             opened.append((pose, last_part))
@@ -255,7 +255,7 @@ def test_hunter_tick_opens_a_new_frame_and_publishes_radians():
     frame = _MovingFrame()
     frame.moving_pose = ((9, 9, 9),)
     frame.params = CmdVelParams(gait=5)
-    frame.slow = 'cmd_false'
+    frame.slow = False
     frame.last_part = True
     frame.hunter = True
     StepController._tick_hunter_gait(step, frame, 'stance', 'lean', _WalkHandshake())
@@ -265,7 +265,7 @@ def test_hunter_tick_opens_a_new_frame_and_publishes_radians():
     assert step.transform == 'lean'
 
 
-def test_hunter_reuse_does_not_open_and_a_boundary_swaps():
+def test_hunter_reuse_does_not_open_and_a_boundary_winds_down():
     step = _step()
     opened = []
     current = object()
@@ -274,7 +274,10 @@ def test_hunter_reuse_does_not_open_and_a_boundary_swaps():
     step.new_moving_generator = nxt
 
     class Session:
-        slow = 'move'
+        # Gait 5 is a velocity walk. The boundary winds down; it does
+        # not install the queued generator on this same call.
+        params = CmdVelParams(gait=5)
+        slow = False
 
         def open_frame(self, *args):
             opened.append(args)
@@ -289,11 +292,15 @@ def test_hunter_reuse_does_not_open_and_a_boundary_swaps():
     frame = _MovingFrame()
     frame.moving_pose = ((1, 1, 1),)
     frame.params = CmdVelParams(gait=5)
-    frame.slow = 'cmd_false'
+    frame.slow = False
     frame.reused = True
-    StepController._tick_hunter_gait(step, frame, 'stance', 'lean', _WalkHandshake())
+    handshake = _WalkHandshake()
+    StepController._tick_hunter_gait(step, frame, 'stance', 'lean', handshake)
     assert opened == []
-    assert step.cur_moving_generator is nxt
+    assert step.cur_moving_generator is current
+    assert handshake.pending is nxt
+    assert handshake.send_status == 'finish'
+    assert handshake.last_status == 'finish'
 
 
 class _StepResult:

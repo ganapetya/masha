@@ -428,7 +428,7 @@ class Gait5Session(object):
         return self.frame is not None and self.alpha_done < 1.0
 
     def held(self):
-        """Feet, params, and the slow word to reuse instead of send()."""
+        """Feet, params, and the blend flag to reuse instead of send()."""
         return self.frame, self.params, self.slow
 
     def open_frame(self, feet, params, slow, last_part):
