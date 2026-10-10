@@ -37,7 +37,7 @@ is 0.60 s. At 20 ms per frame that film has 30 pages
 | `_pull_mini_step_input()` | same file |
 | `_tick_legacy_gait()` | same file |
 | `_tick_hunter_gait()` | same file |
-| `_WalkHandshake.honor_boundary()` | same file |
+| `_WalkState.after_accepted_gait_step()` | same file |
 | `MovingGenerator` | `driver/controller/controller/move.py` |
 | `CmdVelGenerator` | same file |
 | `FollowGaitGenerator` | same file |
@@ -129,7 +129,7 @@ sequenceDiagram
     autonumber
     participant Legs as leg thread in step_controller.py
     participant Pull as _pull_mini_step_input() in step_controller.py
-    participant Hand as honor_boundary() in step_controller.py
+    participant State as after_accepted_gait_step() in step_controller.py
     participant Legacy as _tick_legacy_gait() in step_controller.py
     participant Hunter as _tick_hunter_gait() in step_controller.py
     participant Base as set_pose_base() in step_controller.py
@@ -137,17 +137,17 @@ sequenceDiagram
     participant Servo as JointControl in x_joint_control.py
 
     Note over Legs: time.sleep(0.02) ended. This is one leg tick.
-    Legs->>Pull: current stance, send_status
+    Legs->>Pull: current stance, generator_slice
     alt a gait-5 page is still open
         Pull-->>Legs: the same six feet, reused, hunter
         Note over Pull: gen_next_mini_step_yield is not called. The bookmark stays.
     else a generator is playing
-        Pull->>Pull: gen_next_mini_step_yield(stance, send_status)
+        Pull->>Pull: gen_next_mini_step_yield(stance, generator_slice)
         Note over Pull: The generator yields the next baked page and moves its bookmark.
         alt last_part and the page is legacy
-            Pull->>Hand: swap or start the wind-down now
+            Pull->>State: counted walk swaps now; velocity walk only orders the outro
         else last_part and the page is gait 5
-            Note over Hand: left for the hunter tick, after the gate accepts the page
+            Note over State: left for the hunter tick, after the gate accepts the page
         end
     else nothing is playing
         Pull-->>Legs: no feet
@@ -157,11 +157,11 @@ sequenceDiagram
     alt no feet
         Note over Legacy,Hunter: neither walker runs
     else hunter, gait 5
-        Legs->>Hunter: frame, stance, handshake
+        Legs->>Hunter: frame, stance, walk_state
         Note over Hunter: Diagram 4. May publish eighteen radians, or nothing.
     else legacy
-        Legs->>Legacy: frame, handshake
-        alt send_status is first and slow is cmd_true
+        Legs->>Legacy: frame, walk_state
+        alt generator_slice is generator_intro and slow is true
             Legacy->>Base: six feet, duration 0.05 s
         else every other legacy frame
             Legacy->>Base: six feet, duration 0.02 s
@@ -177,6 +177,22 @@ sequenceDiagram
 Legacy `last_part` is handled inside the pull, before the servos
 of this page are commanded. The page still plays. The next book
 is what starts on a later tick.
+
+The leg thread keeps one `_WalkState` for its whole life. Three
+memories live on it. `generator_slice` is the text handed to the
+generator on the next resume: `generator_intro` reads the opening
+of the prepared list, `generator_running` reads the whole gait
+step, and `generator_outro` reads the ending. `generator_outro_order`
+says how far an order to play that ending has got. It starts
+`'off'`. The wake that notices a velocity walk should change
+generators writes `'ordered'`, copies the waiting generator into
+`pending_generator_after_outro`, and still sends the feet it
+already had, which belong to the slice that just ended. At the
+end of that same wake the order becomes `'in_effect'`. The wakes
+after that play the outro. The next accepted gait step is the
+one that starts the stored generator and sets the slice back to
+`generator_intro`. A counted walk does not use this order. It
+installs the new generator inside the call.
 
 Gait 5 stores `last_part` on `Gait5Session` and acts on it only
 when `approach_target` has accepted the generator's own feet
@@ -300,7 +316,7 @@ sequenceDiagram
     Gate-->>Hex: allow, or rate_limit, or another reason
     alt gate allows the generator's own feet
         Target-->>Session: decision sent, alpha = 1, publish
-        Session-->>Tick: boundary if this page was last_part
+        Session-->>Tick: gait_step_accepted if this page was last_part and the gate sent it
         Tick->>Servo: eighteen radians, duration 0.02 s or 0.05 s
         Note over Tick: Odometry adds alpha's fraction of 0.02 s. The next tick may call gen_next_mini_step_yield().
     else reason is rate_limit

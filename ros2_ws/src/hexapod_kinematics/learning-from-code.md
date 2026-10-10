@@ -967,9 +967,10 @@ outside this module.
 `gen_next_mini_step_yield()` yields six feet and moves the cursor. While
 `waiting()` is true the loop keeps those feet and does not call it.
 `begin_target` stores `last_part` and does not act on it.
-The boundary runs only when `mini_step()` reports the target accepted
-at alpha 1. Honoring `last_part` early would start the next gait step
-while the feet were still short.
+`gait_step_accepted` is true only when `mini_step()` reports the
+target sent at alpha 1 and that target closed the period. Acting
+on `last_part` any earlier would start the next gait step while
+the feet were still short.
 
 **odometry_increment** scales the body twist by `delta_alpha`. A hold
 adds nothing. The mini-step that reaches alpha 1 adds only the leftover
@@ -1049,7 +1050,7 @@ On each iteration, for a current moving generator:
   - `_begin_gait5` creates the session on the first mini-step and logs `gait 5 backend=...`.
   - `begin_target` on a freshly yielded pose.
   - `session.mini_step()`, then `_record_gait5` (the WARN, the one-hertz line, the CSV row).
-  - `honor_boundary` only when `mini_step()` says the target finished and this yield was `last_part`.
+  - `after_accepted_gait_step` only when `mini_step()` says the target finished and this yield was `last_part`. That pair is `gait_step_accepted`. A velocity walk uses it to order the outro, and the same wake then moves the order to `in_effect` after the feet go out.
   - Duration 0.05 s on the first slice of a `cmd_true` blend, otherwise 0.02 s. The thread still sleeps 0.02 s.
   - `should_publish`: a hold does not publish. A dry run (`pseudo`) does not publish either.
   - `_publish_leg_radians` hands eighteen radians, ids 1..18, to `JointControl`. It does not call `kinematics.so`, and it does not replace `self.pose`.
@@ -1058,8 +1059,8 @@ On each iteration, for a current moving generator:
 
 `_drop_gait5_if_replaced` forgets the session when `cur_moving_generator`
 is no longer the session's generator. The next gait-5 start reads the
-flag again. A pose-set, a halt, and a finished boundary are the
-replacements.
+flag again. A pose-set, a halt, and an accepted gait step that
+installed another generator are the replacements.
 
 `set_pose_base` and `set_leg_position` are still the vendor path.
 Their comments in the file still talk about pulses in places. The
@@ -1079,8 +1080,10 @@ follow walk." Say, for one iteration, which function moves the
 generator cursor, which function decides publish, and which function
 writes a pulse.
 
-Then read `honor_boundary` and the comment above it. A gait-5 partial
-does not call it.
+Then read `after_accepted_gait_step` and the comment above it. The
+comment walks the three memories: which section the generator will
+read, how far the outro order has got, and which generator is
+waiting. A gait-5 partial does not call it.
 
 `controller/test/test_gait5_session.py` asserts the parameter name
 is in the controller source. That test is a lock on the wiring, not

@@ -40,6 +40,9 @@ from controller.move import (
     CmdVelGenerator,
     CmdVelParams,
     FollowGaitGenerator,
+    generator_intro,
+    generator_running,
+    generator_outro,
 )
 from servo_controller_msgs.msg import ServosPosition
 
@@ -49,58 +52,142 @@ def _is_hunter_gait(params):
     return isinstance(params, CmdVelParams) and params.gait == 5
 
 
-class _WalkHandshake:
-    """Cmd_vel switch state for the life of the loop thread.
+class _WalkState:
+    """The notebook the leg thread keeps for as long as it runs.
 
-    send_status is the slice word passed into
-    gen_next_mini_step_yield. last_status is how far a wind-down
-    has got. pending is the next generator, held while the current
-    one plays its finish slice.
+    loop creates one of these before the while, and every wake
+    reads that same object. It remembers three things, and nothing
+    else. generator_slice is the text passed into the walk
+    generator on the next resume, and it chooses which part of
+    the prepared foot list to read. generator_outro_order says
+    how far an order to play the ending has got, which is what
+    keeps a velocity walk from jumping to a new generator on the
+    same wake that noticed the period had ended.
+    pending_generator_after_outro is the generator copied at the
+    moment that order was written. The feet, the body twist, and
+    the generator that is playing right now live on StepController.
     """
 
     def __init__(self):
-        # 'first' plays the resume slice, 'running' the full cycle,
-        # 'finish' the wind-down slice that stashes finish_ps.
-        self.send_status = 'first'
-        # 'start', then 'stop' while the finish slice is playing,
-        # then 'finish' once that slice has been applied.
-        self.last_status = 'start'
-        self.pending = None
+        # A new thread has not played a step yet, so the first
+        # resume asks for the opening section of the prepared
+        # list. That section runs from the splice point to the
+        # end of the table. A cold start uses it, and so does the
+        # first period after a new generator is installed.
+        self.generator_slice = generator_intro
+        # No ending has been asked for. 'ordered' will mean this
+        # wake just asked, and the swap has to wait until the
+        # feet of this wake have been sent. 'in_effect' will mean
+        # the later wakes play the outro, and the next accepted
+        # gait step may start the generator we stored.
+        self.generator_outro_order = 'off'
+        self.pending_generator_after_outro = None
 
-    def honor_boundary(self, controller, params):
-        """Swap or wind down on a gait-step boundary the walker accepted.
+    def after_accepted_gait_step(self, controller, params):
+        """React once the caller has decided this gait step counts.
 
-        A counted walk (MovingParams) swaps on this call. A velocity
-        walk (CmdVelParams) is told 'finish' first, and the queued
-        generator starts only on the later boundary. Gait 5 calls
-        this after the gate has accepted target_feet_positions. An
-        earlier call would start the next target while these feet
-        were still short. The blend flag is not consulted here.
+        The caller already knows the period ended. This method
+        does not test that again, and it does not look at the
+        blend flag. A legacy walk learns the period ended from
+        the yield's last_part, inside the pull, before the servos
+        of that wake are commanded. Gait 5 learns it from
+        mini_step, and only after the gate has sent the six feet
+        that close the period. Calling this any earlier on gait 5
+        would start the next target while those feet were still
+        short of where the generator asked them to be.
+
+        A counted walk carries MovingParams. The generator is the
+        whole performance, so there is no ending section to play
+        inside it. This call installs new_moving_generator
+        immediately. When that queue is empty the walk is over,
+        and the twist the node publishes is set to zero so
+        odometry stops claiming the body is still moving.
+
+        A velocity walk carries CmdVelParams, and gait 5 is one
+        of those. The generator that is playing has to be allowed
+        to finish through the ending of its own list, or the feet
+        jump. The first accepted gait step that finds a different
+        generator waiting only writes the order. The generator
+        that was waiting is copied into
+        pending_generator_after_outro at that moment. A Twist
+        that arrives while the outro plays can replace
+        new_moving_generator, and it leaves the copy alone. The
+        wake that writes the order still sends the feet it had
+        already pulled, which are the last target of the slice
+        that just ended. At the end of that same wake the tick
+        moves the order from 'ordered' to 'in_effect'. From the
+        next resume on, the generator reads its ending section
+        and saves each pose so the next generator can start near
+        those feet. The order stays 'in_effect' for that whole
+        outro. The next accepted gait step finds the order
+        already in effect, installs the stored generator, and
+        sets the slice back to the opening section so the new
+        generator begins at its own splice.
         """
         if isinstance(params, MovingParams):
+            # The new generator, or None when nothing is queued,
+            # becomes the one that plays. A counted walk has no
+            # outro and stores no hand-off.
             current = controller.cur_moving_generator
             if current is not controller.new_moving_generator:
                 controller.cur_moving_generator = controller.new_moving_generator
             if controller.cur_moving_generator is None:
+                # The walk ended on this call. The published twist
+                # has to say the body is stopped.
                 controller.linear_x = 0
                 controller.linear_y = 0
                 controller.angular_z = 0
             return
-        self.send_status = 'running'
+        # Nothing new is waiting, so the next period reads the
+        # whole prepared list. An outro order below overwrites
+        # this, and so does the branch that finally starts a
+        # generator we stored on an earlier period.
+        self.generator_slice = generator_running
         current = controller.cur_moving_generator
         if current is not controller.new_moving_generator:
-            if self.last_status != 'finish':
-                self.last_status = 'stop'
-                self.send_status = 'finish'
-                self.pending = controller.new_moving_generator
+            if self.generator_outro_order != 'in_effect':
+                # The period ended and a different generator is
+                # waiting, but the order is not in effect yet, so
+                # the generator that is playing stays. The next
+                # resumes read the ending section. The waiting
+                # generator is copied now, because a later Twist
+                # is allowed to change new_moving_generator and
+                # is not allowed to change this copy. 'ordered'
+                # lasts only until the end of this wake. The tick
+                # that sends this wake's feet moves it to
+                # 'in_effect', and those feet are still the last
+                # target of the slice that just ended. The outro
+                # targets are the wakes after this one. The swap
+                # branch further down does not run on this call,
+                # because the order is 'ordered' and the tick has
+                # not moved it yet.
+                self.generator_outro_order = 'ordered'
+                self.generator_slice = generator_outro
+                self.pending_generator_after_outro = (
+                    controller.new_moving_generator)
         if controller.cur_moving_generator is None:
+            # This method was reached with no generator playing.
+            # x and y are cleared. The yaw rate is written as
+            # −1 rad/s. No other line treats −1 as a message.
+            # A wake that still has a velocity command replaces
+            # all three numbers from that command, and a wake
+            # with no feet replaces them with zeros. The −1
+            # remains only when neither of those writes follows.
             controller.linear_x = 0
             controller.linear_y = 0
             controller.angular_z = -1
-        if self.last_status == 'finish':
-            self.send_status = 'first'
-            self.last_status = 'start'
-            controller.cur_moving_generator = self.pending
+        if self.generator_outro_order == 'in_effect':
+            # The outro was ordered on an earlier accepted gait
+            # step, and that wake already moved the order to
+            # 'in_effect'. This is the accepted gait step that
+            # starts the generator stored then. The slice returns
+            # to the opening section so the new generator begins
+            # at its splice, and the order returns to 'off' so a
+            # later period is not treated as another ending.
+            self.generator_slice = generator_intro
+            self.generator_outro_order = 'off'
+            controller.cur_moving_generator = (
+                self.pending_generator_after_outro)
 
 
 class _MiniStepInput:
@@ -144,15 +231,18 @@ class _GeneratorCall:
         generator.send(None)
 
     @staticmethod
-    def gen_next_mini_step_yield(generator, pose, slice_word):
+    def gen_next_mini_step_yield(generator, pose, generator_slice):
         """Resume a walk generator and return its next yield.
 
-        pose is the stored stance. slice_word is 'first', 'running',
-        or 'finish'. The yield is six feet, the gait-step wrap flag,
-        the params, and the slow flag. The caller handles StopIteration
-        when the generator has ended.
+        pose is the stored stance. generator_slice is the text from
+        the walk state: generator_intro, generator_running, or
+        generator_outro. The generator uses it to choose which
+        part of its prepared foot list to hand back. The yield is
+        six feet, the flag that says this yield closed the period,
+        the params, and the slow flag. The caller handles
+        StopIteration when the generator has ended.
         """
-        return generator.send((pose, slice_word))
+        return generator.send((pose, generator_slice))
 
     @staticmethod
     def gen_next_lean_slice(generator, pose, transform):
@@ -283,10 +373,11 @@ class StepController(Node):
     def _drop_gait5_if_replaced(self):
         """Forget the session when its generator is no longer current.
 
-        A pose-set, a halt, and a finished boundary all replace
-        cur_moving_generator. The next gait-5 start reads the flag
-        again. The hold streak belongs to the generator that is
-        walking, so a replacement clears that too.
+        A pose-set, a halt, and an accepted gait step that installed
+        another generator all replace cur_moving_generator. The next
+        gait-5 start reads the flag again. The hold streak belongs
+        to the generator that is walking, so a replacement clears
+        that too.
         """
         if self._gait5 is None:
             return
@@ -405,21 +496,25 @@ class StepController(Node):
         clears the published twist and drives neither walker.
         """
         os.system("sudo renice -n -19 -p " + str(os.getpid()))
-        handshake = _WalkHandshake()
+        # One notebook for the whole thread. The wakes below update
+        # it. They do not build a new one, because the outro order
+        # has to survive from the wake that writes it to the later
+        # wake that starts the stored generator.
+        walk_state = _WalkState()
         while self.loop_enable:
             if not self._consume_pose_setter():
                 continue
             pose, transform = self._step_pose_transformer()
-            mini_step_input = self._pull_mini_step_input(pose, handshake)
+            mini_step_input = self._pull_mini_step_input(pose, walk_state)
             self._apply_shifted_body_pose(
                 pose, transform, mini_step_input.moving_pose)
             if mini_step_input.moving_pose is None:
                 self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
             elif mini_step_input.hunter:
                 self._tick_hunter_gait(
-                    mini_step_input, pose, transform, handshake)
+                    mini_step_input, pose, transform, walk_state)
             else:
-                self._tick_legacy_gait(mini_step_input, transform, handshake)
+                self._tick_legacy_gait(mini_step_input, transform, walk_state)
             self._mark_idle()
             time.sleep(0.02)
 
@@ -473,16 +568,20 @@ class StepController(Node):
             self.cur_pose_transformer = None
         return pose, transform
 
-    def _pull_mini_step_input(self, pose, handshake):
+    def _pull_mini_step_input(self, pose, walk_state):
         """Take one mini-step's input from the current walk generator.
 
-        A queued generator is promoted first. Legacy generators
-        always call gen_next_mini_step_yield, and a last_part swaps
-        or winds down before this returns. Gait 5 does not. While
-        its gate has not accepted target_feet_positions, the same
-        six feet are returned and gen_next_mini_step_yield is not
-        called, because that call would drop them. Its last_part
-        is left for the hunter mini-step.
+        A queued generator is promoted first, when nothing is
+        playing. Legacy generators always call
+        gen_next_mini_step_yield, and a yield that closes the
+        period updates the walk state before this returns. A
+        counted walk swaps on that update. A velocity walk only
+        orders its outro. Gait 5 does not take that update here.
+        While its gate has not accepted the six feet, the same
+        feet are returned and the generator is not resumed,
+        because resuming it would drop them. The period-closed
+        flag is left for the hunter wake, which can see whether
+        the gate actually sent those feet.
         """
         mini_step_input = _MiniStepInput()
         if self.cur_moving_generator is None:
@@ -501,7 +600,7 @@ class StepController(Node):
             return mini_step_input
         try:
             yielded = _GeneratorCall.gen_next_mini_step_yield(
-                self.cur_moving_generator, pose, handshake.send_status)
+                self.cur_moving_generator, pose, walk_state.generator_slice)
             mini_step_input.moving_pose = yielded[0]
             mini_step_input.last_part = yielded[1]
             mini_step_input.params = yielded[2]
@@ -515,7 +614,13 @@ class StepController(Node):
             return mini_step_input
         mini_step_input.hunter = _is_hunter_gait(mini_step_input.params)
         if mini_step_input.last_part and not mini_step_input.hunter:
-            handshake.honor_boundary(self, mini_step_input.params)
+            # The yield just closed a period, and this is not gait 5.
+            # The feet already pulled are still the ones this wake
+            # sends. A counted walk swaps inside the call. A velocity
+            # walk only orders the outro, and the tick below is what
+            # moves that order from 'ordered' to 'in_effect' after
+            # the servos have been commanded.
+            walk_state.after_accepted_gait_step(self, mini_step_input.params)
         return mini_step_input
 
     def _apply_shifted_body_pose(self, pose, transform, moving_pose):
@@ -536,20 +641,25 @@ class StepController(Node):
             self.get_logger().info("POSE " + str(e))
             self.cur_pose_transformer = None
 
-    def _tick_legacy_gait(self, mini_step_input, transform, handshake):
+    def _tick_legacy_gait(self, mini_step_input, transform, walk_state):
         """Drive MovingGenerator or CmdVelGenerator for one mini-step.
 
         This is the walk from before the hunter. Feet go through
-        set_pose_base and kinematics.set_leg_position. The first
-        slice of a cmd_vel gait step blends for 50 ms when slow is
-        True. Every other mini-step blends for 20 ms. CmdVelParams
-        integrates a full 20 ms of the command. A counted walk
-        carries MovingParams, so it does not integrate here. A
-        raised error drops the generator.
+        set_pose_base and kinematics.set_leg_position. The opening
+        section of a velocity walk blends for 50 ms when the
+        generator also asks for a slow blend. Every other mini-step
+        blends for 20 ms. CmdVelParams integrates a full 20 ms of
+        the command. A counted walk carries MovingParams, so it
+        does not integrate here. A raised error drops the generator.
         """
         try:
-            if handshake.send_status == 'first' and mini_step_input.slow:
-                # First slice after a gait-step splice: 50 ms blend.
+            if (walk_state.generator_slice == generator_intro
+                    and mini_step_input.slow):
+                # The generator is on its opening section and this
+                # pose would jump from the feet of the previous
+                # generator. The servos are given 50 ms to arrive.
+                # The thread still sleeps 20 ms, so the next wake
+                # replaces this pulse.
                 self.set_pose_base(
                     mini_step_input.moving_pose, 0.05,
                     pseudo=False, update_pose=False)
@@ -557,8 +667,15 @@ class StepController(Node):
                 self.set_pose_base(
                     mini_step_input.moving_pose, 0.02,
                     pseudo=False, update_pose=False)
-            if handshake.last_status == 'stop':
-                handshake.last_status = 'finish'
+            if walk_state.generator_outro_order == 'ordered':
+                # The pull wrote this order earlier in the same wake,
+                # before these feet were sent. The feet belong to the
+                # slice that just ended. Moving the order to
+                # 'in_effect' means the next resume plays the outro,
+                # and the next accepted gait step may start the
+                # generator that was stored. The outro feet themselves
+                # go out on the wakes after this one.
+                walk_state.generator_outro_order = 'in_effect'
             self.transform = transform
             if isinstance(mini_step_input.params, CmdVelParams):
                 # mm/s to m/s, then 20 ms of that body velocity into odom.
@@ -580,16 +697,16 @@ class StepController(Node):
             self.cur_moving_generator = None
             self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
 
-    def _tick_hunter_gait(self, mini_step_input, stance, transform, handshake):
+    def _tick_hunter_gait(self, mini_step_input, stance, transform, walk_state):
         """Drive gait 5, the hunter follow walk, for one mini-step.
 
         use_hexapod_kinematics chooses who turns the six tips into
         angles. A legal target whose joint move is too big is
         shortened and the generator waits. Any other refusal
         publishes nothing and does not advance the generator. The
-        boundary swap runs only when the gate accepted the
-        generator's own feet. Odometry adds the fraction of the
-        target that this mini-step sent.
+        walk state changes only when the gate has sent the six
+        feet that close the period. Odometry adds the fraction of
+        the target that this mini-step sent.
         """
         try:
             session = self._begin_gait5(self.cur_moving_generator, stance)
@@ -597,21 +714,36 @@ class StepController(Node):
                 session.begin_target(
                     mini_step_input.moving_pose, mini_step_input.params,
                     mini_step_input.slow, mini_step_input.last_part)
-            mini_step_result, delta, boundary = session.mini_step()
+            mini_step_result, delta, gait_step_accepted = session.mini_step()
             self._record_gait5(session, mini_step_result)
-            if boundary:
-                handshake.honor_boundary(self, session.params)
-            # First-slice blend is 50 ms when slow is True. A later
-            # mini-step, including a partial, is 20 ms. The thread
-            # still sleeps 20 ms.
-            if handshake.send_status == 'first' and mini_step_input.slow:
+            if gait_step_accepted:
+                # The gate sent the six feet, and those feet close
+                # the period. A partial or a hold leaves this false,
+                # so the generator is not asked for its outro while
+                # the feet are still on the way to the target. Gait 5
+                # is a velocity walk, so this call orders the outro
+                # when another generator is waiting. It does not
+                # install that generator yet.
+                walk_state.after_accepted_gait_step(self, session.params)
+            # The opening section blends for 50 ms when the generator
+            # asks for it. A later mini-step, including a partial of
+            # the same target, is 20 ms. The thread still sleeps 20 ms.
+            if (walk_state.generator_slice == generator_intro
+                    and mini_step_input.slow):
                 duration = 0.05
             else:
                 duration = 0.02
             if should_publish(mini_step_result):
                 self._publish_leg_radians(mini_step_result.angles, duration)
-            if handshake.last_status == 'stop':
-                handshake.last_status = 'finish'
+            if walk_state.generator_outro_order == 'ordered':
+                # Same mark as the legacy tick, made after the
+                # publish of this wake. The order was written a few
+                # lines above. These feet are the wrapping target
+                # the gate just accepted, not an outro target.
+                # 'in_effect' tells the next resume to play the
+                # outro, and tells the next accepted gait step that
+                # it may start the stored generator.
+                walk_state.generator_outro_order = 'in_effect'
             self.transform = transform
             self._integrate_fraction(mini_step_input.params, delta)
         except Exception as e:

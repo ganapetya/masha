@@ -440,10 +440,12 @@ class Gait5Session(object):
         """gen_next_mini_step_yield just yielded these feet.
 
         They are the open target. last_part is stored and not acted
-        on. The loop honors it only when mini_step() reports the
-        boundary. Calling this again on a target that is still
-        waiting would throw away the fraction already sent. The
-        loop calls this only after that yield.
+        on here. The loop acts on it only when mini_step() reports
+        that the gait step was accepted, which means these feet
+        were sent and they close the period. Calling this again on
+        a target that is still waiting would throw away the
+        fraction already sent. The loop calls this only after that
+        yield.
         """
         if self.anchor is None:
             self.anchor = feet
@@ -457,12 +459,17 @@ class Gait5Session(object):
         """Walk the open target as far as the gate allows.
 
         Returns the MiniStepResult, the fraction completed on this
-        mini-step (delta_alpha), and whether the gait-step boundary
-        may run. A hold returns delta 0 and does not release the
-        boundary. A partial keeps the same target. A sent target
-        moves the anchor to the generator's own feet and clears the
-        hold, so the next mini-step may call
-        gen_next_mini_step_yield().
+        mini-step (delta_alpha), and gait_step_accepted. That third
+        value is true only when this wake sent the generator's own
+        six feet and those feet are the ones that close the period.
+        The controller then updates the walk state. A hold returns
+        delta 0 and leaves the gait step unaccepted, so the same
+        target stays open. A partial also leaves it unaccepted and
+        keeps the same target. A sent target moves the anchor to
+        the generator's own feet and clears the hold, so the next
+        mini-step may call gen_next_mini_step_yield(). last_part is
+        cleared on that send, so the same target cannot accept the
+        gait step a second time.
         """
         before = self.alpha_done
         taken = approach_target(
@@ -470,12 +477,16 @@ class Gait5Session(object):
             self.alpha_done)
         self.alpha_done = taken.alpha_done
         finished = taken.decision == "sent"
-        boundary = finished and self.last_part
+        # True only for a fully sent target that also closed the
+        # period. The controller reads this and, when it is true,
+        # updates the walk state. A hold and a partial stay false,
+        # which keeps the generator on the feet it already yielded.
+        gait_step_accepted = finished and self.last_part
         if finished:
             self.anchor = self.target_feet_positions
             self.target_feet_positions = None
             self.last_part = False
-        return taken, self.alpha_done - before, boundary
+        return taken, self.alpha_done - before, gait_step_accepted
 
 
 def read_max_step_rad():

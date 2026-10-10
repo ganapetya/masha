@@ -123,12 +123,12 @@ def cycle_frames(vx_mm_s, vy_mm_s, wz_rad_s, stance):
     This script drives the generator itself, so it calls send().
     StepController does the same two resumes through
     gen_advance_to_first_yield and gen_next_mini_step_yield.
-    Status 'first' plays the intro. Only its first frame is
-    returned, so the stand-to-splice step can be printed beside
-    the cycle. Status 'running' then yields the baked table from
-    frame 0 through the last frame. That table is one period.
-    The caller adds the seam from the last frame back to the
-    first, which is the tick the next lap actually takes.
+    generator_intro plays the opening section. Only its first
+    frame is kept, so the stand-to-splice step can be printed
+    beside the cycle. generator_running then yields the baked
+    table from frame 0 through the last frame. That table is one
+    period. The caller adds the seam from the last frame back to
+    the first, which is the wake the next lap actually takes.
 
     finish_ps is cleared first. A leftover hand-off pose would splice
     this cycle against some earlier run.
@@ -151,18 +151,21 @@ def cycle_frames(vx_mm_s, vy_mm_s, wz_rad_s, stance):
     )
     generator = move.FollowGaitGenerator(params, log=None)
     generator.send(None)
-    status = "first"
+    generator_slice = move.generator_intro
     running = []
     first_intro = None
     while True:
         # The stance object stays the same one. A new tuple would
         # make the generator throw the table away and bake again.
-        pose, last_part, _params, _slow = generator.send((stance, status))
-        if status == "first":
+        pose, last_part, _params, _slow = generator.send((stance, generator_slice))
+        if generator_slice == move.generator_intro:
             if first_intro is None:
                 first_intro = pose
             if last_part:
-                status = "running"
+                # The opening section wrapped. The rest of this
+                # cycle is the whole prepared gait step, which is
+                # what the controller calls generator_running.
+                generator_slice = move.generator_running
             continue
         running.append(pose)
         if last_part:

@@ -10,14 +10,34 @@ import copy
 # generators. Calling one only builds the object. StepController resumes
 # it through _GeneratorCall, and those methods are what call send():
 #   1) gen_advance_to_first_yield once, up to the first yield
-#   2) then gen_next_mini_step_yield(pose, slice_word), which returns
+#   2) then gen_next_mini_step_yield(pose, generator_slice), which returns
 #      (out_pose, last_part, params, slow)
-# last_part is True when a gait step just wrapped, so the outer
-# loop in step_controller can swap or stop generators on that boundary.
+# generator_slice is one of the three texts defined just below.
+# The generator uses it to choose which part of its prepared foot
+# list to yield. last_part is True when a gait step just wrapped,
+# so the outer loop in step_controller can swap or stop generators
+# on that accepted gait step.
 # slow is a bool. True asks for a 50 ms servo blend on this one pose.
 # False keeps the usual 20 ms command. A counted walk always yields
 # False. The boundary tells a counted walk from a velocity walk by the
 # params object (MovingParams versus CmdVelParams), not by this flag.
+
+# The three texts _WalkState.generator_slice can hold. They are
+# defined here because this file is where the generator compares
+# them, and step_controller already imports this module. The
+# controller passes one text on every resume.
+#
+# generator_intro is the opening section, from the splice point
+# to the end of the prepared list. A cold start uses it, and so
+# does the first period after a new generator is installed.
+# generator_running is the whole prepared gait step, wrapping at
+# the end. generator_outro is the ending section, from the start
+# of the list up to the splice. While that ending plays, each
+# pose is saved in finish_ps so the next generator can begin
+# near those feet.
+generator_intro = 'generator_intro'
+generator_running = 'generator_running'
+generator_outro = 'generator_outro'
 
 
 class MovingParams:
@@ -92,8 +112,11 @@ def MovingGenerator(params, log=None):
     sub_rotate = params.rotation / (sub_action_num * 6.0)
 
     # gen_advance_to_first_yield parks here. The next resume fills
-    # cur_pose and status from (pose, slice_word).
-    cur_pose, status = yield None
+    # cur_pose from the stance, and generator_slice from the walk
+    # state. A counted walk receives that text and does not branch
+    # on it. When the period ends, the controller replaces this
+    # whole generator instead of asking it to play an ending.
+    cur_pose, generator_slice = yield None
     while params.repeat > 0 or params.forever:
         org_pose = cur_pose
         if params.relative_h:
@@ -136,7 +159,7 @@ def MovingGenerator(params, log=None):
             ps = np.transpose(ps, (1, 0, 2))  # 转换为[子动作[六条腿[坐标]]](shape: [sub-actions][6 legs][x,y,z])
             start_pose = ps[-1]  # next part continues from this part's last mini-step
             poses.append(ps)
-        # log.info(f'{status}, {poses}')    
+        # log.info(f'{generator_slice}, {poses}')    
         while params.repeat > 0 or params.forever:
             out_pose = poses[part_index][sub_index]
             # log.info('forvoer'+str(params.forever)) 
@@ -149,10 +172,18 @@ def MovingGenerator(params, log=None):
                     # wrapped one gait step; forever keeps repeat at 0 so the outer while stays true
                     params.repeat = max(params.repeat - 1, 0)
             # log.info(f'{part_index} {sub_index}')
-            # last_part is True only at the wrap (part 0, sub 0): a gait-step boundary.
-            # False: this counted walk never asks for the 50 ms blend. The
-            # boundary sees MovingParams and swaps on the wrap.
-            cur_pose, status = yield out_pose, part_index == 0 and sub_index == 0, params, False
+            # last_part is True only when both counters have just
+            # wrapped, which is the end of one gait step. The fourth
+            # value is False because a counted walk never asks for
+            # the 50 ms blend. The controller sees MovingParams on
+            # that True and swaps generators inside the same call.
+            # generator_slice comes back on the resume and is not
+            # consulted; the swap replaces this generator outright.
+            cur_pose, generator_slice = yield (
+                out_pose,
+                part_index == 0 and sub_index == 0,
+                params,
+                False)
 
             # 两次初始姿态变了我们需要重算(stance pose object changed: break inner loop and recompute the 6 parts)
             # Identity check (is not), not a value compare: set_pose_base assigns a new tuple.
@@ -177,28 +208,33 @@ def total_dist_sq(a_pts, b_pts):
     return s
 
 # Module-level handoff shared by CmdVelGenerator and FollowGaitGenerator.
-# On status=='finish' the live generator stores the pose it is about to
-# yield into finish_ps, every finish mini-step, so the last one is the pose the
-# feet were given when that slice wrapped. The next generator searches its
-# new gait step for the target nearest that pose and starts there
-# (avoids a jump).
-# slow is the blend flag yielded with each pose. True asks the servo
-# loop for a 50 ms blend; False keeps the usual 20 ms command.
-# stop means "we refused to splice at target 0". finish_index is the cursor
-# after a finish yield; no other function reads it.
+# While generator_slice is generator_outro, the live generator stores
+# the pose it is about to yield into finish_ps, on every outro wake,
+# so the last one is the pose the feet were given when that section
+# wrapped. The next generator searches its new gait step for the
+# target nearest that pose and starts there, which keeps the feet
+# from jumping. slow is the blend flag yielded with each pose. True
+# asks the servo loop for a 50 ms blend. False keeps the usual 20 ms
+# command. stop means we refused to splice at target 0, because that
+# target would make the outro an empty list. finish_index is the
+# cursor after an outro yield. No other function reads it.
 finish_ps = []
 slow = False
 stop = False   
 finish_index = None
 
 def CmdVelGenerator(params, log=None):
-    """Yield continuous gait poses for Twist / cmd_vel.
+    """Yield continuous gait poses for a velocity command.
 
-    Builds one gait-cycle table (phase 0 .. 2pi), then plays it. The outer
-    loop in step_controller drives a small state machine via `status`:
-      'first'  — resume from a splice index (after start or after a switch)
-      'finish' — play the leftover prefix so the cycle can stop on a stable pose
-      other    — normal wrap around the full cycle
+    Builds one gait-step table, from phase 0 around to just before
+    a full turn, then plays it. The controller's walk state chooses
+    the section by the text it sends on each resume.
+    generator_intro reads from the splice point to the end of the
+    table, which is how a walk starts and how a new generator
+    starts after a swap. generator_outro reads from the start of
+    the table up to that splice, so the feet can stop on a pose
+    the next generator knows how to meet. generator_running ignores
+    the cut and reads the whole table, wrapping at the end.
     """
     global finish_ps, slow,  stop, finish_index
     height = params.height
@@ -227,7 +263,7 @@ def CmdVelGenerator(params, log=None):
     )
 
     # gen_advance_to_first_yield parks here.
-    cur_pose, status = yield None
+    cur_pose, generator_slice = yield None
     while True:
         # phase_index = 0
         org_pose = cur_pose
@@ -276,49 +312,61 @@ def CmdVelGenerator(params, log=None):
             else:
                 stop = False     
  
-        # Split the cycle at idx:
-        #   steps1 = idx .. end  — played while status == 'first'  (resume / start)
-        #   steps2 = 0 .. idx    — played while status == 'finish' (wind down)
+        # The table is cut at the splice. steps1 is the opening
+        # section, played while the walk state says generator_intro.
+        # steps2 is the ending section, played while it says
+        # generator_outro. generator_running does not use either
+        # cut. It reads steps from beginning to end.
         steps1 = steps[idx:]
-        steps2 = steps[:idx]   
-                    
-        
+        steps2 = steps[:idx]
+
         while True:
-            """
-            ps = kinematics.cmd_vel_new_point(
-                params.gait,
-                height,
-                phase_list[phase_index],
-                aep,
-                pep
-            )
-            """
-            if status == 'first':
+            if generator_slice == generator_intro:
+                # Opening section: from the splice toward the end of
+                # the table. The first pose of a new generator is
+                # compared with the pose the previous generator
+                # saved. A jump larger than 7 mm, or a splice that
+                # had to skip the seam, asks the controller for a
+                # 50 ms blend on this one wake. The saved pose is
+                # then cleared, so later wakes of this same opening
+                # do not ask again.
                 ps = steps1[phase_index]
                 if finish_ps:
-                    # largest per-foot jump from the previous generator's last pose
                     distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, finish_ps)])
                     if distances > 7 or stop:
-                        slow = True  # ask the servo loop for a 50 ms blend
+                        slow = True
                     finish_ps = []
                 else:
-                    slow = False    
+                    slow = False
                 phase_index = (phase_index + 1) % (len(steps) - idx)
-            elif status == 'finish':
-                # play the leftover prefix so the gait can halt near a stable pose
+            elif generator_slice == generator_outro:
+                # Ending section: from the start of the table up to
+                # the splice, so a stop can park on a pose the next
+                # generator can meet. Every pose of this section is
+                # written into finish_ps. The write that matters is
+                # the last one, because that is the pose the feet
+                # actually hold when the section wraps.
                 ps = steps2[phase_index]
                 phase_index = (phase_index + 1) % (idx)
-                finish_ps = ps  # hand this pose to the next CmdVelGenerator
+                finish_ps = ps
                 finish_index = phase_index
             else:
-                # normal running: wrap the full gait step
+                # generator_running, and any text that is neither
+                # the opening nor the ending. The whole gait step,
+                # seam included, one target after another.
                 ps = steps[phase_index]
                 phase_index = (phase_index + 1) % targets_per_gait_step
             if phase_index == 0:
-                # wrapped this slice — last_part True so the outer loop may switch generators
-                cur_pose, status = yield ps, True, params, slow
+                # The cursor wrapped, so this pose is the last
+                # target of whichever section we are in. last_part
+                # is True and the controller may order an outro or
+                # start a generator it stored earlier. The text that
+                # comes back on the resume is the walk state's new
+                # generator_slice, which is how the section changes
+                # without this function writing the walk state.
+                cur_pose, generator_slice = yield ps, True, params, slow
             else:
-                cur_pose, status = yield ps, False, params, slow
+                cur_pose, generator_slice = yield ps, False, params, slow
             # 两次初始姿态变了我们需要重算(stance pose object changed: recompute AEP/PEP and the cycle table)
             if cur_pose is not org_pose:
                 break
@@ -335,8 +383,9 @@ def CmdVelGenerator(params, log=None):
 # hexapod_kinematics does that job, and the safety gate can refuse
 # the result. With the flag off, the closed set_leg_position still does.
 #
-# Same handshake as CmdVelGenerator so a halt can finish a cycle and a new
-# Twist can splice on last_part without teleporting the feet.
+# Same three slice texts as CmdVelGenerator, so a halt can finish
+# through the ending section and a new Twist can start at the
+# splice on last_part without the feet jumping.
 # ---------------------------------------------------------------------------
 
 _PI = math.pi
@@ -438,15 +487,17 @@ def FollowGaitGenerator(params, log=None):
     only builds the generator object. The body runs when _GeneratorCall
     resumes it, and that method is what calls Python's send().
 
-    Handshake, same words as CmdVelGenerator:
-      gen_advance_to_first_yield once — run up to the first yield
-      slice word 'first'   — intro slice (steps1), startup or swap
-      slice word 'running' — the full baked cycle
-      slice word 'finish'  — outro slice (steps2), stash finish_ps
-    The bool beside each pose is last_part: True means this slice just
-    wrapped, so the controller may wind down or swap generators.
-    A new Twist does not edit this table. It builds a new generator and
-    waits for last_part.
+    The walk state uses the same three texts as CmdVelGenerator.
+    gen_advance_to_first_yield runs this function up to the first
+    yield, and no feet exist yet. generator_intro then reads the
+    opening section, from the splice to the end of the table, which
+    is a cold start and also the first period after a swap.
+    generator_running reads the whole table. generator_outro reads
+    the ending section and saves each pose into finish_ps. The bool
+    beside each pose is last_part. True means this section just
+    wrapped, so the controller may order an outro or start a
+    generator it stored earlier. A new Twist does not edit this
+    table. It builds a new generator and waits for last_part.
     """
     # `global` is a write permit, not an import. These four names already
     # exist at the top of this file and are shared with CmdVelGenerator.
@@ -508,12 +559,13 @@ def FollowGaitGenerator(params, log=None):
             f'stride_cap={stride_max:.0f} mm'
         )
 
-    # Prime. `cur_pose, status = yield None` gives None to the caller
+    # Prime. `cur_pose, generator_slice = yield None` gives None to the caller
     # and, on the next resume, receives whatever they pass.
     # gen_advance_to_first_yield only gets us here and discards the None.
-    # The first gen_next_mini_step_yield(stance, 'first') fills
-    # cur_pose and status.
-    cur_pose, status = yield None
+    # The first gen_next_mini_step_yield(stance, generator_intro)
+    # fills cur_pose and generator_slice. The controller starts
+    # every new generator on the opening section.
+    cur_pose, generator_slice = yield None
 
     # Outer loop, the animator. Bakes one full cycle into `steps`, then
     # the inner loop plays it. We come back here only when the controller
@@ -563,101 +615,113 @@ def FollowGaitGenerator(params, log=None):
             dists = [total_dist_sq(finish_ps, bi) for bi in steps]
             idx = min(range(len(dists)), key=lambda i: dists[i])
             if idx == 0:
-                # Target 0 would make the outro `steps[:0]` empty, and the
-                # first 'finish' mini-step would index that empty list.
-                # Start one target later. stop remembers that we refused
-                # the seam; the 'first' branch ORs it into the slow-blend
-                # test while finish_ps is still set.
+                # Target 0 would make the outro steps[:0] empty, and
+                # the first generator_outro wake would index that
+                # empty list. Start one target later. stop remembers
+                # that we refused the seam. The generator_intro branch
+                # uses that memory, while finish_ps is still set, to
+                # ask for the slow blend.
                 idx = 1
                 stop = True
             else:
                 stop = False
         else:
-            # No hand-off pose. That is a cold start, and also a rebake:
-            # the 'first' mini-step already cleared finish_ps, so a later stance
-            # change comes through here too. Leg 1 (the second tuple) stands
-            # at x = 0 in DEFAULT_POSE, so "leg 1's x closest to 0" means
-            # that foot is near its forward home. Search only the first half
-            # of the cycle; the second half is the other tripod.
+            # No hand-off pose. That is a cold start, and also a rebake.
+            # The opening section already cleared finish_ps, so a later
+            # stance change comes through here too. Leg 1 (the second
+            # tuple) stands at x = 0 in DEFAULT_POSE, so "leg 1's x
+            # closest to 0" means that foot is near its forward home.
+            # Search only the first half of the cycle. The second half
+            # is the other tripod.
             idx = min(range(len(steps) // 2), key=lambda i: abs(steps[i][1][0]))
             if idx == 0:
-                # Same empty-outro guard as the hand-off path. This branch
-                # does not arm the slow blend: finish_ps is empty, so the
-                # 'first' mini-step below takes the other arm and writes
-                # slow = False.
+                # Same empty-outro guard as the hand-off path. This
+                # branch does not arm the slow blend. finish_ps is
+                # empty, so the opening section below takes the other
+                # arm and writes slow = False.
                 idx = 1
                 stop = True
             else:
                 stop = False
 
-        # Cut the table at the splice. Target 0 is the seam, not "where
-        # the feet are now", so playback must be allowed to start mid-table.
-        # steps1, the intro: splice → end of the table. status 'first'.
-        # steps2, the outro: start of the table → splice. status 'finish'.
-        # status 'running' ignores both and plays `steps` whole.
+        # Cut the table at the splice. Target 0 is the seam, where
+        # the two tripods are at opposite extremes, so playback has
+        # to be allowed to start mid-table. steps1 is the opening
+        # section, played when generator_slice is generator_intro.
+        # steps2 is the ending section, played when it is
+        # generator_outro. generator_running ignores both cuts and
+        # reads the whole table.
         steps1 = steps[idx:]
         steps2 = steps[:idx]
 
-        # Inner loop. One yield per resume. At each yield we freeze;
-        # ~20 ms later gen_next_mini_step_yield passes the stance the
-        # controller still holds, plus the next slice word.
+        # Inner loop. One yield per resume. At each yield we freeze.
+        # About 20 ms later the controller resumes us with the stance
+        # it still holds, plus the next generator_slice. That text is
+        # how the walk state changes which section we read, without
+        # this function writing the walk state itself.
         while True:
-            if status == 'first':
-                # Intro: from the splice toward the end of the math cycle.
+            if generator_slice == generator_intro:
+                # Opening section: from the splice toward the end of
+                # the math cycle. Only the first wake of this section
+                # still has the saved pose from the previous
+                # generator. The largest single-toe jump to this
+                # target, in millimetres, is compared with 7. Over
+                # 7 mm, or a splice that skipped the seam, asks the
+                # controller for a 50 ms command on this one wake.
+                # The thread still sleeps 20 ms, and the next wake
+                # replaces that pulse. The saved pose is cleared
+                # here, or every later wake of the opening would
+                # run the test again.
                 ps = steps1[phase_index]
                 if finish_ps:
-                    # Only the first 'first' mini-step still has the stash.
-                    # The largest single-toe jump to this target, in
-                    # millimetres. Over 7 mm, or we skipped the seam
-                    # (stop), asks StepController for a 50 ms command on
-                    # this one mini-step (slow is True). The thread still
-                    # sleeps 20 ms; the next mini-step replaces that pulse.
                     distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, finish_ps)])
                     if distances > 7 or stop:
                         slow = True
-                    # Drop the stash now, or every later 'first' mini-step would
-                    # run this test again.
                     finish_ps = []
                 else:
-                    # Later 'first' mini-steps, and a cold start: ordinary timing.
+                    # Later wakes of the opening, and a cold start
+                    # that had nothing saved: ordinary 20 ms timing.
                     slow = False
-                # Advance inside the intro. Its length is
-                # targets_per_gait_step − idx,
-                # which is len(steps1). Wrapping this modulo is what makes
-                # phase_index == 0 at the end of the intro.
+                # Advance inside the opening. Its length is
+                # targets_per_gait_step minus idx, which is
+                # len(steps1). Wrapping this modulo is what makes
+                # phase_index come back to 0 at the end of the
+                # opening, and that 0 is what sets last_part.
                 phase_index = (phase_index + 1) % (len(steps) - idx)
-            elif status == 'finish':
-                # Outro: from the math seam back toward the splice, so a
-                # stop can park on the way to a pose the next generator
-                # knows how to meet.
+            elif generator_slice == generator_outro:
+                # Ending section: from the math seam back toward the
+                # splice, so a stop can park on a pose the next
+                # generator knows how to meet. Every pose is written
+                # into finish_ps. The write that matters is the one
+                # on the wrapping yield, because that pose is what
+                # the next generator splices against.
                 ps = steps2[phase_index]
-                # max(idx, 1) keeps this modulo off zero if idx were ever
-                # left at 0. The splice above already forces idx to 1.
+                # max(idx, 1) keeps this modulo off zero if idx were
+                # ever left at 0. The splice above already forces
+                # idx to 1.
                 phase_index = (phase_index + 1) % max(idx, 1)
-                # Overwrite the hand-off every finish mini-step. The write that
-                # matters is the one on the wrapping yield: that pose is
-                # what the next generator splices against.
                 finish_ps = ps
                 # Cursor after the increment. Stored, never read.
                 finish_index = phase_index
             else:
-                # 'running', and any word that is not 'first' or 'finish'.
-                # Full cycle, seam included.
+                # generator_running, and any text that is neither the
+                # opening nor the ending. The whole gait step, seam
+                # included. When targets_per_gait_step is 30, the
+                # step from 29 back to 0 is the wrap. The target we
+                # just took was the last one of this gait step.
                 ps = steps[phase_index]
-                # 29 + 1 wraps to 0 when targets_per_gait_step is 30.
-                # That 0 is the signal below; the target we just took
-                # was the last one of this gait step.
                 phase_index = (phase_index + 1) % targets_per_gait_step
 
             # The target was chosen first, then the cursor moved.
-            # Cursor 0 means the move wrapped, so `ps` is the last
-            # target of this slice. True: controller may enter 'finish'
-            # or swap in the queued generator. False: mid-slice, keep
-            # playing.
+            # Cursor 0 means the move wrapped, so this pose is the
+            # last target of whichever section we are in. True lets
+            # the controller order an outro or start a generator it
+            # stored earlier. False means we are still in the middle
+            # of the section.
             if phase_index == 0:
-                cur_pose, status = yield ps, True, params, slow
+                cur_pose, generator_slice = yield ps, True, params, slow
             else:
-                cur_pose, status = yield ps, False, params, slow
+                cur_pose, generator_slice = yield ps, False, params, slow
 
             # Wake-up, about 20 ms later. `is` checks the object, not the
             # millimetres. Gait ticks call set_pose_base(..., update_pose=

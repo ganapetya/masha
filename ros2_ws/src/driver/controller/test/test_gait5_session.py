@@ -80,7 +80,7 @@ def test_start_uses_the_flag_from_that_moment_and_defaults_false():
     assert hex_line == "gait 5 backend=hexapod"
 
 
-def test_an_allowed_target_finishes_in_one_mini_step_and_releases_the_boundary():
+def test_an_allowed_target_finishes_in_one_mini_step_and_accepts_the_gait_step():
     ik = AllowIk()
     stance = default_feet()
     target_feet_positions = tuple(
@@ -91,25 +91,27 @@ def test_an_allowed_target_finishes_in_one_mini_step_and_releases_the_boundary()
     session.begin_target(
         target_feet_positions, "params", False, last_part=True)
     assert session.waiting() is True
-    mini_step_result, delta, boundary = session.mini_step()
+    mini_step_result, delta, gait_step_accepted = session.mini_step()
     assert mini_step_result.decision == "sent"
     assert mini_step_result.alpha == 1.0
     assert delta == 1.0
-    assert boundary is True
+    assert gait_step_accepted is True
     assert session.waiting() is False
     assert session.anchor is target_feet_positions
-    # The next target is a new begin. The boundary does not stick.
+    # The next target is a new begin. Accepting the gait step on
+    # the target that just finished does not make the next target
+    # accepted as well.
     session.begin_target(stance, "params", False, last_part=False)
-    mini_step_result, delta, boundary = session.mini_step()
+    mini_step_result, delta, gait_step_accepted = session.mini_step()
     assert mini_step_result.decision == "sent"
     assert delta == 1.0
-    assert boundary is False
+    assert gait_step_accepted is False
     whole = odometry_increment(0.12, 0.10, 0.6, delta_alpha=1.0)
     once = odometry_increment(0.12, 0.10, 0.6, delta_alpha=delta)
     assert once == pytest.approx(whole)
 
 
-def test_a_partial_target_stays_open_and_the_boundary_waits():
+def test_a_partial_target_stays_open_until_the_gait_step_is_accepted():
     ik = HexapodLegIk()
     anchor = default_feet()
     session = Gait5Session("generator", ik, "hexapod")
@@ -118,7 +120,7 @@ def test_a_partial_target_stays_open_and_the_boundary_waits():
     session.begin_target(
         target_feet_positions, "params", True, last_part=True)
     deltas = []
-    boundary = False
+    gait_step_accepted = False
     mini_step_result = None
     for _ in range(300):
         assert session.waiting()
@@ -126,16 +128,16 @@ def test_a_partial_target_stays_open_and_the_boundary_waits():
         assert held_feet is target_feet_positions
         assert params == "params"
         assert slow is True
-        mini_step_result, delta, boundary = session.mini_step()
+        mini_step_result, delta, gait_step_accepted = session.mini_step()
         deltas.append(delta)
         if mini_step_result.decision == "sent":
             break
-        assert boundary is False
+        assert gait_step_accepted is False
         assert session.anchor is anchor
     assert mini_step_result is not None
     assert mini_step_result.decision == "sent"
     assert mini_step_result.alpha == 1.0
-    assert boundary is True
+    assert gait_step_accepted is True
     assert session.waiting() is False
     assert deltas[0] < 1.0
     assert sum(deltas) == pytest.approx(1.0)
@@ -151,7 +153,7 @@ def test_a_partial_target_stays_open_and_the_boundary_waits():
     assert pieces[-1][3] != pytest.approx(twist[0] * 0.02)
 
 
-def test_a_hold_does_not_move_alpha_or_release_the_boundary():
+def test_a_hold_does_not_move_alpha_or_accept_the_gait_step():
     stance = default_feet()
     target_feet_positions = tuple(stance)
     ik = HoldIk(target_feet_positions)
@@ -159,19 +161,19 @@ def test_a_hold_does_not_move_alpha_or_release_the_boundary():
     session.attach(stance)
     session.begin_target(
         target_feet_positions, "params", False, last_part=True)
-    mini_step_result, delta, boundary = session.mini_step()
+    mini_step_result, delta, gait_step_accepted = session.mini_step()
     assert mini_step_result.decision == "held"
     assert mini_step_result.reason == "unreachable"
     assert mini_step_result.publish is False
     assert delta == 0.0
-    assert boundary is False
+    assert gait_step_accepted is False
     assert session.waiting() is True
     assert session.held()[0] is target_feet_positions
-    again, delta2, boundary2 = session.mini_step()
+    again, delta2, gait_step_accepted2 = session.mini_step()
     assert again.decision == "held"
     assert again.alpha_done == mini_step_result.alpha_done
     assert delta2 == 0.0
-    assert boundary2 is False
+    assert gait_step_accepted2 is False
     assert odometry_increment(0.12, 0.1, 0.6, delta_alpha=delta2) == (
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 

@@ -12,28 +12,38 @@ import pytest
 # step_controller imports that module.
 StepController = None
 _MiniStepInput = None
-_WalkHandshake = None
+_WalkState = None
 _is_hunter_gait = None
 CmdVelParams = None
 MovingParams = None
+generator_intro = None
+generator_running = None
+generator_outro = None
 
 
 @pytest.fixture(autouse=True)
 def _load_controller():
-    global StepController, _MiniStepInput, _WalkHandshake, _is_hunter_gait
+    global StepController, _MiniStepInput, _WalkState, _is_hunter_gait
     global CmdVelParams, MovingParams
+    global generator_intro, generator_running, generator_outro
     from controller.move import CmdVelParams as cmd_params
     from controller.move import MovingParams as move_params
+    from controller.move import generator_intro as intro_text
+    from controller.move import generator_running as running_text
+    from controller.move import generator_outro as outro_text
     from controller.step_controller import StepController as controller
     from controller.step_controller import _MiniStepInput as input_type
-    from controller.step_controller import _WalkHandshake as handshake_type
+    from controller.step_controller import _WalkState as walk_state_type
     from controller.step_controller import _is_hunter_gait as hunter_check
     StepController = controller
     _MiniStepInput = input_type
-    _WalkHandshake = handshake_type
+    _WalkState = walk_state_type
     _is_hunter_gait = hunter_check
     CmdVelParams = cmd_params
     MovingParams = move_params
+    generator_intro = intro_text
+    generator_running = running_text
+    generator_outro = outro_text
 
 
 class _Log:
@@ -100,7 +110,7 @@ def test_discrete_boundary_swaps_immediately():
     nxt = object()
     step.cur_moving_generator = object()
     step.new_moving_generator = nxt
-    _WalkHandshake().honor_boundary(step, MovingParams(gait=2))
+    _WalkState().after_accepted_gait_step(step, MovingParams(gait=2))
     assert step.cur_moving_generator is nxt
     assert step.linear_x == 1
 
@@ -109,7 +119,7 @@ def test_discrete_boundary_with_nothing_queued_zeros_twist():
     step = _step()
     step.cur_moving_generator = object()
     step.new_moving_generator = None
-    _WalkHandshake().honor_boundary(step, MovingParams(gait=2))
+    _WalkState().after_accepted_gait_step(step, MovingParams(gait=2))
     assert step.cur_moving_generator is None
     assert (step.linear_x, step.linear_y, step.angular_z) == (0, 0, 0)
 
@@ -120,17 +130,20 @@ def test_cmd_vel_boundary_winds_down_before_the_swap():
     nxt = object()
     step.cur_moving_generator = current
     step.new_moving_generator = nxt
-    handshake = _WalkHandshake()
-    handshake.honor_boundary(step, CmdVelParams(gait=2))
+    walk_state = _WalkState()
+    walk_state.after_accepted_gait_step(step, CmdVelParams(gait=2))
     assert step.cur_moving_generator is current
-    assert handshake.send_status == 'finish'
-    assert handshake.last_status == 'stop'
-    assert handshake.pending is nxt
-    handshake.last_status = 'finish'
-    handshake.honor_boundary(step, CmdVelParams(gait=2))
+    assert walk_state.generator_slice == generator_outro
+    assert walk_state.generator_outro_order == 'ordered'
+    assert walk_state.pending_generator_after_outro is nxt
+    # The tick would make this move after sending the feet. The
+    # test does that write itself, then asks for the next accepted
+    # gait step, which is the one that starts the stored generator.
+    walk_state.generator_outro_order = 'in_effect'
+    walk_state.after_accepted_gait_step(step, CmdVelParams(gait=2))
     assert step.cur_moving_generator is nxt
-    assert handshake.send_status == 'first'
-    assert handshake.last_status == 'start'
+    assert walk_state.generator_slice == generator_intro
+    assert walk_state.generator_outro_order == 'off'
 
 
 def test_legacy_last_part_is_honored_before_the_tick():
@@ -139,7 +152,7 @@ def test_legacy_last_part_is_honored_before_the_tick():
     feet = ((1, 2, 3),)
     step.cur_moving_generator = _Gen((feet, True, MovingParams(gait=2), False))
     step.new_moving_generator = nxt
-    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkState())
     assert mini_step_input.hunter is False
     assert mini_step_input.moving_pose == feet
     assert step.cur_moving_generator is nxt
@@ -151,11 +164,11 @@ def test_hunter_last_part_does_not_swap_during_the_pull():
     nxt = object()
     step.cur_moving_generator = gen
     step.new_moving_generator = nxt
-    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkState())
     assert mini_step_input.hunter is True
     assert mini_step_input.last_part is True
     assert step.cur_moving_generator is gen
-    assert gen.sent == [('pose', 'first')]
+    assert gen.sent == [('pose', generator_intro)]
 
 
 def test_waiting_hunter_target_is_not_sent_again():
@@ -166,7 +179,7 @@ def test_waiting_hunter_target_is_not_sent_again():
     gen = _Gen(error=AssertionError(
         'gen_next_mini_step_yield dropped the open target'))
     step.cur_moving_generator = gen
-    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkState())
     assert mini_step_input.hunter is True
     assert mini_step_input.reused is True
     assert mini_step_input.moving_pose == feet
@@ -179,7 +192,7 @@ def test_vendor_cmd_vel_is_a_legacy_mini_step():
     feet = ((1, 0, 0),)
     gen = _Gen((feet, False, params, False))
     step.cur_moving_generator = gen
-    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkState())
     assert mini_step_input.hunter is False
     assert mini_step_input.moving_pose == feet
 
@@ -187,7 +200,7 @@ def test_vendor_cmd_vel_is_a_legacy_mini_step():
 def test_a_dead_generator_leaves_no_feet():
     step = _step()
     step.cur_moving_generator = _Gen(error=StopIteration())
-    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkState())
     assert mini_step_input.moving_pose is None
     assert step.cur_moving_generator is None
 
@@ -204,9 +217,9 @@ def test_legacy_tick_uses_set_pose_base_and_a_full_20_ms():
     mini_step_input.moving_pose = ((1, 2, 3),)
     mini_step_input.params = CmdVelParams(gait=2, velocity_x=1000, velocity_y=0, angular_z=0)
     mini_step_input.slow = False
-    handshake = _WalkHandshake()
-    handshake.send_status = 'running'
-    StepController._tick_legacy_gait(step, mini_step_input, 'lean', handshake)
+    walk_state = _WalkState()
+    walk_state.generator_slice = generator_running
+    StepController._tick_legacy_gait(step, mini_step_input, 'lean', walk_state)
     assert calls == [(
         (mini_step_input.moving_pose, 0.02),
         {'pseudo': False, 'update_pose': False})]
@@ -227,13 +240,13 @@ def test_legacy_first_slice_blends_for_50_ms_and_a_move_does_not_integrate():
     mini_step_input.moving_pose = ((1, 2, 3),)
     mini_step_input.params = MovingParams(gait=2)
     mini_step_input.slow = False
-    StepController._tick_legacy_gait(step, mini_step_input, 'lean', _WalkHandshake())
+    StepController._tick_legacy_gait(step, mini_step_input, 'lean', _WalkState())
     assert calls == [0.02]
     assert step.linear_x == 1
 
     mini_step_input.slow = True
     mini_step_input.params = CmdVelParams(gait=2, velocity_x=0, velocity_y=0, angular_z=0)
-    StepController._tick_legacy_gait(step, mini_step_input, 'lean', _WalkHandshake())
+    StepController._tick_legacy_gait(step, mini_step_input, 'lean', _WalkState())
     assert calls == [0.02, 0.05]
 
 
@@ -263,7 +276,7 @@ def test_hunter_mini_step_begins_a_new_target_and_publishes_radians():
     mini_step_input.slow = False
     mini_step_input.last_part = True
     mini_step_input.hunter = True
-    StepController._tick_hunter_gait(step, mini_step_input, 'stance', 'lean', _WalkHandshake())
+    StepController._tick_hunter_gait(step, mini_step_input, 'stance', 'lean', _WalkState())
     assert opened == [(((9, 9, 9),), True)]
     assert published == [0.02]
     assert integrated == [0.5]
@@ -279,8 +292,9 @@ def test_hunter_reuse_does_not_open_and_a_boundary_winds_down():
     step.new_moving_generator = nxt
 
     class Session:
-        # Gait 5 is a velocity walk. The boundary winds down; it does
-        # not install the queued generator on this same call.
+        # Gait 5 is a velocity walk. An accepted gait step orders
+        # the outro. It does not install the queued generator on
+        # this same call.
         params = CmdVelParams(gait=5)
         slow = False
 
@@ -299,13 +313,16 @@ def test_hunter_reuse_does_not_open_and_a_boundary_winds_down():
     mini_step_input.params = CmdVelParams(gait=5)
     mini_step_input.slow = False
     mini_step_input.reused = True
-    handshake = _WalkHandshake()
-    StepController._tick_hunter_gait(step, mini_step_input, 'stance', 'lean', handshake)
+    walk_state = _WalkState()
+    StepController._tick_hunter_gait(step, mini_step_input, 'stance', 'lean', walk_state)
     assert opened == []
     assert step.cur_moving_generator is current
-    assert handshake.pending is nxt
-    assert handshake.send_status == 'finish'
-    assert handshake.last_status == 'finish'
+    assert walk_state.pending_generator_after_outro is nxt
+    assert walk_state.generator_slice == generator_outro
+    # The tick both orders the outro and, after the publish,
+    # moves the order to in_effect. 'ordered' does not outlive
+    # the wake.
+    assert walk_state.generator_outro_order == 'in_effect'
 
 
 class _StepResult:
