@@ -13,8 +13,9 @@ def PoseTransformer(params:PoseTransformerParams):
     """
     使用平移变换加欧拉角改变机器人的姿态
     (Change body pose by a translation plus xyz Euler rotation.
-     Generator: send(None) to prime, then send((org_pose, cur_transform))
-     and receive (pose, transform, last_part). last_part is True on the final frame.)
+     Generator: gen_advance_to_first_yield once, then
+     gen_next_lean_slice(org_pose, cur_transform). That returns
+     (pose, transform, last_part). last_part is True on the final slice.)
     :param translate: 机体中心偏移的平移变换 (x, y, z)(body-center translation)
     :param rotation: 欧拉角的元组, 'xyz'(xyz Euler tuple)
     :param duration: 完成这个变换的用时(time to complete this transform, seconds)
@@ -27,7 +28,9 @@ def PoseTransformer(params:PoseTransformerParams):
     u, v, w = params.rotation
 
 
-    org_pose, cur_transform = yield None  # prime: wait for the current 6-leg pose and body transform
+    # gen_advance_to_first_yield parks here. The next resume fills
+    # org_pose and cur_transform from the current feet and body transform.
+    org_pose, cur_transform = yield None
 
     # 当前机器人相对于最初始的变换(body transform already applied on top of the last set_build_in_pose)
     (org_x, org_y, org_z), (org_u, org_v, org_w) = cur_transform

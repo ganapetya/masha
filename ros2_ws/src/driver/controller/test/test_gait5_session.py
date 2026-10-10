@@ -1,6 +1,7 @@
-# The unfinished gait-5 frame. No robot, and no 20 ms thread.
-# The loop's job is to call these in order and not to call send()
-# while waiting() is true. That order is what these tests lock.
+# The unfinished gait-5 target. No robot, and no 20 ms thread.
+# The loop's job is to call these in order and not to call
+# gen_next_mini_step_yield while waiting() is true. That order
+# is what these tests lock.
 
 import os
 import sys
@@ -17,11 +18,11 @@ from controller.leg_ik import (
     read_max_step_rad,
     start_gait5,
 )
-from test_leg_ik import _rate_limit_frame, default_feet
+from test_leg_ik import _rate_limit_target, default_feet
 
 
 class AllowIk(object):
-    """Every foot is legal. One tick finishes the frame."""
+    """Every foot is legal. One mini-step finishes the target."""
 
     def __init__(self):
         self.previous = None
@@ -43,12 +44,12 @@ class AllowIk(object):
 class HoldIk(object):
     """The generator's own feet are unreachable. Nothing is published."""
 
-    def __init__(self, frame):
-        self.frame = frame
+    def __init__(self, target_feet_positions):
+        self.target_feet_positions = target_feet_positions
         self.previous = (0.0,) * 18
 
     def solve(self, pose):
-        if pose is self.frame:
+        if pose is self.target_feet_positions:
             return IkDecision(
                 False, (0.0,) * 18, "unreachable", 0, 4, 0.0, 0.0)
         return IkDecision(True, (0.1,) * 18, "", 0, 0, 0.0, 0.0)
@@ -79,27 +80,28 @@ def test_start_uses_the_flag_from_that_moment_and_defaults_false():
     assert hex_line == "gait 5 backend=hexapod"
 
 
-def test_an_allowed_frame_finishes_in_one_tick_and_releases_the_boundary():
+def test_an_allowed_target_finishes_in_one_mini_step_and_releases_the_boundary():
     ik = AllowIk()
     stance = default_feet()
-    frame = tuple(
+    target_feet_positions = tuple(
         (foot[0] + 1.0, foot[1], foot[2]) for foot in stance)
     session = Gait5Session("generator", ik, "vendor")
     assert session.attach(stance).allow is True
     assert session.anchor is stance
-    session.open_frame(frame, "params", False, last_part=True)
+    session.begin_target(
+        target_feet_positions, "params", False, last_part=True)
     assert session.waiting() is True
-    step, delta, boundary = session.step()
-    assert step.decision == "sent"
-    assert step.alpha == 1.0
+    mini_step_result, delta, boundary = session.mini_step()
+    assert mini_step_result.decision == "sent"
+    assert mini_step_result.alpha == 1.0
     assert delta == 1.0
     assert boundary is True
     assert session.waiting() is False
-    assert session.anchor is frame
-    # The next film frame is a new open. The boundary does not stick.
-    session.open_frame(stance, "params", False, last_part=False)
-    step, delta, boundary = session.step()
-    assert step.decision == "sent"
+    assert session.anchor is target_feet_positions
+    # The next target is a new begin. The boundary does not stick.
+    session.begin_target(stance, "params", False, last_part=False)
+    mini_step_result, delta, boundary = session.mini_step()
+    assert mini_step_result.decision == "sent"
     assert delta == 1.0
     assert boundary is False
     whole = odometry_increment(0.12, 0.10, 0.6, delta_alpha=1.0)
@@ -107,31 +109,32 @@ def test_an_allowed_frame_finishes_in_one_tick_and_releases_the_boundary():
     assert once == pytest.approx(whole)
 
 
-def test_a_partial_frame_stays_open_and_the_boundary_waits():
+def test_a_partial_target_stays_open_and_the_boundary_waits():
     ik = HexapodLegIk()
     anchor = default_feet()
     session = Gait5Session("generator", ik, "hexapod")
     assert session.attach(anchor).allow is True
-    frame = _rate_limit_frame(ik, anchor)
-    session.open_frame(frame, "params", True, last_part=True)
+    target_feet_positions = _rate_limit_target(ik, anchor)
+    session.begin_target(
+        target_feet_positions, "params", True, last_part=True)
     deltas = []
     boundary = False
-    step = None
+    mini_step_result = None
     for _ in range(300):
         assert session.waiting()
         held_feet, params, slow = session.held()
-        assert held_feet is frame
+        assert held_feet is target_feet_positions
         assert params == "params"
         assert slow is True
-        step, delta, boundary = session.step()
+        mini_step_result, delta, boundary = session.mini_step()
         deltas.append(delta)
-        if step.decision == "sent":
+        if mini_step_result.decision == "sent":
             break
         assert boundary is False
         assert session.anchor is anchor
-    assert step is not None
-    assert step.decision == "sent"
-    assert step.alpha == 1.0
+    assert mini_step_result is not None
+    assert mini_step_result.decision == "sent"
+    assert mini_step_result.alpha == 1.0
     assert boundary is True
     assert session.waiting() is False
     assert deltas[0] < 1.0
@@ -143,36 +146,37 @@ def test_a_partial_frame_stays_open_and_the_boundary_waits():
     for index in range(6):
         assert sum(piece[index] for piece in pieces) == pytest.approx(
             whole[index])
-    # The finishing tick is only the leftover fraction.
+    # The finishing mini-step is only the leftover fraction.
     assert pieces[-1][3] == pytest.approx(twist[0] * 0.02 * deltas[-1])
     assert pieces[-1][3] != pytest.approx(twist[0] * 0.02)
 
 
 def test_a_hold_does_not_move_alpha_or_release_the_boundary():
     stance = default_feet()
-    frame = tuple(stance)
-    ik = HoldIk(frame)
+    target_feet_positions = tuple(stance)
+    ik = HoldIk(target_feet_positions)
     session = Gait5Session("generator", ik, "hexapod")
     session.attach(stance)
-    session.open_frame(frame, "params", False, last_part=True)
-    step, delta, boundary = session.step()
-    assert step.decision == "held"
-    assert step.reason == "unreachable"
-    assert step.publish is False
+    session.begin_target(
+        target_feet_positions, "params", False, last_part=True)
+    mini_step_result, delta, boundary = session.mini_step()
+    assert mini_step_result.decision == "held"
+    assert mini_step_result.reason == "unreachable"
+    assert mini_step_result.publish is False
     assert delta == 0.0
     assert boundary is False
     assert session.waiting() is True
-    assert session.held()[0] is frame
-    again, delta2, boundary2 = session.step()
+    assert session.held()[0] is target_feet_positions
+    again, delta2, boundary2 = session.mini_step()
     assert again.decision == "held"
-    assert again.alpha_done == step.alpha_done
+    assert again.alpha_done == mini_step_result.alpha_done
     assert delta2 == 0.0
     assert boundary2 is False
     assert odometry_increment(0.12, 0.1, 0.6, delta_alpha=delta2) == (
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
-def test_the_step_limit_is_the_measured_peak_times_the_margin():
+def test_max_step_rad_is_the_measured_peak_times_the_margin():
     # Vendor pseudo cycle, Twist +0.12 m/s, +0.10 m/s, +0.6 rad/s,
     # period 0.60 s, lift 35 mm. safety.cpp names that command.
     assert read_max_step_rad() == pytest.approx(0.17622116866774196 * 1.5)

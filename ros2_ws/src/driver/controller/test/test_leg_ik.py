@@ -1,5 +1,5 @@
 # Catch-up beside leg_ik.py. No robot, and no kinematics.so.
-# A refused frame is a returned step. The generator is not involved.
+# A refused target is a returned mini-step result. The generator is not involved.
 
 import math
 import sys
@@ -13,14 +13,14 @@ from controller.leg_ik import (
     TRACE_PATH_DEFAULT,
     TRACE_QUEUE_BOUND,
     USE_HEXAPOD_KINEMATICS_DEFAULT,
-    FrameStep,
+    MiniStepResult,
     HexapodLegIk,
     HoldWatch,
     IkDecision,
     SecondLog,
     TraceWriter,
     VendorLegIk,
-    approach_frame,
+    approach_target,
     begin_generator,
     make_leg_ik,
     odometry_increment,
@@ -87,15 +87,15 @@ class Clock(object):
 class ScriptedIk(object):
     """Allows every pose except the generator's own object, until told."""
 
-    def __init__(self, frame):
-        self.frame = frame
+    def __init__(self, target_feet_positions):
+        self.target_feet_positions = target_feet_positions
         self.previous = (0.0,) * 18
-        self.allow_frame = False
+        self.allow_target = False
         self.calls = []
 
     def solve(self, pose):
         self.calls.append(pose)
-        if pose is self.frame and not self.allow_frame:
+        if pose is self.target_feet_positions and not self.allow_target:
             return IkDecision(
                 False, (1.0,) * 18, "rate_limit", 8, 3, 1.0, 0.0)
         return IkDecision(True, (0.1,) * 18, "", 0, 0, 0.0, 0.0)
@@ -107,7 +107,7 @@ class ScriptedIk(object):
 def _near_straight_feet():
     # 0.02 mm short of straight, level with the femur hinge, leg 6.
     # That close, a 0.5 mm slip moves the knee past the measured
-    # step limit. A foot 0.2 mm short does not.
+    # joint limit. A foot 0.2 mm short does not.
     coxa = 45.0
     femur = 77.1
     tibia = 115.6
@@ -122,19 +122,19 @@ def _near_straight_feet():
     return tuple(feet)
 
 
-def _rate_limit_frame(ik, anchor):
-    """A legal foot move whose full frame exceeds one step."""
+def _rate_limit_target(ik, anchor):
+    """A legal foot move whose full target exceeds one joint limit."""
     foot = anchor[0]
     for millimetres in (5, 10, 15, 20, 30, 40, 60, 80):
-        frame = list(anchor)
-        frame[0] = (foot[0] + millimetres, foot[1], foot[2])
-        frame = tuple(frame)
-        decision = ik.solve(frame)
+        target_feet_positions = list(anchor)
+        target_feet_positions[0] = (foot[0] + millimetres, foot[1], foot[2])
+        target_feet_positions = tuple(target_feet_positions)
+        decision = ik.solve(target_feet_positions)
         if decision.reason == "rate_limit":
-            return frame
+            return target_feet_positions
         if decision.reason not in ("",):
             raise AssertionError(decision.reason)
-    raise AssertionError("no rate_limit frame along +X")
+    raise AssertionError("no rate_limit target along +X")
 
 
 def test_the_flag_defaults_to_the_vendor_backend():
@@ -164,33 +164,37 @@ def test_startup_line_names_the_measured_peak():
     assert "measured_peak=0.04" in text
 
 
-def test_step_one_solves_the_generator_feet_and_0996_stays_partial():
-    frame = tuple(default_feet())
-    ik = ScriptedIk(frame)
-    step = approach_frame(ik, frame, frame, 0.0)
-    assert ik.calls[0] is frame
-    assert step.decision == "partial"
-    assert step.alpha == pytest.approx(255.0 / 256.0)
-    assert step.alpha < 1.0
-    assert step.alpha_done == step.alpha
-    assert step.publish is True
-    assert step.reason == "rate_limit"
-    # A later tick on the same frame still waits for those exact feet.
-    later = approach_frame(ik, frame, frame, step.alpha_done)
+def test_approach_solves_the_generator_feet_and_0996_stays_partial():
+    target_feet_positions = tuple(default_feet())
+    ik = ScriptedIk(target_feet_positions)
+    mini_step_result = approach_target(
+        ik, target_feet_positions, target_feet_positions, 0.0)
+    assert ik.calls[0] is target_feet_positions
+    assert mini_step_result.decision == "partial"
+    assert mini_step_result.alpha == pytest.approx(255.0 / 256.0)
+    assert mini_step_result.alpha < 1.0
+    assert mini_step_result.alpha_done == mini_step_result.alpha
+    assert mini_step_result.publish is True
+    assert mini_step_result.reason == "rate_limit"
+    # A later mini-step on the same target still waits for those feet.
+    later = approach_target(
+        ik, target_feet_positions, target_feet_positions,
+        mini_step_result.alpha_done)
     assert later.decision == "partial"
     assert later.alpha < 1.0
-    assert later.alpha_done > step.alpha_done
-    ik.allow_frame = True
-    done = approach_frame(ik, frame, frame, later.alpha_done)
+    assert later.alpha_done > mini_step_result.alpha_done
+    ik.allow_target = True
+    done = approach_target(
+        ik, target_feet_positions, target_feet_positions, later.alpha_done)
     assert done.decision == "sent"
     assert done.alpha == 1.0
     assert done.alpha_done == 1.0
-    assert ik.calls[-1] is frame
+    assert ik.calls[-1] is target_feet_positions
     assert should_publish(done, pseudo=True) is False
     assert should_publish(done, pseudo=False) is True
 
 
-def test_odometry_leftover_is_not_a_full_tick():
+def test_odometry_leftover_is_not_a_full_mini_step():
     twist = (0.12, -0.05, 0.6)
     full = odometry_increment(*twist, delta_alpha=1.0)
     early = odometry_increment(*twist, delta_alpha=0.25)
@@ -201,7 +205,7 @@ def test_odometry_leftover_is_not_a_full_tick():
         assert whole == pytest.approx(left + right)
     # Stored velocity is the command scaled by the fraction.
     assert rest[0] == pytest.approx(twist[0] * 0.75)
-    # Integrated body step is that velocity over one tick.
+    # Integrated body move is that velocity over one mini-step.
     assert rest[3] == pytest.approx(twist[0] * TICK_S * 0.75)
     assert rest[3] != pytest.approx(twist[0] * TICK_S)
 
@@ -227,10 +231,10 @@ def test_the_writer_appends_a_header_and_a_row(tmp_path):
     path = tmp_path / "hexapod_ik_trace.csv"
     log = Log()
     writer = TraceWriter(str(path), log)
-    step = FrameStep(
+    mini_step_result = MiniStepResult(
         "sent", 1.0, 1.0, (0.1,) * 18, "", 0, 0, 0.0, 0.0,
         default_feet(), default_feet(), ("",) * 18, True)
-    row = trace_row(1.5, "vendor", step)
+    row = trace_row(1.5, "vendor", mini_step_result)
     assert len(row) == len(TRACE_COLUMNS)
     assert writer.put(row) is True
     writer.close()
@@ -253,7 +257,7 @@ def test_five_hard_holds_log_one_error_and_a_partial_resets():
     log = Log()
     watch = HoldWatch()
     feet = default_feet()
-    held = FrameStep(
+    held = MiniStepResult(
         "held", 0.0, 0.0, (0.0,) * 18, "unreachable", 0, 4,
         0.0, 0.0, feet, feet, ("",) * 18, False)
     for _ in range(4):
@@ -263,10 +267,10 @@ def test_five_hard_holds_log_one_error_and_a_partial_resets():
     watch.note(log, held)
     assert watch.errors == 1
     assert log.errors == [
-        "holding last safe pose, generator frame frozen"]
+        "holding last safe pose, generator target frozen"]
     watch.note(log, held)
     assert watch.errors == 1
-    partial = FrameStep(
+    partial = MiniStepResult(
         "partial", 0.5, 0.5, (0.1,) * 18, "rate_limit", 8, 3,
         1.0, 0.0, feet, feet, (0.01,) * 18, True)
     watch.note(log, partial)
@@ -292,15 +296,15 @@ def test_stand_is_sent_and_matches_the_vendor_tape():
     feet = default_feet()
     reference = ik.establish_reference(feet)
     assert reference.allow is True
-    step = approach_frame(ik, feet, feet, 0.0)
-    assert step.decision == "sent"
-    assert step.alpha == 1.0
-    assert step.publish is True
-    assert step.reason == ""
+    mini_step_result = approach_target(ik, feet, feet, 0.0)
+    assert mini_step_result.decision == "sent"
+    assert mini_step_result.alpha == 1.0
+    assert mini_step_result.publish is True
+    assert mini_step_result.reason == ""
     flat = []
     for triple in STAND:
         flat.extend(triple)
-    for got, want in zip(step.angles, flat):
+    for got, want in zip(mini_step_result.angles, flat):
         assert abs(got - want) <= 0.005
 
 
@@ -312,7 +316,7 @@ def test_unreachable_and_near_singular_hold_without_moving_alpha():
     far = list(feet)
     far[3] = (0.0, 0.0, 500.0)
     far = tuple(far)
-    held = approach_frame(ik, feet, far, 0.25)
+    held = approach_target(ik, feet, far, 0.25)
     assert held.decision == "held"
     assert held.reason == "unreachable"
     assert held.leg == 4
@@ -321,7 +325,7 @@ def test_unreachable_and_near_singular_hold_without_moving_alpha():
     assert held.publish is False
     assert ik.previous is previous
     straight = _near_straight_feet()
-    knee = approach_frame(ik, feet, straight, 0.25)
+    knee = approach_target(ik, feet, straight, 0.25)
     assert knee.decision == "held"
     assert knee.reason == "near_singular"
     assert knee.leg == 6
@@ -332,32 +336,33 @@ def test_unreachable_and_near_singular_hold_without_moving_alpha():
 def test_no_reference_holds_when_the_stand_was_not_solved():
     ik = HexapodLegIk()
     feet = default_feet()
-    held = approach_frame(ik, feet, feet, 0.0)
+    held = approach_target(ik, feet, feet, 0.0)
     assert held.decision == "held"
     assert held.reason == "no_reference"
     assert held.publish is False
     assert ik.previous is None
 
 
-def test_a_long_legal_frame_sums_its_alphas_to_one():
+def test_a_long_legal_target_sums_its_alphas_to_one():
     ik = HexapodLegIk()
     anchor = default_feet()
     assert ik.establish_reference(anchor).allow is True
-    frame = _rate_limit_frame(ik, anchor)
+    target_feet_positions = _rate_limit_target(ik, anchor)
     alpha_done = 0.0
     deltas = []
     first = None
     finished = None
     for _ in range(BISECTION_PARTS + 8):
         before = alpha_done
-        step = approach_frame(ik, anchor, frame, alpha_done)
-        assert step.decision != "held"
+        mini_step_result = approach_target(
+            ik, anchor, target_feet_positions, alpha_done)
+        assert mini_step_result.decision != "held"
         if first is None:
-            first = step
-        deltas.append(step.alpha_done - before)
-        alpha_done = step.alpha_done
-        if step.decision == "sent":
-            finished = step
+            first = mini_step_result
+        deltas.append(mini_step_result.alpha_done - before)
+        alpha_done = mini_step_result.alpha_done
+        if mini_step_result.decision == "sent":
+            finished = mini_step_result
             break
     assert first.decision == "partial"
     assert first.alpha < 1.0
@@ -388,15 +393,15 @@ def test_a_same_foot_branch_flip_is_a_hold():
     shifted = list(ik.previous)
     shifted[1] = shifted[1] + 1.0
     ik.previous = tuple(shifted)
-    frame = list(feet)
-    frame[0] = (feet[0][0] + 1.0, feet[0][1], feet[0][2])
-    frame = tuple(frame)
+    target_feet_positions = list(feet)
+    target_feet_positions[0] = (feet[0][0] + 1.0, feet[0][1], feet[0][2])
+    target_feet_positions = tuple(target_feet_positions)
     before = ik.previous
-    step = approach_frame(ik, feet, frame, 0.0)
-    assert step.decision == "held"
-    assert step.reason == "rate_limit"
-    assert step.alpha == 0.0
-    assert step.alpha_done == 0.0
-    assert step.publish is False
+    mini_step_result = approach_target(ik, feet, target_feet_positions, 0.0)
+    assert mini_step_result.decision == "held"
+    assert mini_step_result.reason == "rate_limit"
+    assert mini_step_result.alpha == 0.0
+    assert mini_step_result.alpha_done == 0.0
+    assert mini_step_result.publish is False
     assert ik.previous is before
-    assert should_publish(step) is False
+    assert should_publish(mini_step_result) is False

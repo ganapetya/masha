@@ -45,16 +45,17 @@ from servo_controller_msgs.msg import ServosPosition
 
 
 def _is_hunter_gait(params):
-    """Return True when this frame is the hunter follow walk, gait 5."""
+    """Return True when this mini-step is the hunter follow walk, gait 5."""
     return isinstance(params, CmdVelParams) and params.gait == 5
 
 
 class _WalkHandshake:
     """Cmd_vel switch state for the life of the loop thread.
 
-    send_status is the word passed into generator.send. last_status
-    is how far a wind-down has got. pending is the next generator,
-    held while the current one plays its finish slice.
+    send_status is the slice word passed into
+    gen_next_mini_step_yield. last_status is how far a wind-down
+    has got. pending is the next generator, held while the current
+    one plays its finish slice.
     """
 
     def __init__(self):
@@ -66,43 +67,51 @@ class _WalkHandshake:
         self.last_status = 'start'
         self.pending = None
 
-    def honor_boundary(self, step, params):
-        """Swap or wind down on a step boundary the walker accepted.
+    def honor_boundary(self, controller, params):
+        """Swap or wind down on a gait-step boundary the walker accepted.
 
-        A counted step (MovingParams) swaps on this call. A velocity
+        A counted walk (MovingParams) swaps on this call. A velocity
         walk (CmdVelParams) is told 'finish' first, and the queued
         generator starts only on the later boundary. Gait 5 calls
-        this after the gate has accepted the frame. An earlier call
-        would start the next frame while these feet were still short.
-        The blend flag is not consulted here.
+        this after the gate has accepted target_feet_positions. An
+        earlier call would start the next target while these feet
+        were still short. The blend flag is not consulted here.
         """
         if isinstance(params, MovingParams):
-            if step.cur_moving_generator is not step.new_moving_generator:
-                step.cur_moving_generator = step.new_moving_generator
-            if step.cur_moving_generator is None:
-                step.linear_x, step.linear_y, step.angular_z = 0, 0, 0
+            current = controller.cur_moving_generator
+            if current is not controller.new_moving_generator:
+                controller.cur_moving_generator = controller.new_moving_generator
+            if controller.cur_moving_generator is None:
+                controller.linear_x = 0
+                controller.linear_y = 0
+                controller.angular_z = 0
             return
         self.send_status = 'running'
-        if step.cur_moving_generator is not step.new_moving_generator:
+        current = controller.cur_moving_generator
+        if current is not controller.new_moving_generator:
             if self.last_status != 'finish':
                 self.last_status = 'stop'
                 self.send_status = 'finish'
-                self.pending = step.new_moving_generator
-        if step.cur_moving_generator is None:
-            step.linear_x, step.linear_y, step.angular_z = 0, 0, -1
+                self.pending = controller.new_moving_generator
+        if controller.cur_moving_generator is None:
+            controller.linear_x = 0
+            controller.linear_y = 0
+            controller.angular_z = -1
         if self.last_status == 'finish':
             self.send_status = 'first'
             self.last_status = 'start'
-            step.cur_moving_generator = self.pending
+            controller.cur_moving_generator = self.pending
 
 
-class _MovingFrame:
-    """One tick of feet from a step generator.
+class _MiniStepInput:
+    """What one 20 ms mini-step received from the generator.
 
-    moving_pose is None when this tick has no feet. hunter is gait 5.
-    reused means the gait-5 gate has not accepted the open frame, so
-    send() was not called and the cursor did not move. slow is a bool:
-    True asks for a 50 ms servo blend on this pose.
+    One mini-step is one wake of the loop, in every gait. moving_pose
+    is None when this mini-step has no feet. hunter is gait 5.
+    reused means the gait-5 gate has not accepted
+    target_feet_positions, so gen_next_mini_step_yield was not
+    called and the cursor did not move. slow is a bool: True asks
+    for a 50 ms servo blend on this pose.
     """
 
     def __init__(self):
@@ -114,21 +123,63 @@ class _MovingFrame:
         self.hunter = False
 
 
+class _GeneratorCall:
+    """The three ways StepController resumes a Python generator.
+
+    The class holds no generator. Each method receives the generator
+    and calls its send. gen_advance_to_first_yield parks a fresh
+    generator on its first yield. gen_next_mini_step_yield takes the
+    next walk yield. gen_next_lean_slice takes the next body-lean slice.
+    """
+
+    @staticmethod
+    def gen_advance_to_first_yield(generator):
+        """Run a fresh generator from its first line to its first yield.
+
+        Python requires None on this first resume: no yield is waiting
+        to receive a value yet. The None that comes back is discarded.
+        Walk generators and the pose transformer both start here.
+        No feet exist yet.
+        """
+        generator.send(None)
+
+    @staticmethod
+    def gen_next_mini_step_yield(generator, pose, slice_word):
+        """Resume a walk generator and return its next yield.
+
+        pose is the stored stance. slice_word is 'first', 'running',
+        or 'finish'. The yield is six feet, the gait-step wrap flag,
+        the params, and the slow flag. The caller handles StopIteration
+        when the generator has ended.
+        """
+        return generator.send((pose, slice_word))
+
+    @staticmethod
+    def gen_next_lean_slice(generator, pose, transform):
+        """Resume a pose transformer and return one 20 ms lean slice.
+
+        pose and transform are the current feet and body transform.
+        The yield is the shifted feet, the updated transform, and
+        whether this slice is the last.
+        """
+        return generator.send((pose, transform))
+
+
 class StepController(Node):
     """50 Hz gait/pose loop. Callers queue work on the new_* slots; loop()
     promotes them to cur_* and drives Python generators at 20 ms.
 
     Each work type uses a pair of slots:
       new_*  — next command, written under self.lock by ROS callbacks
-      cur_*  — the generator/tuple the loop thread is currently sending to
+      cur_*  — the generator or tuple the loop thread is driving now
     Pose-set wins: applying a new pose clears every generator (stand, then idle).
-    Walking never aborts mid-step: the current generator is swapped only when
-    it reports last_part (a full step / cycle wrap).
+    Walking never aborts in the middle of a gait step: the current generator is swapped
+    only when it reports last_part (the wrap of one gait step).
 
     Two walkers share that rule. The legacy walker is MovingGenerator
     and CmdVelGenerator, the walks from before the hunter, and it
     publishes through set_pose_base. The hunter walker is gait 5,
-    FollowGaitGenerator, and it can hold one frame across ticks.
+    FollowGaitGenerator, and it can hold one target across mini-steps.
     """
     
     RIPPLE_GAIT = 1
@@ -147,8 +198,8 @@ class StepController(Node):
         self.lock = threading.RLock()
 
         # Dual-slot command queues. ROS callbacks only write new_*; loop() only
-        # reads/clears them. That way a callback never mutates a generator that
-        # is mid-send().
+        # reads/clears them. A callback must not mutate a generator while
+        # _GeneratorCall is inside its send.
         self.cur_moving_generator = None
         self.new_moving_generator = None
         self.cur_pose_transformer = None
@@ -181,7 +232,7 @@ class StepController(Node):
         # ROS parameter, not the Python constant. ros2 param set
         # /step_controller use_hexapod_kinematics true changes it.
         # The value is read when a gait-5 generator starts. A change
-        # mid-step does not rebuild the session already walking.
+        # during a gait step does not rebuild the session already walking.
         # Default false keeps kinematics.so. The launch argument of
         # the same name arrives as an override. This node is created
         # with automatically_declare_parameters_from_overrides, so
@@ -245,11 +296,11 @@ class StepController(Node):
         self._hold_watch = HoldWatch()
 
     def _begin_gait5(self, generator, pose):
-        """Return this generator's session, creating it on the first tick.
+        """Return this generator's session, creating it on the first mini-step.
 
         The flag is read here, once. attach() solves the stance and
         does not publish it. The same generator keeps this object
-        through partial frames and through a cycle wrap that does
+        through partial targets and through a gait-step wrap that does
         not swap the generator.
         """
         if self._gait5 is not None and self._gait5.generator is generator:
@@ -262,7 +313,7 @@ class StepController(Node):
         self._hold_watch = HoldWatch()
         return session
 
-    def _record_gait5(self, session, step):
+    def _record_gait5(self, session, mini_step_result):
         """WARN, the 1 Hz line, and one CSV row. None of these block.
 
         The row is queued with block=False. A full queue drops it
@@ -271,23 +322,23 @@ class StepController(Node):
         column as a wall-clock run.
         """
         t_s = self.get_clock().now().nanoseconds * 1e-9
-        self._hold_watch.note(self.get_logger(), step)
+        self._hold_watch.note(self.get_logger(), mini_step_result)
         self._second_log.note(
             self.get_logger(), t_s, session.backend,
-            step.decision, step.dq)
-        self._trace.put(trace_row(t_s, session.backend, step))
+            mini_step_result.decision, mini_step_result.dq)
+        self._trace.put(trace_row(t_s, session.backend, mini_step_result))
 
     def _integrate_fraction(self, params, delta_alpha):
         """Add twist * 0.02 * delta_alpha to the body odometry.
 
-        A hold passes delta 0 and adds nothing. The tick that
+        A hold passes delta 0 and adds nothing. The mini-step that
         reaches alpha 1 adds only the leftover fraction. It does
         not repay the seconds the partials already covered. The
         velocity fields stored on the node are the command scaled
         by that same fraction, so a partial line is not a full
         command for one sample. The yaw rotation into the world
-        frame stays here. The next frame, after send(), is a fresh
-        0.02 s of the full twist.
+        frame stays here. The next target, after
+        gen_next_mini_step_yield(), is a fresh 0.02 s of the full twist.
         """
         command_x = params.velocity_x / 1000.0
         command_y = params.velocity_y / 1000.0
@@ -308,8 +359,9 @@ class StepController(Node):
 
         JointControl applies SERVOS['direction'] and writes the
         pulse. This does not call kinematics.so, and it does not
-        replace self.pose. A gait tick leaves the stance object
-        alone so the generator does not rebake on the next send().
+        replace self.pose. A gait mini-step leaves the stance object
+        alone so the generator does not rebake on the next
+        gen_next_mini_step_yield().
         """
         joints_data = [
             [joint_id, radian]
@@ -344,12 +396,12 @@ class StepController(Node):
         self.cur_moving_generator = None
 
     def loop(self):
-        """Run one 20 ms tick: a pose command, then exactly one walker.
+        """Run one 20 ms mini-step: a pose command, then exactly one walker.
 
-        The legacy walker is every step generator from before the
+        The legacy walker is every walk generator from before the
         hunter: MovingGenerator (set_step_mode) and CmdVelGenerator
         (cmd_vel while cmd_gait is not 5). The hunter walker is
-        gait 5 only, FollowGaitGenerator. A tick with no feet
+        gait 5 only, FollowGaitGenerator. A mini-step with no feet
         clears the published twist and drives neither walker.
         """
         os.system("sudo renice -n -19 -p " + str(os.getpid()))
@@ -358,21 +410,23 @@ class StepController(Node):
             if not self._consume_pose_setter():
                 continue
             pose, transform = self._step_pose_transformer()
-            frame = self._pull_moving_frame(pose, handshake)
-            self._apply_shifted_body_pose(pose, transform, frame.moving_pose)
-            if frame.moving_pose is None:
+            mini_step_input = self._pull_mini_step_input(pose, handshake)
+            self._apply_shifted_body_pose(
+                pose, transform, mini_step_input.moving_pose)
+            if mini_step_input.moving_pose is None:
                 self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
-            elif frame.hunter:
-                self._tick_hunter_gait(frame, pose, transform, handshake)
+            elif mini_step_input.hunter:
+                self._tick_hunter_gait(
+                    mini_step_input, pose, transform, handshake)
             else:
-                self._tick_legacy_gait(frame, transform, handshake)
+                self._tick_legacy_gait(mini_step_input, transform, handshake)
             self._mark_idle()
             time.sleep(0.02)
 
     def _consume_pose_setter(self):
         """Apply a queued stand, then drop every generator.
 
-        Returns False when the apply raised. This tick stops there,
+        Returns False when the apply raised. This mini-step stops there,
         including the 20 ms sleep, and the next iteration tries again.
         set_pose(None, None, t) holds the current feet for duration.
         """
@@ -397,10 +451,11 @@ class StepController(Node):
         return True
 
     def _step_pose_transformer(self):
-        """Advance a body lean by one frame.
+        """Advance a body lean by one 20 ms slice.
 
         Returns the pose and transform the walker should read.
-        A failed send drops the transformer and keeps the stored pose.
+        A failed gen_next_lean_slice drops the transformer and keeps
+        the stored pose.
         """
         pose = self.pose
         transform = self.transform
@@ -409,8 +464,8 @@ class StepController(Node):
                 self.cur_pose_transformer = self.new_pose_transformer
                 self.new_pose_transformer = None
             if self.cur_pose_transformer is not None:
-                pose, transform, last_part = self.cur_pose_transformer.send(
-                    (pose, transform))
+                pose, transform, last_part = _GeneratorCall.gen_next_lean_slice(
+                    self.cur_pose_transformer, pose, transform)
                 if last_part:
                     self.cur_pose_transformer = None
         except Exception as e:
@@ -418,49 +473,57 @@ class StepController(Node):
             self.cur_pose_transformer = None
         return pose, transform
 
-    def _pull_moving_frame(self, pose, handshake):
-        """Take one frame from the current step generator.
+    def _pull_mini_step_input(self, pose, handshake):
+        """Take one mini-step's input from the current walk generator.
 
         A queued generator is promoted first. Legacy generators
-        always send(), and a last_part swaps or winds down before
-        this returns. Gait 5 does not. While its gate has not
-        accepted the open frame, the same six feet are returned
-        and send() is not called, because send() would drop them.
-        Its last_part is left for the hunter tick.
+        always call gen_next_mini_step_yield, and a last_part swaps
+        or winds down before this returns. Gait 5 does not. While
+        its gate has not accepted target_feet_positions, the same
+        six feet are returned and gen_next_mini_step_yield is not
+        called, because that call would drop them. Its last_part
+        is left for the hunter mini-step.
         """
-        frame = _MovingFrame()
+        mini_step_input = _MiniStepInput()
         if self.cur_moving_generator is None:
             if self.new_moving_generator is not None:
                 self.cur_moving_generator = self.new_moving_generator
         self._drop_gait5_if_replaced()
         if self.cur_moving_generator is None:
-            return frame
+            return mini_step_input
         if self._gait5 is not None and self._gait5.waiting():
-            frame.moving_pose, frame.params, frame.slow = self._gait5.held()
-            frame.reused = True
-            frame.hunter = _is_hunter_gait(frame.params)
-            return frame
+            held = self._gait5.held()
+            mini_step_input.moving_pose = held[0]
+            mini_step_input.params = held[1]
+            mini_step_input.slow = held[2]
+            mini_step_input.reused = True
+            mini_step_input.hunter = _is_hunter_gait(mini_step_input.params)
+            return mini_step_input
         try:
-            frame.moving_pose, frame.last_part, frame.params, frame.slow = (
-                self.cur_moving_generator.send((pose, handshake.send_status)))
+            yielded = _GeneratorCall.gen_next_mini_step_yield(
+                self.cur_moving_generator, pose, handshake.send_status)
+            mini_step_input.moving_pose = yielded[0]
+            mini_step_input.last_part = yielded[1]
+            mini_step_input.params = yielded[2]
+            mini_step_input.slow = yielded[3]
         except StopIteration:
             self.cur_moving_generator = None
-            return frame
+            return mini_step_input
         except Exception as e:
             self.get_logger().error("GENERATE ERROR: " + repr(e))
             self.cur_moving_generator = None
-            return frame
-        frame.hunter = _is_hunter_gait(frame.params)
-        if frame.last_part and not frame.hunter:
-            handshake.honor_boundary(self, frame.params)
-        return frame
+            return mini_step_input
+        mini_step_input.hunter = _is_hunter_gait(mini_step_input.params)
+        if mini_step_input.last_part and not mini_step_input.hunter:
+            handshake.honor_boundary(self, mini_step_input.params)
+        return mini_step_input
 
     def _apply_shifted_body_pose(self, pose, transform, moving_pose):
-        """Publish a pose-transformer step when the object changed.
+        """Publish a body-lean slice when the pose object changed.
 
         The transformer yields a new object. While a walk is also
         running, pseudo=True stores that pose and does not move
-        the servos. The walker frame is what moves them.
+        the servos. The walker's mini-step is what moves them.
         """
         if pose is self.pose:
             return
@@ -473,33 +536,35 @@ class StepController(Node):
             self.get_logger().info("POSE " + str(e))
             self.cur_pose_transformer = None
 
-    def _tick_legacy_gait(self, frame, transform, handshake):
-        """Drive MovingGenerator or CmdVelGenerator for one tick.
+    def _tick_legacy_gait(self, mini_step_input, transform, handshake):
+        """Drive MovingGenerator or CmdVelGenerator for one mini-step.
 
         This is the walk from before the hunter. Feet go through
         set_pose_base and kinematics.set_leg_position. The first
-        slice of a cmd_vel cycle blends for 50 ms when slow is True.
-        Every other frame blends for 20 ms. CmdVelParams integrates
-        a full 20 ms of the command. A counted step carries
-        MovingParams, so it does not integrate here. A raised error
-        drops the generator.
+        slice of a cmd_vel gait step blends for 50 ms when slow is
+        True. Every other mini-step blends for 20 ms. CmdVelParams
+        integrates a full 20 ms of the command. A counted walk
+        carries MovingParams, so it does not integrate here. A
+        raised error drops the generator.
         """
         try:
-            if handshake.send_status == 'first' and frame.slow:
-                # First slice after a cycle splice: 50 ms blend.
+            if handshake.send_status == 'first' and mini_step_input.slow:
+                # First slice after a gait-step splice: 50 ms blend.
                 self.set_pose_base(
-                    frame.moving_pose, 0.05, pseudo=False, update_pose=False)
+                    mini_step_input.moving_pose, 0.05,
+                    pseudo=False, update_pose=False)
             else:
                 self.set_pose_base(
-                    frame.moving_pose, 0.02, pseudo=False, update_pose=False)
+                    mini_step_input.moving_pose, 0.02,
+                    pseudo=False, update_pose=False)
             if handshake.last_status == 'stop':
                 handshake.last_status = 'finish'
             self.transform = transform
-            if isinstance(frame.params, CmdVelParams):
+            if isinstance(mini_step_input.params, CmdVelParams):
                 # mm/s to m/s, then 20 ms of that body velocity into odom.
-                self.linear_x = frame.params.velocity_x / 1000.0
-                self.linear_y = frame.params.velocity_y / 1000.0
-                self.angular_z = frame.params.angular_z
+                self.linear_x = mini_step_input.params.velocity_x / 1000.0
+                self.linear_y = mini_step_input.params.velocity_y / 1000.0
+                self.angular_z = mini_step_input.params.angular_z
                 yaw = self.real_pose_yaw if self.real_pose_yaw else self.pose_yaw
                 x = (math.cos(yaw) * self.linear_x * 0.02
                      - math.sin(yaw) * self.linear_y * 0.02)
@@ -515,39 +580,40 @@ class StepController(Node):
             self.cur_moving_generator = None
             self.linear_x, self.linear_y, self.angular_z = 0, 0, 0
 
-    def _tick_hunter_gait(self, frame, stance, transform, handshake):
-        """Drive gait 5, the hunter follow walk, for one tick.
+    def _tick_hunter_gait(self, mini_step_input, stance, transform, handshake):
+        """Drive gait 5, the hunter follow walk, for one mini-step.
 
         use_hexapod_kinematics chooses who turns the six tips into
-        angles. A legal frame that steps too far is shortened and
-        the generator waits. Any other refusal publishes nothing
-        and does not advance the generator. The boundary swap runs
-        only when the gate accepted the generator's own feet.
-        Odometry adds the fraction of the 20 ms frame that was sent.
+        angles. A legal target whose joint move is too big is
+        shortened and the generator waits. Any other refusal
+        publishes nothing and does not advance the generator. The
+        boundary swap runs only when the gate accepted the
+        generator's own feet. Odometry adds the fraction of the
+        target that this mini-step sent.
         """
         try:
             session = self._begin_gait5(self.cur_moving_generator, stance)
-            if not frame.reused:
-                session.open_frame(
-                    frame.moving_pose, frame.params, frame.slow,
-                    frame.last_part)
-            step, delta, boundary = session.step()
-            self._record_gait5(session, step)
+            if not mini_step_input.reused:
+                session.begin_target(
+                    mini_step_input.moving_pose, mini_step_input.params,
+                    mini_step_input.slow, mini_step_input.last_part)
+            mini_step_result, delta, boundary = session.mini_step()
+            self._record_gait5(session, mini_step_result)
             if boundary:
                 handshake.honor_boundary(self, session.params)
             # First-slice blend is 50 ms when slow is True. A later
-            # frame, including a partial, is 20 ms. The thread still
-            # sleeps 20 ms.
-            if handshake.send_status == 'first' and frame.slow:
+            # mini-step, including a partial, is 20 ms. The thread
+            # still sleeps 20 ms.
+            if handshake.send_status == 'first' and mini_step_input.slow:
                 duration = 0.05
             else:
                 duration = 0.02
-            if should_publish(step):
-                self._publish_leg_radians(step.angles, duration)
+            if should_publish(mini_step_result):
+                self._publish_leg_radians(mini_step_result.angles, duration)
             if handshake.last_status == 'stop':
                 handshake.last_status = 'finish'
             self.transform = transform
-            self._integrate_fraction(frame.params, delta)
+            self._integrate_fraction(mini_step_input.params, delta)
         except Exception as e:
             self.get_logger().info("MOVING_POSE " + str(e))
             self.cur_moving_generator = None
@@ -688,7 +754,7 @@ class StepController(Node):
         generator = PoseTransformer(PoseTransformerParams(translation=translate, rotation=euler, absolutely=True, duration=duration))
         if generator:
             with self.lock:
-                generator.send(None)
+                _GeneratorCall.gen_advance_to_first_yield(generator)
                 self.new_pose_transformer = generator
 
     def transform_pose_euler(self, translate, axis, euler, duration, degrees=True):
@@ -706,7 +772,7 @@ class StepController(Node):
 
         if generator:
             with self.lock:
-                generator.send(None)
+                _GeneratorCall.gen_advance_to_first_yield(generator)
                 self.new_pose_transformer = generator
       
     def cmd_vel(self, twist: Twist):
@@ -763,7 +829,7 @@ class StepController(Node):
             generator = CmdVelGenerator(vel_params, self.get_logger())
         if generator:
             with self.lock:
-                generator.send(None)
+                _GeneratorCall.gen_advance_to_first_yield(generator)
                 self.new_moving_generator = generator
 
                 self.stop = False
@@ -851,7 +917,7 @@ class StepController(Node):
             )
             if generator:
                 with self.lock:
-                    generator.send(None)
+                    _GeneratorCall.gen_advance_to_first_yield(generator)
                     self.new_moving_generator = generator
             return
 
@@ -870,5 +936,5 @@ class StepController(Node):
 
         if generator:
             with self.lock:
-                generator.send(None)
+                _GeneratorCall.gen_advance_to_first_yield(generator)
                 self.new_moving_generator = generator

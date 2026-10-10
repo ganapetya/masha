@@ -6,15 +6,17 @@ from kinematics import kinematics
 import copy
 
 # Gait generators for the hexapod.
-# Both MovingGenerator and CmdVelGenerator are Python generators:
-#   1) caller does gen.send(None) once to prime them
-#   2) then repeatedly send((cur_pose, status)) and receive
+# MovingGenerator, CmdVelGenerator, and FollowGaitGenerator are Python
+# generators. Calling one only builds the object. StepController resumes
+# it through _GeneratorCall, and those methods are what call send():
+#   1) gen_advance_to_first_yield once, up to the first yield
+#   2) then gen_next_mini_step_yield(pose, slice_word), which returns
 #      (out_pose, last_part, params, slow)
-# last_part is True when a full step/cycle just wrapped, so the outer
-# loop in step_controller can swap or stop generators on a step boundary.
+# last_part is True when a gait step just wrapped, so the outer
+# loop in step_controller can swap or stop generators on that boundary.
 # slow is a bool. True asks for a 50 ms servo blend on this one pose.
-# False keeps the usual 20 ms command. A counted step always yields
-# False. The boundary tells a counted step from a velocity walk by the
+# False keeps the usual 20 ms command. A counted walk always yields
+# False. The boundary tells a counted walk from a velocity walk by the
 # params object (MovingParams versus CmdVelParams), not by this flag.
 
 
@@ -64,10 +66,11 @@ class CmdVelParams:
 
 
 def MovingGenerator(params, log=None):
-    """Yield discrete-step gait poses for Traveling / set_step_mode.
+    """Yield counted gait poses for Traveling / set_step_mode.
 
-    One step is 6 kinematic parts (i = 0..5). Each part is further split into
-    sub_action_num servo frames so the whole step lasts params.period at 50 Hz.
+    One gait step is 6 kinematic parts (i = 0..5). Each part is further
+    split into sub_action_num mini-steps so the gait step lasts
+    params.period at 50 Hz.
     """
 
     # 根据是相对高度还是绝对高度计算实际的高度(actual lift height is computed later from relative_h vs absolute)
@@ -75,25 +78,28 @@ def MovingGenerator(params, log=None):
     part_index = 0
     sub_index = 0
 
-    # 50 Hz loop (0.02 s). One step = 6 parts, so frames-per-part = period / 6 / 0.02
-    sub_action_num = params.period / 6.0 / 0.02 # 一步会分为六步幅， 计算每一部分有多少个子动作(one step is six parts; how many sub-actions each part has)
+    # 50 Hz loop (0.02 s). One gait step = 6 parts, so
+    # mini-steps per part = period / 6 / 0.02
+    sub_action_num = params.period / 6.0 / 0.02 # 一步会分为六部分，每部分多少个小步(mini-steps per part)
     sub_action_num = math.ceil(round(max(sub_action_num, 1), 3)) # 每一分步最少要有一个子动作(each part must have at least one sub-action)
     height = params.height
     real_stride = params.stride * params.linear_factor
     real_rotate = params.rotation * params.rotate_factor
 
-    # Per-frame increments. kinematics.set_step_mode still gets the full-step
-    # real_stride / real_rotate; these locals are unused leftovers.
+    # Per mini-step increments. kinematics.set_step_mode still gets the full
+    # gait-step real_stride / real_rotate; these locals are unused leftovers.
     sub_stride = params.stride / (sub_action_num * 6.0)
     sub_rotate = params.rotation / (sub_action_num * 6.0)
 
-    cur_pose, status = yield None  # prime: wait for the first (pose, status) from the loop thread
+    # gen_advance_to_first_yield parks here. The next resume fills
+    # cur_pose and status from (pose, slice_word).
+    cur_pose, status = yield None
     while params.repeat > 0 or params.forever:
         org_pose = cur_pose
         if params.relative_h:
             # percent of current foot z (stance height), not an absolute mm lift
             height = abs(org_pose[0][2]) * (params.height / 100.0) 
-        poses = [] # 计算到的步态的所有姿态(all gait poses for this one step, 6 parts)
+        poses = [] # 计算到的步态的所有姿态(all gait poses for this one gait step, 6 parts)
         # 波纹步态时有根据不同的方向会有条腿刚好在下落过程，
         # 如果在立正状态下下落的话会将机体撑起来，所以需要先将这条腿抬起
         # (In ripple gait, depending on heading, one leg is already in its down-stroke.
@@ -113,7 +119,7 @@ def MovingGenerator(params, log=None):
         else: # 非波纹步态(not ripple: usually tripod — start from the current pose as-is)
             start_pose = org_pose
         
-        # 计算整个过程的所有步态过程(precompute all 6 parts of this step)
+        # 计算整个过程的所有步态过程(precompute all 6 parts of this gait step)
         for i in range(6):
             ps = kinematics.set_step_mode(sub_action_num, 
                                         i, 
@@ -125,10 +131,10 @@ def MovingGenerator(params, log=None):
                                         real_rotate)            
 
             ps = np.array(ps)
-            # 出来的数据是每条对的多个姿态，转换为六条腿的子动作的姿态(kinematics returns per-leg sequences; reshape into per-frame snapshots of all six legs)
+            # 出来的数据是每条腿的多个姿态，转成每个小步的六腿快照(per-leg sequences become one six-leg snapshot per mini-step)
             ps = ps.reshape((6, -1, 3))  # 转换为[六条腿[子动作[坐标]]](shape: [6 legs][sub-actions][x,y,z])
             ps = np.transpose(ps, (1, 0, 2))  # 转换为[子动作[六条腿[坐标]]](shape: [sub-actions][6 legs][x,y,z])
-            start_pose = ps[-1]  # next part continues from this part's last frame
+            start_pose = ps[-1]  # next part continues from this part's last mini-step
             poses.append(ps)
         # log.info(f'{status}, {poses}')    
         while params.repeat > 0 or params.forever:
@@ -140,11 +146,11 @@ def MovingGenerator(params, log=None):
             if sub_index == 0:
                 part_index = (part_index + 1) % 6 # 分步计数 +1(next of the 6 parts)
                 if part_index == 0:
-                    # wrapped a full step; forever keeps repeat at 0 so the outer while stays true
+                    # wrapped one gait step; forever keeps repeat at 0 so the outer while stays true
                     params.repeat = max(params.repeat - 1, 0)
             # log.info(f'{part_index} {sub_index}')
-            # last_part is True only at the wrap (part 0, sub 0): a complete-step boundary.
-            # False: this counted step never asks for the 50 ms blend. The
+            # last_part is True only at the wrap (part 0, sub 0): a gait-step boundary.
+            # False: this counted walk never asks for the 50 ms blend. The
             # boundary sees MovingParams and swaps on the wrap.
             cur_pose, status = yield out_pose, part_index == 0 and sub_index == 0, params, False
 
@@ -172,12 +178,13 @@ def total_dist_sq(a_pts, b_pts):
 
 # Module-level handoff shared by CmdVelGenerator and FollowGaitGenerator.
 # On status=='finish' the live generator stores the pose it is about to
-# yield into finish_ps, every finish tick, so the last one is the pose the
+# yield into finish_ps, every finish mini-step, so the last one is the pose the
 # feet were given when that slice wrapped. The next generator searches its
-# new cycle for the frame nearest that pose and starts there (avoids a jump).
+# new gait step for the target nearest that pose and starts there
+# (avoids a jump).
 # slow is the blend flag yielded with each pose. True asks the servo
 # loop for a 50 ms blend; False keeps the usual 20 ms command.
-# stop means "we refused to splice at frame 0". finish_index is the cursor
+# stop means "we refused to splice at target 0". finish_index is the cursor
 # after a finish yield; no other function reads it.
 finish_ps = []
 slow = False
@@ -201,9 +208,12 @@ def CmdVelGenerator(params, log=None):
 
     org_pose = None
     phase_index = 0 # 当前相位游标(index into the current phase slice being played)
-    # one frame every 20 ms; round then ceil so 1.0 s → 50 phases
-    phase_num = math.ceil(round((params.period * 1000.0 / 20.0), 1)) # 细分的相位个数(how many discrete phases in one cycle)
-    phase_list = [(i / phase_num) * 2.0 * math.pi for i in range(phase_num)] # 细分相位列表(phase samples covering 0 .. 2pi)
+    # One target every 20 ms. round then ceil so 1.0 s → 50 targets.
+    targets_per_gait_step = math.ceil(
+        round((params.period * 1000.0 / 20.0), 1))
+    phase_list = [
+        (i / targets_per_gait_step) * 2.0 * math.pi
+        for i in range(targets_per_gait_step)]
 
     # AEP/PEP offsets from body velocity. AEP = anterior extreme position
     # (where a swinging foot will land), PEP = posterior extreme position
@@ -216,7 +226,8 @@ def CmdVelGenerator(params, log=None):
         params.period
     )
 
-    cur_pose, status = yield None  # prime
+    # gen_advance_to_first_yield parks here.
+    cur_pose, status = yield None
     while True:
         # phase_index = 0
         org_pose = cur_pose
@@ -249,7 +260,7 @@ def CmdVelGenerator(params, log=None):
             idx = min(range(len(dists)), key=lambda i: dists[i])
 
             if idx == 0:
-                # phase 0 is the cycle wrap; skip it so the first yield is a real step
+                # phase 0 is the gait-step wrap; skip it so the first yield is a real target
                 idx = 1
 
                 stop = True    
@@ -300,9 +311,9 @@ def CmdVelGenerator(params, log=None):
                 finish_ps = ps  # hand this pose to the next CmdVelGenerator
                 finish_index = phase_index
             else:
-                # normal running: wrap the full cycle
+                # normal running: wrap the full gait step
                 ps = steps[phase_index]
-                phase_index = (phase_index + 1) % phase_num
+                phase_index = (phase_index + 1) % targets_per_gait_step
             if phase_index == 0:
                 # wrapped this slice — last_part True so the outer loop may switch generators
                 cur_pose, status = yield ps, True, params, slow
@@ -421,16 +432,17 @@ def FollowGaitGenerator(params, log=None):
     into angles. With use_hexapod_kinematics on, hexapod_kinematics does
     that job, and the safety gate can refuse the result.
 
-    Python generator: `yield` freezes this function and hands one value to
-    StepController. The controller's 20 ms loop is the projector. This
-    function is the film. Calling FollowGaitGenerator(...) only builds the
-    generator object; the body runs on send().
+    Python generator: `yield` freezes this function and hands one target to
+    StepController. The controller's 20 ms loop plays one mini-step.
+    This function is the table of targets. Calling FollowGaitGenerator(...)
+    only builds the generator object. The body runs when _GeneratorCall
+    resumes it, and that method is what calls Python's send().
 
     Handshake, same words as CmdVelGenerator:
-      send(None) once     — prime, runs up to the first yield
-      status 'first'      — play the intro slice (steps1), startup or swap
-      status 'running'    — play the full baked cycle
-      status 'finish'     — play the outro slice (steps2), stash finish_ps
+      gen_advance_to_first_yield once — run up to the first yield
+      slice word 'first'   — intro slice (steps1), startup or swap
+      slice word 'running' — the full baked cycle
+      slice word 'finish'  — outro slice (steps2), stash finish_ps
     The bool beside each pose is last_part: True means this slice just
     wrapped, so the controller may wind down or swap generators.
     A new Twist does not edit this table. It builds a new generator and
@@ -455,22 +467,29 @@ def FollowGaitGenerator(params, log=None):
     # the outer loop does not put it back to 0.
     phase_index = 0
 
-    # How many 20 ms frames fit in one period. round-to-1-decimal, then
-    # ceil, so binary float noise (30.0000001) does not become an extra
-    # frame. 1.00 s → 50 frames. The hunter's 0.60 s → 30 frames.
-    phase_num = math.ceil(round((params.period * 1000.0 / 20.0), 1))
-    # Two frames minimum. A 1-frame cycle wraps on every tick (`% 1`
-    # is always 0), and the controller would treat every tick as a boundary.
-    phase_num = max(int(phase_num), 2)
+    # How many targets fit in one gait step. One target is the nominal
+    # 20 ms sample. round-to-1-decimal, then ceil, so binary float noise
+    # (30.0000001) does not become an extra target. 1.00 s → 50 targets.
+    # The hunter's 0.60 s → 30 targets.
+    targets_per_gait_step = math.ceil(
+        round((params.period * 1000.0 / 20.0), 1))
+    # Two targets minimum. A one-target gait step wraps on every
+    # mini-step (`% 1` is always 0), and the controller would treat
+    # every mini-step as a gait-step boundary.
+    targets_per_gait_step = max(int(targets_per_gait_step), 2)
 
     # The gait clock is an angle. A for-loop cannot walk "0 to 2π", so
-    # each frame gets one sample: frame i is at fraction i/phase_num of
-    # the circle. The list starts at 0 and stops just before 2π. The next
-    # lap is frame 0 again. That seam is why index 0 is special below.
-    phase_list = [(i / phase_num) * 2.0 * math.pi for i in range(phase_num)]
+    # each target gets one sample: target i is at fraction
+    # i/targets_per_gait_step of the circle. The list starts at 0 and
+    # stops just before 2π. The next lap is target 0 again. That seam
+    # is why index 0 is special below.
+    phase_list = [
+        (i / targets_per_gait_step) * 2.0 * math.pi
+        for i in range(targets_per_gait_step)]
 
     # Offset cap (|AEP − home| and |PEP − home|), not the full PEP→AEP
-    # travel. 55 mm → ~75 mm step at the hunter's vx 0.25 m/s and T 0.60 s.
+    # travel. 55 mm → about 75 mm of toe travel at the hunter's
+    # vx 0.25 m/s and period 0.60 s.
     # 40 mm was the short shuffle. sample_follow_gait clamps each foot so
     # a large command cannot park a toe past this radius from its home.
     stride_max = 55.0
@@ -479,7 +498,7 @@ def FollowGaitGenerator(params, log=None):
     # object from crashing the bake. Missing → 1.0, meaning "use vx, vy as given".
     linear_factor = getattr(params, 'linear_factor', 1.0)
 
-    # Once, before any foot pose. Later ticks do not log. The numbers are
+    # Once, before any foot pose. Later mini-steps do not log. The numbers are
     # the command this generator was built with; a new Twist is a new object.
     if log is not None:
         log.info(
@@ -489,16 +508,17 @@ def FollowGaitGenerator(params, log=None):
             f'stride_cap={stride_max:.0f} mm'
         )
 
-    # Prime. `cur_pose, status = yield None` both gives None to the caller
-    # and, on the next send, receives whatever they pass. cmd_vel's first
-    # send(None) only gets us here and discards the None. The loop thread's
-    # first send((stance, 'first')) is what fills cur_pose and status.
+    # Prime. `cur_pose, status = yield None` gives None to the caller
+    # and, on the next resume, receives whatever they pass.
+    # gen_advance_to_first_yield only gets us here and discards the None.
+    # The first gen_next_mini_step_yield(stance, 'first') fills
+    # cur_pose and status.
     cur_pose, status = yield None
 
     # Outer loop, the animator. Bakes one full cycle into `steps`, then
     # the inner loop plays it. We come back here only when the controller
     # replaces self.pose with a different object (a stand, or a body move).
-    # A normal 20 ms tick does not. A new velocity does not either: that
+    # A normal mini-step does not. A new velocity does not either: that
     # waits for last_part and then runs a new generator from the top.
     while True:
         org_pose = cur_pose
@@ -515,7 +535,7 @@ def FollowGaitGenerator(params, log=None):
             # set_step_mode gait 5 can turn it on.
             height = abs(nominal[0][2]) * (params.height / 100.0)
 
-        # Bake every frame now. This for-loop does not yield. After it,
+        # Bake every target now. This for-loop does not yield. After it,
         # `steps[i]` is the six toes at phase_list[i].
         steps = []
         for phase in phase_list:
@@ -534,27 +554,27 @@ def FollowGaitGenerator(params, log=None):
                 linear_factor,
             ))
 
-        # Splice, once per bake. Frame 0 puts one tripod at PEP and the
+        # Splice, once per bake. Target 0 puts one tripod at PEP and the
         # other at AEP, the two extremes. Playback has to be allowed to
-        # start at a later frame that already looks like the current feet.
+        # start at a later target that already looks like the current feet.
         if finish_ps:
             # Sum of squared foot-to-foot distances. Skipping the square
-            # root is enough: we only need which frame is nearest.
+            # root is enough: we only need which target is nearest.
             dists = [total_dist_sq(finish_ps, bi) for bi in steps]
             idx = min(range(len(dists)), key=lambda i: dists[i])
             if idx == 0:
-                # Frame 0 would make the outro `steps[:0]` empty, and the
-                # first 'finish' tick would index that empty list. Start
-                # one frame later. stop remembers that we refused the seam;
-                # the 'first' branch ORs it into the slow-blend test while
-                # finish_ps is still set.
+                # Target 0 would make the outro `steps[:0]` empty, and the
+                # first 'finish' mini-step would index that empty list.
+                # Start one target later. stop remembers that we refused
+                # the seam; the 'first' branch ORs it into the slow-blend
+                # test while finish_ps is still set.
                 idx = 1
                 stop = True
             else:
                 stop = False
         else:
             # No hand-off pose. That is a cold start, and also a rebake:
-            # the 'first' tick already cleared finish_ps, so a later stance
+            # the 'first' mini-step already cleared finish_ps, so a later stance
             # change comes through here too. Leg 1 (the second tuple) stands
             # at x = 0 in DEFAULT_POSE, so "leg 1's x closest to 0" means
             # that foot is near its forward home. Search only the first half
@@ -563,14 +583,14 @@ def FollowGaitGenerator(params, log=None):
             if idx == 0:
                 # Same empty-outro guard as the hand-off path. This branch
                 # does not arm the slow blend: finish_ps is empty, so the
-                # 'first' tick below takes the other arm and writes
+                # 'first' mini-step below takes the other arm and writes
                 # slow = False.
                 idx = 1
                 stop = True
             else:
                 stop = False
 
-        # Cut the film at the splice. Math frame 0 is the seam, not "where
+        # Cut the table at the splice. Target 0 is the seam, not "where
         # the feet are now", so playback must be allowed to start mid-table.
         # steps1, the intro: splice → end of the table. status 'first'.
         # steps2, the outro: start of the table → splice. status 'finish'.
@@ -578,30 +598,31 @@ def FollowGaitGenerator(params, log=None):
         steps1 = steps[idx:]
         steps2 = steps[:idx]
 
-        # Inner loop, the projector. One yield per wake-up. At each yield
-        # we freeze; ~20 ms later the controller send()s the stance it
-        # still holds, plus the next status word.
+        # Inner loop. One yield per resume. At each yield we freeze;
+        # ~20 ms later gen_next_mini_step_yield passes the stance the
+        # controller still holds, plus the next slice word.
         while True:
             if status == 'first':
                 # Intro: from the splice toward the end of the math cycle.
                 ps = steps1[phase_index]
                 if finish_ps:
-                    # Only the first 'first' tick still has the stash. The
-                    # largest single-toe jump to this frame, in millimetres.
-                    # Over 7 mm, or we skipped the seam (stop), asks
-                    # StepController for a 50 ms command on this one frame
-                    # (slow is True). The thread still sleeps 20 ms;
-                    # the next tick replaces that pulse.
+                    # Only the first 'first' mini-step still has the stash.
+                    # The largest single-toe jump to this target, in
+                    # millimetres. Over 7 mm, or we skipped the seam
+                    # (stop), asks StepController for a 50 ms command on
+                    # this one mini-step (slow is True). The thread still
+                    # sleeps 20 ms; the next mini-step replaces that pulse.
                     distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, finish_ps)])
                     if distances > 7 or stop:
                         slow = True
-                    # Drop the stash now, or every later 'first' tick would
+                    # Drop the stash now, or every later 'first' mini-step would
                     # run this test again.
                     finish_ps = []
                 else:
-                    # Later 'first' ticks, and a cold start: ordinary timing.
+                    # Later 'first' mini-steps, and a cold start: ordinary timing.
                     slow = False
-                # Advance inside the intro. Its length is phase_num − idx,
+                # Advance inside the intro. Its length is
+                # targets_per_gait_step − idx,
                 # which is len(steps1). Wrapping this modulo is what makes
                 # phase_index == 0 at the end of the intro.
                 phase_index = (phase_index + 1) % (len(steps) - idx)
@@ -613,7 +634,7 @@ def FollowGaitGenerator(params, log=None):
                 # max(idx, 1) keeps this modulo off zero if idx were ever
                 # left at 0. The splice above already forces idx to 1.
                 phase_index = (phase_index + 1) % max(idx, 1)
-                # Overwrite the hand-off every finish tick. The write that
+                # Overwrite the hand-off every finish mini-step. The write that
                 # matters is the one on the wrapping yield: that pose is
                 # what the next generator splices against.
                 finish_ps = ps
@@ -623,14 +644,16 @@ def FollowGaitGenerator(params, log=None):
                 # 'running', and any word that is not 'first' or 'finish'.
                 # Full cycle, seam included.
                 ps = steps[phase_index]
-                # 29 + 1 wraps to 0 when phase_num is 30. That 0 is the
-                # signal below; the frame we just took was the last one.
-                phase_index = (phase_index + 1) % phase_num
+                # 29 + 1 wraps to 0 when targets_per_gait_step is 30.
+                # That 0 is the signal below; the target we just took
+                # was the last one of this gait step.
+                phase_index = (phase_index + 1) % targets_per_gait_step
 
-            # The frame was chosen first, then the cursor moved. Cursor 0
-            # means the move wrapped, so `ps` is the last frame of this
-            # slice. True: controller may enter 'finish' or swap in the
-            # queued generator. False: mid-slice, keep playing.
+            # The target was chosen first, then the cursor moved.
+            # Cursor 0 means the move wrapped, so `ps` is the last
+            # target of this slice. True: controller may enter 'finish'
+            # or swap in the queued generator. False: mid-slice, keep
+            # playing.
             if phase_index == 0:
                 cur_pose, status = yield ps, True, params, slow
             else:
@@ -641,7 +664,7 @@ def FollowGaitGenerator(params, log=None):
             # False), so self.pose stays this same object and `steps` keeps
             # playing. A stand or a pose transform stores a new tuple; that
             # object arrives here and we break out to bake again.
-            # phase_index is still wherever the old film had reached.
+            # phase_index is still wherever the old table had reached.
             if cur_pose is not org_pose:
                 break
 

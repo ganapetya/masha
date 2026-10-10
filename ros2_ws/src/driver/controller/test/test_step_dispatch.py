@@ -1,7 +1,9 @@
 # The 20 ms loop picks one walker. These tests lock that pick
 # without a node and without the thread: legacy generators still
-# send and publish through set_pose_base, gait 5 does not send
-# while a frame is waiting.
+# resume through gen_next_mini_step_yield and publish through
+# set_pose_base. Gait 5 does not resume while a target is waiting.
+# The fake generator still implements send(), because that is what
+# _GeneratorCall calls.
 
 import pytest
 
@@ -9,7 +11,7 @@ import pytest
 # that `kinematics` is still unloaded when its first test starts, and
 # step_controller imports that module.
 StepController = None
-_MovingFrame = None
+_MiniStepInput = None
 _WalkHandshake = None
 _is_hunter_gait = None
 CmdVelParams = None
@@ -18,16 +20,16 @@ MovingParams = None
 
 @pytest.fixture(autouse=True)
 def _load_controller():
-    global StepController, _MovingFrame, _WalkHandshake, _is_hunter_gait
+    global StepController, _MiniStepInput, _WalkHandshake, _is_hunter_gait
     global CmdVelParams, MovingParams
     from controller.move import CmdVelParams as cmd_params
     from controller.move import MovingParams as move_params
     from controller.step_controller import StepController as controller
-    from controller.step_controller import _MovingFrame as frame_type
+    from controller.step_controller import _MiniStepInput as input_type
     from controller.step_controller import _WalkHandshake as handshake_type
     from controller.step_controller import _is_hunter_gait as hunter_check
     StepController = controller
-    _MovingFrame = frame_type
+    _MiniStepInput = input_type
     _WalkHandshake = handshake_type
     _is_hunter_gait = hunter_check
     CmdVelParams = cmd_params
@@ -43,10 +45,10 @@ class _Log:
 
 
 class _Hold:
-    """A gait-5 session whose open frame is not finished."""
+    """A gait-5 session whose open target is not finished."""
 
-    def __init__(self, frame, params, slow):
-        self.frame = frame
+    def __init__(self, target_feet_positions, params, slow):
+        self.target_feet_positions = target_feet_positions
         self.params = params
         self.slow = slow
         self.sends = 0
@@ -55,7 +57,7 @@ class _Hold:
         return True
 
     def held(self):
-        return self.frame, self.params, self.slow
+        return self.target_feet_positions, self.params, self.slow
 
 
 class _Gen:
@@ -72,7 +74,7 @@ class _Gen:
 
 
 def _step():
-    """Build the fields pull and the two ticks read. Not a ROS node."""
+    """Build the fields the pull and the two mini-steps read. Not a ROS node."""
     robot = _Log()
     robot.cur_moving_generator = None
     robot.new_moving_generator = None
@@ -137,9 +139,9 @@ def test_legacy_last_part_is_honored_before_the_tick():
     feet = ((1, 2, 3),)
     step.cur_moving_generator = _Gen((feet, True, MovingParams(gait=2), False))
     step.new_moving_generator = nxt
-    frame = StepController._pull_moving_frame(step, 'pose', _WalkHandshake())
-    assert frame.hunter is False
-    assert frame.moving_pose == feet
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    assert mini_step_input.hunter is False
+    assert mini_step_input.moving_pose == feet
     assert step.cur_moving_generator is nxt
 
 
@@ -149,43 +151,44 @@ def test_hunter_last_part_does_not_swap_during_the_pull():
     nxt = object()
     step.cur_moving_generator = gen
     step.new_moving_generator = nxt
-    frame = StepController._pull_moving_frame(step, 'pose', _WalkHandshake())
-    assert frame.hunter is True
-    assert frame.last_part is True
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    assert mini_step_input.hunter is True
+    assert mini_step_input.last_part is True
     assert step.cur_moving_generator is gen
     assert gen.sent == [('pose', 'first')]
 
 
-def test_waiting_hunter_frame_is_not_sent_again():
+def test_waiting_hunter_target_is_not_sent_again():
     step = _step()
     params = CmdVelParams(gait=5)
     feet = ((4, 5, 6),)
     step._gait5 = _Hold(feet, params, False)
-    gen = _Gen(error=AssertionError('send dropped the open frame'))
+    gen = _Gen(error=AssertionError(
+        'gen_next_mini_step_yield dropped the open target'))
     step.cur_moving_generator = gen
-    frame = StepController._pull_moving_frame(step, 'pose', _WalkHandshake())
-    assert frame.hunter is True
-    assert frame.reused is True
-    assert frame.moving_pose == feet
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    assert mini_step_input.hunter is True
+    assert mini_step_input.reused is True
+    assert mini_step_input.moving_pose == feet
     assert gen.sent == []
 
 
-def test_vendor_cmd_vel_is_a_legacy_frame():
+def test_vendor_cmd_vel_is_a_legacy_mini_step():
     step = _step()
     params = CmdVelParams(gait=2, velocity_x=100)
     feet = ((1, 0, 0),)
     gen = _Gen((feet, False, params, False))
     step.cur_moving_generator = gen
-    frame = StepController._pull_moving_frame(step, 'pose', _WalkHandshake())
-    assert frame.hunter is False
-    assert frame.moving_pose == feet
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    assert mini_step_input.hunter is False
+    assert mini_step_input.moving_pose == feet
 
 
 def test_a_dead_generator_leaves_no_feet():
     step = _step()
     step.cur_moving_generator = _Gen(error=StopIteration())
-    frame = StepController._pull_moving_frame(step, 'pose', _WalkHandshake())
-    assert frame.moving_pose is None
+    mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkHandshake())
+    assert mini_step_input.moving_pose is None
     assert step.cur_moving_generator is None
 
 
@@ -197,14 +200,16 @@ def test_legacy_tick_uses_set_pose_base_and_a_full_20_ms():
     step.pose_yaw = 0.0
     step.position = (0.0, 0.0, 0.0)
     step.cur_moving_generator = object()
-    frame = _MovingFrame()
-    frame.moving_pose = ((1, 2, 3),)
-    frame.params = CmdVelParams(gait=2, velocity_x=1000, velocity_y=0, angular_z=0)
-    frame.slow = False
+    mini_step_input = _MiniStepInput()
+    mini_step_input.moving_pose = ((1, 2, 3),)
+    mini_step_input.params = CmdVelParams(gait=2, velocity_x=1000, velocity_y=0, angular_z=0)
+    mini_step_input.slow = False
     handshake = _WalkHandshake()
     handshake.send_status = 'running'
-    StepController._tick_legacy_gait(step, frame, 'lean', handshake)
-    assert calls == [((frame.moving_pose, 0.02), {'pseudo': False, 'update_pose': False})]
+    StepController._tick_legacy_gait(step, mini_step_input, 'lean', handshake)
+    assert calls == [(
+        (mini_step_input.moving_pose, 0.02),
+        {'pseudo': False, 'update_pose': False})]
     assert step.linear_x == pytest.approx(1.0)
     assert step.position[0] == pytest.approx(0.02)
     assert step.transform == 'lean'
@@ -218,21 +223,21 @@ def test_legacy_first_slice_blends_for_50_ms_and_a_move_does_not_integrate():
     step.real_pose_yaw = None
     step.pose_yaw = 0.0
     step.position = (0.0, 0.0, 0.0)
-    frame = _MovingFrame()
-    frame.moving_pose = ((1, 2, 3),)
-    frame.params = MovingParams(gait=2)
-    frame.slow = False
-    StepController._tick_legacy_gait(step, frame, 'lean', _WalkHandshake())
+    mini_step_input = _MiniStepInput()
+    mini_step_input.moving_pose = ((1, 2, 3),)
+    mini_step_input.params = MovingParams(gait=2)
+    mini_step_input.slow = False
+    StepController._tick_legacy_gait(step, mini_step_input, 'lean', _WalkHandshake())
     assert calls == [0.02]
     assert step.linear_x == 1
 
-    frame.slow = True
-    frame.params = CmdVelParams(gait=2, velocity_x=0, velocity_y=0, angular_z=0)
-    StepController._tick_legacy_gait(step, frame, 'lean', _WalkHandshake())
+    mini_step_input.slow = True
+    mini_step_input.params = CmdVelParams(gait=2, velocity_x=0, velocity_y=0, angular_z=0)
+    StepController._tick_legacy_gait(step, mini_step_input, 'lean', _WalkHandshake())
     assert calls == [0.02, 0.05]
 
 
-def test_hunter_tick_opens_a_new_frame_and_publishes_radians():
+def test_hunter_mini_step_begins_a_new_target_and_publishes_radians():
     step = _step()
     opened = []
     published = []
@@ -241,10 +246,10 @@ def test_hunter_tick_opens_a_new_frame_and_publishes_radians():
     class Session:
         slow = False
 
-        def open_frame(self, pose, params, slow, last_part):
+        def begin_target(self, pose, params, slow, last_part):
             opened.append((pose, last_part))
 
-        def step(self):
+        def mini_step(self):
             return _StepResult(True), 0.5, False
 
     step._begin_gait5 = lambda generator, stance: Session()
@@ -252,13 +257,13 @@ def test_hunter_tick_opens_a_new_frame_and_publishes_radians():
     step._publish_leg_radians = lambda angles, duration: published.append(duration)
     step._integrate_fraction = lambda params, delta: integrated.append(delta)
     step.cur_moving_generator = object()
-    frame = _MovingFrame()
-    frame.moving_pose = ((9, 9, 9),)
-    frame.params = CmdVelParams(gait=5)
-    frame.slow = False
-    frame.last_part = True
-    frame.hunter = True
-    StepController._tick_hunter_gait(step, frame, 'stance', 'lean', _WalkHandshake())
+    mini_step_input = _MiniStepInput()
+    mini_step_input.moving_pose = ((9, 9, 9),)
+    mini_step_input.params = CmdVelParams(gait=5)
+    mini_step_input.slow = False
+    mini_step_input.last_part = True
+    mini_step_input.hunter = True
+    StepController._tick_hunter_gait(step, mini_step_input, 'stance', 'lean', _WalkHandshake())
     assert opened == [(((9, 9, 9),), True)]
     assert published == [0.02]
     assert integrated == [0.5]
@@ -279,23 +284,23 @@ def test_hunter_reuse_does_not_open_and_a_boundary_winds_down():
         params = CmdVelParams(gait=5)
         slow = False
 
-        def open_frame(self, *args):
+        def begin_target(self, *args):
             opened.append(args)
 
-        def step(self):
+        def mini_step(self):
             return _StepResult(False), 0.0, True
 
     step._begin_gait5 = lambda generator, stance: Session()
     step._record_gait5 = lambda session, result: None
     step._publish_leg_radians = lambda angles, duration: None
     step._integrate_fraction = lambda params, delta: None
-    frame = _MovingFrame()
-    frame.moving_pose = ((1, 1, 1),)
-    frame.params = CmdVelParams(gait=5)
-    frame.slow = False
-    frame.reused = True
+    mini_step_input = _MiniStepInput()
+    mini_step_input.moving_pose = ((1, 1, 1),)
+    mini_step_input.params = CmdVelParams(gait=5)
+    mini_step_input.slow = False
+    mini_step_input.reused = True
     handshake = _WalkHandshake()
-    StepController._tick_hunter_gait(step, frame, 'stance', 'lean', handshake)
+    StepController._tick_hunter_gait(step, mini_step_input, 'stance', 'lean', handshake)
     assert opened == []
     assert step.cur_moving_generator is current
     assert handshake.pending is nxt

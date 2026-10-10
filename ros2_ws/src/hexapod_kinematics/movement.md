@@ -34,7 +34,7 @@ is 0.60 s. At 20 ms per frame that film has 30 pages
 | `cmd_vel()` | `driver/controller/controller/step_controller.py` |
 | `set_step_mode()` | same file |
 | `loop()` | same file |
-| `_pull_moving_frame()` | same file |
+| `_pull_mini_step_input()` | same file |
 | `_tick_legacy_gait()` | same file |
 | `_tick_hunter_gait()` | same file |
 | `_WalkHandshake.honor_boundary()` | same file |
@@ -43,7 +43,7 @@ is 0.60 s. At 20 ms per frame that film has 30 pages
 | `FollowGaitGenerator` | same file |
 | `sample_follow_gait()` | same file |
 | `Gait5Session` | `driver/controller/controller/leg_ik.py` |
-| `approach_frame()` | same file |
+| `approach_target()` | same file |
 | `VendorLegIk` | same file |
 | `HexapodLegIk` | same file |
 | `kinematics.set_step_mode`, `cmd_vel_new_point`, `set_leg_position` | closed `kinematics.so`, called from `move.py` and `leg_ik.py` |
@@ -79,7 +79,7 @@ sequenceDiagram
     Cmd->>Cmd: m/s to mm/s, gait = cmd_gait
     alt cmd_gait is 5, the hunter
         Cmd->>Film: construct FollowGaitGenerator
-        Cmd->>Film: send(None), run until the first yield
+        Cmd->>Film: gen_advance_to_first_yield, run until the first yield
         Note over Film: Body is paused. No foot page exists yet.
         Cmd->>Queue: store this primed generator
     else any other cmd_gait
@@ -104,13 +104,13 @@ sequenceDiagram
     participant Queue as new_moving_generator in step_controller.py
 
     alt gait is 5
-        Mode->>Follow: construct and send(None)
+        Mode->>Follow: construct, then gen_advance_to_first_yield
         Mode->>Queue: store it
         Note over So: not called
     else gait is 1, 2, 3, and the rest
-        Mode->>Move: construct and send(None)
+        Mode->>Move: construct, then gen_advance_to_first_yield
         Mode->>Queue: store it
-        Note over Move,So: set_step_mode runs later, on the first real send, when the six parts are baked
+        Note over Move,So: set_step_mode runs later, on the first gen_next_mini_step_yield, when the six parts are baked
     end
 ```
 
@@ -128,7 +128,7 @@ is gait 5, `FollowGaitGenerator`.
 sequenceDiagram
     autonumber
     participant Legs as leg thread in step_controller.py
-    participant Pull as _pull_moving_frame() in step_controller.py
+    participant Pull as _pull_mini_step_input() in step_controller.py
     participant Hand as honor_boundary() in step_controller.py
     participant Legacy as _tick_legacy_gait() in step_controller.py
     participant Hunter as _tick_hunter_gait() in step_controller.py
@@ -140,9 +140,9 @@ sequenceDiagram
     Legs->>Pull: current stance, send_status
     alt a gait-5 page is still open
         Pull-->>Legs: the same six feet, reused, hunter
-        Note over Pull: send() is not called. The bookmark stays.
+        Note over Pull: gen_next_mini_step_yield is not called. The bookmark stays.
     else a generator is playing
-        Pull->>Pull: generator.send(stance, send_status)
+        Pull->>Pull: gen_next_mini_step_yield(stance, send_status)
         Note over Pull: The generator yields the next baked page and moves its bookmark.
         alt last_part and the page is legacy
             Pull->>Hand: swap or start the wind-down now
@@ -179,18 +179,18 @@ of this page are commanded. The page still plays. The next book
 is what starts on a later tick.
 
 Gait 5 stores `last_part` on `Gait5Session` and acts on it only
-when `approach_frame` has accepted the generator's own feet
+when `approach_target` has accepted the generator's own feet
 (`alpha` 1). A half-played page does not change books.
 
-## 3. Where the tiny frames come from
+## 3. Where the targets come from
 
-The generator builds the whole cycle in one burst, then yields one
-frame per `send()`. The 20 ms loop is the projector. The generator
-is the film. A normal tick does not recompute the curves.
+The generator builds the whole gait step in one burst, then yields
+one target per `gen_next_mini_step_yield()`. The 20 ms loop plays one mini-step. A
+normal mini-step does not recompute the curves.
 
-### Hunter film, gait 5
+### Hunter gait 5
 
-For period 0.60 s the bake writes 30 frames. Frame `i` is the six
+For period 0.60 s the bake writes 30 targets. Target `i` is the six
 feet at phase `i / 30 * 2π`. `sample_follow_gait` places each toe
 on its stance line or on its swing arch. No closed solver runs
 during the bake.
@@ -202,7 +202,7 @@ sequenceDiagram
     participant Film as FollowGaitGenerator in move.py
     participant Sample as sample_follow_gait() in move.py
 
-    Legs->>Film: first send(stance, "first") after send(None)
+    Legs->>Film: first gen_next_mini_step_yield(stance, "first") after gen_advance_to_first_yield
     Note over Film: Stance object changed, or this is the first bake. The for-loop below does not yield.
     loop one phase per 20 ms of the period
         Film->>Sample: phase, vx, vy, wz, height, period, six homes
@@ -211,7 +211,7 @@ sequenceDiagram
     Note over Film: the steps list is the whole cycle. steps1 is the intro, steps2 the wind-down.
     Film-->>Legs: yield the first intro frame, last_part, params, slow
     Note over Legs,Film: About 20 ms later
-    Legs->>Film: send(stance, status)
+    Legs->>Film: gen_next_mini_step_yield(stance, status)
     Film-->>Legs: yield the next stored frame
     Note over Sample: not called. The table already exists.
 ```
@@ -236,7 +236,7 @@ sequenceDiagram
     participant Move as MovingGenerator in move.py
     participant So as kinematics.set_step_mode in kinematics.so
 
-    Legs->>Move: send(stance, status)
+    Legs->>Move: gen_next_mini_step_yield(stance, status)
     Note over Move: New stance object. Bake six parts before the next yield.
     loop part i from 0 to 5
         Move->>So: sub_action_num, part i, start pose, gait, stride, height
@@ -249,7 +249,7 @@ sequenceDiagram
 ## 4. The hunter tick and the gate
 
 `_tick_hunter_gait` always goes through `Gait5Session` and
-`approach_frame`. The flag `use_hexapod_kinematics` chooses who
+`approach_target`. The flag `use_hexapod_kinematics` chooses who
 turns the six feet into angles. It is read once, when that
 generator's session is created.
 
@@ -261,7 +261,7 @@ generator's session is created.
   Any other refusal publishes nothing.
 
 The gate is one yes or no for all eighteen joints. It lives in
-`safety.cpp`. It does not move a foot. `approach_frame` is the
+`safety.cpp`. It does not move a foot. `approach_target` is the
 repair, and it lives in `leg_ik.py`.
 
 A partial page moves all six feet by the same fraction `alpha`
@@ -269,7 +269,7 @@ along the straight line from the start of this page to the
 generator's own feet:
 
 ```text
-feet(alpha) = anchor + alpha * (frame - anchor)
+feet(alpha) = anchor + alpha * (target_feet_positions - anchor)
 ```
 
 `alpha` 1 is the page the generator yielded. A smaller `alpha`
@@ -281,7 +281,7 @@ sequenceDiagram
     autonumber
     participant Tick as _tick_hunter_gait() in step_controller.py
     participant Session as Gait5Session in leg_ik.py
-    participant Frame as approach_frame() in leg_ik.py
+    participant Target as approach_target() in leg_ik.py
     participant Hex as HexapodLegIk.solve in leg_ik.py
     participant Bind as bindings.cpp
     participant Solve as solve_pose() in leg_ik.cpp
@@ -289,34 +289,34 @@ sequenceDiagram
     participant Servo as _publish_leg_radians() in step_controller.py
 
     Note over Tick,Gate: This picture is use_hexapod_kinematics true. Flag false uses VendorLegIk in leg_ik.py and never calls gate().
-    Tick->>Session: open_frame on a fresh page, or keep the open one
-    Tick->>Session: step()
-    Session->>Frame: anchor, generator feet, alpha_done
-    Frame->>Hex: solve(generator's own six feet)
+    Tick->>Session: begin_target on a fresh page, or keep the open one
+    Tick->>Session: mini_step()
+    Session->>Target: anchor, target_feet_positions, alpha_done
+    Target->>Hex: solve(generator's own six feet)
     Hex->>Bind: solve_pose(feet)
     Bind->>Solve: six Vec3, max_step_rad()
     Solve-->>Bind: eighteen radians, or a refusal
     Bind->>Gate: those angles, plus the last angles this gate allowed
     Gate-->>Hex: allow, or rate_limit, or another reason
     alt gate allows the generator's own feet
-        Frame-->>Session: decision sent, alpha = 1, publish
+        Target-->>Session: decision sent, alpha = 1, publish
         Session-->>Tick: boundary if this page was last_part
         Tick->>Servo: eighteen radians, duration 0.02 s or 0.05 s
-        Note over Tick: Odometry adds alpha's fraction of 0.02 s. The next tick may call send().
+        Note over Tick: Odometry adds alpha's fraction of 0.02 s. The next tick may call gen_next_mini_step_yield().
     else reason is rate_limit
         loop up to eight bisections, one shared alpha
-            Frame->>Hex: solve(feet at that alpha)
+            Target->>Hex: solve(feet at that alpha)
             Hex->>Gate: eighteen angles against the last sent angles
         end
         alt some alpha passes
-            Frame-->>Session: decision partial, publish those feet
+            Target-->>Session: decision partial, publish those feet
             Tick->>Servo: eighteen radians of the shorter pose
             Note over Session: alpha_done stays below 1. Next tick reuses this page.
         else no shorter pose passes
-            Frame-->>Session: decision held, publish nothing
+            Target-->>Session: decision held, publish nothing
         end
     else unreachable, singular, window, or no reference
-        Frame-->>Session: decision held, publish nothing
+        Target-->>Session: decision held, publish nothing
         Note over Servo: The same page would fail again. A later tick does not change that.
     end
 ```
@@ -331,14 +331,14 @@ legal. One 20 ms jump is not.
 sequenceDiagram
     autonumber
     participant Legs as leg thread in step_controller.py
-    participant Pull as _pull_moving_frame() in step_controller.py
+    participant Pull as _pull_mini_step_input() in step_controller.py
     participant Film as FollowGaitGenerator in move.py
     participant Gate as gate() in safety.cpp
     participant Servo as JointControl in x_joint_control.py
 
     Note over Legs: Tick A, 20 ms
     Legs->>Pull: session is not waiting
-    Pull->>Film: send()
+    Pull->>Film: gen_next_mini_step_yield()
     Film-->>Pull: this page, bookmark moves
     Pull-->>Legs: six feet, hunter
     Legs->>Gate: angles of the whole page, against the last sent angles
@@ -347,7 +347,7 @@ sequenceDiagram
     Legs->>Gate: angles of the halfway feet
     Gate-->>Legs: allow, leftover turn is about 0.20 rad
     Legs->>Servo: eighteen angles of the halfway pose, duration 0.02 s
-    Note over Film: Bookmark stays. send() will not be called next tick.
+    Note over Film: Bookmark stays. gen_next_mini_step_yield() will not be called next tick.
 
     Note over Legs: Tick B, 20 ms later
     Legs->>Pull: waiting() is true
@@ -387,7 +387,7 @@ sequenceDiagram
     Tick->>Servo: eighteen targets, duration 0.05 s
     Legs->>Legs: sleep 0.02 s
     Note over Servo: The 50 ms blend is still in progress.
-    Legs->>Film: send() or, for gait 5, reuse the open page
+    Legs->>Film: gen_next_mini_step_yield(), or for gait 5 reuse the open page
     Film-->>Tick: the next command
     Tick->>Servo: new targets, usually duration 0.02 s
     Note over Servo: This message replaces the 50 ms one.

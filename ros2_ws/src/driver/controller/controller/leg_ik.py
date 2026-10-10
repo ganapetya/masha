@@ -7,7 +7,7 @@
 # is the vendor. This file does not read a ROS parameter and it
 # does not publish a servo pulse. StepController reads the
 # parameter when a gait-5 generator starts, and Gait5Session is
-# the unfinished frame that generator is still walking.
+# the unfinished target that generator is still walking.
 #
 # A refused pose comes back as a decision object. An exception here
 # would fall into the loop's moving-pose handler and drop the
@@ -46,11 +46,11 @@ TRACE_DROP_WARN_S = 1.0
 # Shutdown may flush. It may not hold up a halt.
 TRACE_CLOSE_S = 0.2
 
-# Eight bisections. The smallest accepted step is 1/256 of what is
-# left of this frame. A smaller candidate is no progress.
+# Eight bisections. The smallest accepted advance is 1/256 of what
+# is left of this target. A smaller candidate is no progress.
 BISECTION_PARTS = 256
 
-# One ordinary gait tick, seconds. Catch-up scales this by delta_alpha.
+# One ordinary mini-step, seconds. Catch-up scales this by delta_alpha.
 TICK_S = 0.02
 
 TRACE_COLUMNS = (
@@ -89,22 +89,25 @@ class IkDecision(object):
         self.q_previous_rad = q_previous_rad
 
 
-class FrameStep(object):
-    """What one tick did with one generator frame.
+class MiniStepResult(object):
+    """What one mini-step did with one target.
 
+    A mini-step is one 20 ms wake. A target is the six toe positions
+    the generator yielded for the current part of the gait step.
     decision is sent, partial, or held.
-    alpha is the fraction of the frame solved this tick. It is 1
-    when the generator's own feet were sent, between 0 and 1 for a
-    partial, and 0 when nothing was sent.
-    alpha_done is how far along the frame has been sent, including
-    this tick. A hold leaves it where it was.
-    feet are the six tips that were solved this tick, millimetres.
-    source_feet are the six tips the generator yielded. A partial
-    solves a point between the anchor and those tips. The WARN names
-    the generator's foot, because that is the foot that was refused.
-    dq is the 18 steps from the previous sent pose. Empty strings
-    when no pose has been sent yet. The controller's joints_state
-    starts at 0 and is not that previous pose.
+    alpha is the fraction of the target solved on this mini-step.
+    It is 1 when the generator's own feet were sent, between 0 and 1
+    for a partial, and 0 when nothing was sent.
+    alpha_done is how far along the target has been sent, including
+    this mini-step. A hold leaves it where it was.
+    feet are the six tips that were solved this mini-step, millimetres.
+    source_feet are target_feet_positions, the six tips the generator
+    yielded. A partial solves a point between the anchor and those
+    tips. The WARN names the generator's foot, because that is the
+    foot that was refused.
+    dq is the 18 joint deltas from the previous sent pose. Empty
+    strings when no pose has been sent yet. The controller's
+    joints_state starts at 0 and is not that previous pose.
     publish is false on a hold. pseudo is applied later, by
     should_publish: a dry run still carries sent or partial here.
     """
@@ -153,9 +156,9 @@ class LegIk(object):
         """Solve the pose the body is already standing on.
 
         On success those angles become previous. Nothing is published:
-        the feet are already there. The first moving frame is compared
+        the feet are already there. The first target is compared
         with this solve. A pose the backend cannot accept leaves
-        previous empty, and the next frame holds with that reason.
+        previous empty, and the next target holds with that reason.
         """
         raise NotImplementedError
 
@@ -189,8 +192,8 @@ class VendorLegIk(LegIk):
 class HexapodLegIk(LegIk):
     """hexapod_kinematics.solve_pose, then the safety gate, once.
 
-    This does not subdivide a frame. approach_frame is the only
-    place that turns one rate_limit into a shorter step. The import
+    This does not subdivide a target. approach_target is the only
+    place that turns one rate_limit into a shorter fraction. The import
     happens on the first solve, so a vendor-only process that never
     builds this object does not load the module.
     """
@@ -204,7 +207,7 @@ class HexapodLegIk(LegIk):
     def establish_reference(self, pose):
         # The gate answers no_reference when previous is empty, even
         # for a legal stand. Compare the stand with itself so the
-        # window is checked and the step is zero. A solver refusal
+        # window is checked and the joint change is zero. A solver refusal
         # is returned as itself and previous stays empty.
         import hexapod_kinematics as hk
         result = hk.solve_pose(pose)
@@ -223,11 +226,11 @@ def make_leg_ik(use_hexapod=USE_HEXAPOD_KINEMATICS_DEFAULT):
     """Pick the formula for one gait-5 generator.
 
     Call this when that generator starts, and keep the object until
-    the generator is replaced. A param change mid-step must not build
-    a second object for the same feet: the formula would change under
-    a moving foot. The next generator, at the next Twist after a step
-    boundary or at the next hunt bout, is the next call, and that
-    call sees the new flag.
+    the generator is replaced. A param change during a gait step must
+    not build a second object for the same feet: the formula would
+    change under a moving foot. The next generator, at the next Twist
+    after a gait-step boundary or at the next hunt bout, is the next
+    call, and that call sees the new flag.
 
     The default is false. Joystick gaits, voice gait 2, body lean,
     and action groups do not call this. They stay on set_pose_base.
@@ -241,7 +244,7 @@ def begin_generator(use_hexapod=USE_HEXAPOD_KINEMATICS_DEFAULT):
     """One gait-5 generator's backend, and the line that names it.
 
     The line is `gait 5 backend=hexapod` or `gait 5 backend=vendor`.
-    Log it once, here, not on every tick.
+    Log it once, here, not on every mini-step.
     """
     ik = make_leg_ik(use_hexapod)
     backend = "hexapod" if use_hexapod else "vendor"
@@ -255,7 +258,7 @@ def start_gait5(generator, use_hexapod=USE_HEXAPOD_KINEMATICS_DEFAULT):
     that moment. Keep the session until the generator object is
     replaced. A later param change does not come back here: a second
     session would swap the formula under a moving foot. The next
-    generator, at the next Twist after a step boundary or at the
+    generator, at the next Twist after a gait-step boundary or at the
     next hunt bout, is the next call.
 
     The returned line is logged once by the caller. attach() is
@@ -266,28 +269,28 @@ def start_gait5(generator, use_hexapod=USE_HEXAPOD_KINEMATICS_DEFAULT):
     return Gait5Session(generator, ik, backend), line
 
 
-def approach_frame(ik, feet_anchor, feet_frame, alpha_done):
-    """Walk one generator frame as far as the gate allows.
+def approach_target(ik, feet_anchor, target_feet_positions, alpha_done):
+    """Walk one target as far as the gate allows.
 
-    feet_anchor is where this frame started: the last feet that were
+    feet_anchor is where this target started: the last feet that were
     sent at alpha 1, or the feet of the body pose at the start of a
-    bout. feet_frame is the six tips the generator yielded for this
-    tick. alpha_done is how far along that segment has already been
-    sent, in [0, 1].
+    bout. target_feet_positions are the six tips the generator yielded.
+    alpha_done is how far along that segment has already been sent,
+    in [0, 1].
 
     The order is fixed.
 
     1. Solve the generator's own feet. When the gate allows them,
-       alpha_done becomes 1 by assignment and the next tick may ask
-       the generator for a new frame.
+       alpha_done becomes 1 by assignment and the next mini-step may
+       ask the generator for a new target.
     2. When the only failure is rate_limit, the feet are legal and
-       the step is too big. Eight bisections search the open interval
-       past alpha_done. One fraction is shared by all six legs:
+       the joint move is too big. Eight bisections search the open
+       interval past alpha_done. One fraction is shared by all six legs:
 
-           feet(alpha) = anchor + alpha * (frame - anchor)
+           feet(alpha) = anchor + alpha * (target_feet_positions - anchor)
 
        The largest alpha that passes the whole gate is a partial.
-       The generator stays on this frame.
+       The generator stays on this target.
     3. Any other reason is a hard hold. Nothing is published.
        alpha_done and the previous sent pose stay where they are.
     4. A rate_limit whose search finds nothing is the same hold.
@@ -296,26 +299,26 @@ def approach_frame(ik, feet_anchor, feet_frame, alpha_done):
        branch does not change along the segment. Catch-up must not
        publish that jump.
 
-    alpha_done becomes 1 only when step 1 passes. Eight bisections
+    alpha_done becomes 1 only when point 1 passes. Eight bisections
     land on a 1/256 grid of the remaining segment, so a value such
-    as 0.996 is a partial step. Rounding that up to 1 would start
-    the next frame while these feet were still short, and it would
-    do it without the gate having allowed this frame. A candidate
+    as 0.996 is a partial. Rounding that up to 1 would start the
+    next target while these feet were still short, and it would
+    do it without the gate having allowed this target. A candidate
     less than one part in 256 past alpha_done is no progress, and
-    that tick is a hold.
+    that mini-step is a hold.
 
-    Step 1 solves the generator's own tuple. It does not solve the
+    Point 1 solves the generator's own tuple. It does not solve the
     reconstruction at alpha 1. That sum can miss the original
     millimetres by a fraction of a unit in the last place.
 
     This pause is for hunter gait 5, a tripod. Three feet stay on
-    the ground while one frame is stretched over several ticks, so
-    the body is not depending on a swing finishing on time. A gait
+    the ground while one target is stretched over several mini-steps,
+    so the body is not depending on a swing finishing on time. A gait
     that stays upright by momentum would fall if a swing were slowed
     this way. That gait is outside this module.
 
     The generator object is not dropped here. A hold returns. The
-    caller keeps the same frame. A halt (gait -2) is the existing
+    caller keeps the same target. A halt (gait -2) is the existing
     stand path, and that is what clears a hold.
     """
     if alpha_done < 0.0:
@@ -323,32 +326,32 @@ def approach_frame(ik, feet_anchor, feet_frame, alpha_done):
     if alpha_done > 1.0:
         alpha_done = 1.0
     previous = ik.previous
-    full = ik.solve(feet_frame)
+    full = ik.solve(target_feet_positions)
     if full.allow:
         dq = _steps(previous, full.angles)
         ik.remember(full.angles)
-        return _step(
-            "sent", 1.0, 1.0, full, "", 0, feet_frame, feet_frame,
-            dq, True)
+        return _mini_step_result(
+            "sent", 1.0, 1.0, full, "", 0,
+            target_feet_positions, target_feet_positions, dq, True)
     if full.reason != "rate_limit" or alpha_done >= 1.0:
-        return _hold(full, alpha_done, feet_frame, previous)
-    found = _bisect(ik, feet_anchor, feet_frame, alpha_done)
+        return _hold(full, alpha_done, target_feet_positions, previous)
+    found = _bisect(ik, feet_anchor, target_feet_positions, alpha_done)
     if found is None:
-        return _hold(full, alpha_done, feet_frame, previous)
+        return _hold(full, alpha_done, target_feet_positions, previous)
     alpha, trial, feet = found
     dq = _steps(previous, trial.angles)
     ik.remember(trial.angles)
     # The partial pose was allowed. The row still says rate_limit,
     # because the generator's own feet were the pose that was too big.
-    # The joint named is that refusal, so the WARN matches the frame.
-    return _step(
+    # The joint named is that refusal, so the WARN matches the target.
+    return _mini_step_result(
         "partial", alpha, alpha, trial, "rate_limit", full.joint_id,
-        feet, feet_frame, dq, True,
+        feet, target_feet_positions, dq, True,
         q_now_rad=full.q_now_rad, q_previous_rad=full.q_previous_rad,
         leg=full.leg)
 
 
-def should_publish(step, pseudo=False):
+def should_publish(mini_step_result, pseudo=False):
     """False on a hard hold, and false on a dry run.
 
     pseudo still solved, still gated, and still belongs in the trace
@@ -356,21 +359,21 @@ def should_publish(step, pseudo=False):
     """
     if pseudo:
         return False
-    return step.publish
+    return mini_step_result.publish
 
 
 def odometry_increment(linear_x, linear_y, angular_z, delta_alpha,
                        dt=TICK_S):
-    """The body twist for the fraction of this frame sent this tick.
+    """The body twist for the fraction of this target sent this mini-step.
 
     Returns scaled linear_x, linear_y, angular_z, then the body-frame
-    dx, dy and the yaw step. The scaled velocities are the numbers to
+    dx, dy and the yaw change. The scaled velocities are the numbers to
     store on the node. Integrating those over dt is the same as
     integrating the command over dt * delta_alpha.
 
-    A hold has delta_alpha 0 and adds nothing. The tick that reaches
-    alpha 1 adds only the leftover fraction. The seconds already
-    covered by earlier partials stay covered. The next frame, after
+    A hold has delta_alpha 0 and adds nothing. The mini-step that
+    reaches alpha 1 adds only the leftover fraction. The seconds already
+    covered by earlier partials stay covered. The next target, after
     the generator advances, is a fresh dt of the full command.
 
     The yaw rotation that turns dx, dy into the world frame stays in
@@ -385,15 +388,15 @@ def odometry_increment(linear_x, linear_y, angular_z, delta_alpha,
 
 
 class Gait5Session(object):
-    """One gait-5 generator, and the film frame it has not finished.
+    """One gait-5 generator, and the target it has not finished.
 
-    send() on the generator yields six feet and then moves the
+    gen_next_mini_step_yield yields six feet and then moves the
     cursor. While waiting() is true the loop keeps those feet and
-    does not call send(). A new Twist sitting in the queue does not
+    does not call it. A new Twist sitting in the queue does not
     take over either: takeover waits for last_part, and last_part is
-    honored only when this frame is accepted at alpha 1.
+    honored only when target_feet_positions are accepted at alpha 1.
 
-    alpha_done is how far along the open frame has been sent. It
+    alpha_done is how far along the open target has been sent. It
     becomes 1 only when the generator's own feet pass the gate.
     A bisected fraction stays below 1, and the cursor stays put.
     """
@@ -402,11 +405,11 @@ class Gait5Session(object):
         self.generator = generator
         self.ik = ik
         self.backend = backend
-        # 1 and no frame: the loop may call send(). A fresh session
-        # has not opened a frame yet.
+        # 1 and no target: the loop may call gen_next_mini_step_yield.
+        # A fresh session has not begun a target yet.
         self.alpha_done = 1.0
         self.anchor = None
-        self.frame = None
+        self.target_feet_positions = None
         self.params = None
         self.slow = None
         self.last_part = False
@@ -415,63 +418,68 @@ class Gait5Session(object):
         """Solve the stance the body is already standing on.
 
         Nothing is published. Those angles become the previous sent
-        pose, so the first moving frame is measured from the stand
-        and not from zeros. The anchor is this pose: the start of
-        the bout. A stance the backend refuses leaves previous
-        empty, and the next frame holds with that reason.
+        pose, so the first target is measured from the stand and not
+        from zeros. The anchor is this pose: the start of the bout.
+        A stance the backend refuses leaves previous empty, and the
+        next target holds with that reason.
         """
         self.anchor = pose
         return self.ik.establish_reference(pose)
 
     def waiting(self):
-        """True while this frame has not been accepted at alpha 1."""
-        return self.frame is not None and self.alpha_done < 1.0
+        """True while this target has not been accepted at alpha 1."""
+        return (
+            self.target_feet_positions is not None
+            and self.alpha_done < 1.0)
 
     def held(self):
-        """Feet, params, and the blend flag to reuse instead of send()."""
-        return self.frame, self.params, self.slow
+        """Feet, params, and slow flag, reused instead of a new yield."""
+        return self.target_feet_positions, self.params, self.slow
 
-    def open_frame(self, feet, params, slow, last_part):
-        """A send() just yielded these feet. They are the open frame.
+    def begin_target(self, feet, params, slow, last_part):
+        """gen_next_mini_step_yield just yielded these feet.
 
-        last_part is stored and not acted on. The loop honors it
-        only when step() reports the boundary. Calling this again
-        on a frame that is still waiting would throw away the
-        fraction already sent. The loop calls it only after send().
+        They are the open target. last_part is stored and not acted
+        on. The loop honors it only when mini_step() reports the
+        boundary. Calling this again on a target that is still
+        waiting would throw away the fraction already sent. The
+        loop calls this only after that yield.
         """
         if self.anchor is None:
             self.anchor = feet
-        self.frame = feet
+        self.target_feet_positions = feet
         self.params = params
         self.slow = slow
         self.last_part = bool(last_part)
         self.alpha_done = 0.0
 
-    def step(self):
-        """Walk the open frame as far as the gate allows.
+    def mini_step(self):
+        """Walk the open target as far as the gate allows.
 
-        Returns the FrameStep, the fraction completed on this tick
-        (delta_alpha), and whether the generator boundary may run.
-        A hold returns delta 0 and does not release the boundary.
-        A partial keeps the same frame. A sent frame moves the
-        anchor to the generator's own feet and clears the hold, so
-        the next tick may call send().
+        Returns the MiniStepResult, the fraction completed on this
+        mini-step (delta_alpha), and whether the gait-step boundary
+        may run. A hold returns delta 0 and does not release the
+        boundary. A partial keeps the same target. A sent target
+        moves the anchor to the generator's own feet and clears the
+        hold, so the next mini-step may call
+        gen_next_mini_step_yield().
         """
         before = self.alpha_done
-        taken = approach_frame(
-            self.ik, self.anchor, self.frame, self.alpha_done)
+        taken = approach_target(
+            self.ik, self.anchor, self.target_feet_positions,
+            self.alpha_done)
         self.alpha_done = taken.alpha_done
         finished = taken.decision == "sent"
         boundary = finished and self.last_part
         if finished:
-            self.anchor = self.frame
-            self.frame = None
+            self.anchor = self.target_feet_positions
+            self.target_feet_positions = None
             self.last_part = False
         return taken, self.alpha_done - before, boundary
 
 
 def read_max_step_rad():
-    """The step limit safety.cpp returns, or None if the import fails.
+    """The max_step_rad limit safety.cpp returns, or None if the import fails.
 
     The startup line prints this number once, and prints the peak
     as that number divided by 1.5, which is how safety.cpp defines
@@ -487,7 +495,7 @@ def read_max_step_rad():
 
 
 def _measured_peak(max_step_rad):
-    """The gait-5 peak implied by the step limit, or 'unset'.
+    """The gait-5 peak implied by max_step_rad, or 'unset'.
 
     safety.cpp stores 1.5 times the measured peak. A startup value
     that is not a number means the import failed, and there is no
@@ -529,17 +537,17 @@ class HoldWatch(object):
         self.streak = 0
         self.errors = 0
 
-    def note(self, logger, step):
-        if step.decision == "held":
-            _warn_refusal(logger, step, "holding")
+    def note(self, logger, mini_step_result):
+        if mini_step_result.decision == "held":
+            _warn_refusal(logger, mini_step_result, "holding")
             self.streak += 1
             if self.streak == 5:
                 self.errors += 1
                 logger.error(
-                    "holding last safe pose, generator frame frozen")
+                    "holding last safe pose, generator target frozen")
             return
-        if step.decision == "partial":
-            _warn_refusal(logger, step, "partial")
+        if mini_step_result.decision == "partial":
+            _warn_refusal(logger, mini_step_result, "partial")
         self.streak = 0
 
 
@@ -580,9 +588,9 @@ class TraceWriter(object):
     """The only thread that writes the CSV.
 
     The 20 ms loop builds a row and calls put. put uses block=False.
-    A full queue raises queue.Full; that row is dropped and the tick
-    continues. A blocking put would stop the tick at the moment the
-    queue hits 200, which is the stall this thread exists to avoid.
+    A full queue raises queue.Full; that row is dropped and the
+    mini-step continues. A blocking put would stop the mini-step
+    when the queue hits 200, which is the stall this thread exists to avoid.
     A drop logs one WARN per second, not one line per dropped row.
 
     The file is opened on the first row, appended, and given a header
@@ -660,30 +668,30 @@ class TraceWriter(object):
                 handle.close()
 
 
-def trace_row(t_s, backend, step):
+def trace_row(t_s, backend, mini_step_result):
     """One CSV row. Strings, already formatted, header order.
 
     held stores the angles that were refused, so a later plot shows
     the command that was blocked. partial and sent store the angles
-    that were sent. The foot columns are the feet solved this tick.
+    that were sent. The foot columns are the feet solved this mini-step.
     """
     joint = ""
-    if step.joint_id:
-        joint = str(step.joint_id)
+    if mini_step_result.joint_id:
+        joint = str(mini_step_result.joint_id)
     fields = [
         _fmt(t_s, 6),
         backend,
-        step.decision,
-        _fmt(step.alpha, 8),
-        step.reason,
+        mini_step_result.decision,
+        _fmt(mini_step_result.alpha, 8),
+        mini_step_result.reason,
         joint,
     ]
-    for foot in step.feet:
+    for foot in mini_step_result.feet:
         for coord in foot:
             fields.append(_fmt(coord, 4))
-    for angle in step.angles:
+    for angle in mini_step_result.angles:
         fields.append(_fmt(angle, 8))
-    for value in step.dq:
+    for value in mini_step_result.dq:
         if value == "":
             fields.append("")
         else:
@@ -715,10 +723,11 @@ def _steps(previous, angles):
     return tuple(a - b for a, b in zip(angles, previous))
 
 
-def _step(decision, alpha, alpha_done, source, reason, joint_id,
-          feet, source_feet, dq, publish,
-          q_now_rad=None, q_previous_rad=None, leg=None):
-    return FrameStep(
+def _mini_step_result(
+        decision, alpha, alpha_done, source, reason, joint_id,
+        feet, source_feet, dq, publish,
+        q_now_rad=None, q_previous_rad=None, leg=None):
+    return MiniStepResult(
         decision, alpha, alpha_done, source.angles, reason, joint_id,
         source.leg if leg is None else leg,
         source.q_now_rad if q_now_rad is None else q_now_rad,
@@ -726,14 +735,15 @@ def _step(decision, alpha, alpha_done, source, reason, joint_id,
         feet, source_feet, dq, publish)
 
 
-def _hold(full, alpha_done, feet_frame, previous):
+def _hold(full, alpha_done, target_feet_positions, previous):
     # q columns are the angles that were refused. previous is not updated.
-    return _step(
+    return _mini_step_result(
         "held", 0.0, alpha_done, full, full.reason, full.joint_id,
-        feet_frame, feet_frame, _steps(previous, full.angles), False)
+        target_feet_positions, target_feet_positions,
+        _steps(previous, full.angles), False)
 
 
-def _bisect(ik, feet_anchor, feet_frame, alpha_done):
+def _bisect(ik, feet_anchor, target_feet_positions, alpha_done):
     span = 1.0 - alpha_done
     grain = span / float(BISECTION_PARTS)
     lo = alpha_done
@@ -745,7 +755,7 @@ def _bisect(ik, feet_anchor, feet_frame, alpha_done):
         mid = 0.5 * (lo + hi)
         if mid - alpha_done < grain:
             break
-        feet = _interpolate(feet_anchor, feet_frame, mid)
+        feet = _interpolate(feet_anchor, target_feet_positions, mid)
         trial = ik.solve(feet)
         if trial.allow:
             best = mid
@@ -759,37 +769,37 @@ def _bisect(ik, feet_anchor, feet_frame, alpha_done):
     return best, best_decision, best_feet
 
 
-def _interpolate(feet_anchor, feet_frame, alpha):
+def _interpolate(feet_anchor, target_feet_positions, alpha):
     # One fraction for every leg. A per-leg fraction would twist the body.
     feet = []
-    for anchor, frame in zip(feet_anchor, feet_frame):
+    for anchor, target_position in zip(feet_anchor, target_feet_positions):
         feet.append(tuple(
-            anchor[axis] + alpha * (frame[axis] - anchor[axis])
+            anchor[axis] + alpha * (target_position[axis] - anchor[axis])
             for axis in range(3)))
     return tuple(feet)
 
 
-def _warn_refusal(logger, step, how):
-    foot = _foot_of(step)
-    joint = step.joint_id if step.joint_id else ""
+def _warn_refusal(logger, mini_step_result, how):
+    foot = _foot_of(mini_step_result)
+    joint = mini_step_result.joint_id if mini_step_result.joint_id else ""
     logger.warning(
         "%s joint=%s angle=%.4f previous=%.4f foot=%s %s"
-        % (step.reason, joint, step.q_now_rad, step.q_previous_rad,
-           foot, how))
+        % (mini_step_result.reason, joint, mini_step_result.q_now_rad,
+           mini_step_result.q_previous_rad, foot, how))
 
 
-def _foot_of(step):
+def _foot_of(mini_step_result):
     # The generator's foot, not the partial point. joint 1 is leg 1.
     index = None
-    if step.joint_id >= 1:
-        index = (step.joint_id - 1) // 3
-    elif step.leg >= 1:
-        index = step.leg - 1
+    if mini_step_result.joint_id >= 1:
+        index = (mini_step_result.joint_id - 1) // 3
+    elif mini_step_result.leg >= 1:
+        index = mini_step_result.leg - 1
     if index is None:
         return None
-    if index >= len(step.source_feet):
+    if index >= len(mini_step_result.source_feet):
         return None
-    return step.source_feet[index]
+    return mini_step_result.source_feet[index]
 
 
 def _fmt(value, digits):

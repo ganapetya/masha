@@ -32,7 +32,7 @@ is `hexapod_kinematics.solve_pose` followed by `hexapod_kinematics.gate`.
 
 Two more facts that only the new path can produce:
 
-- A `partial` row exists only in `approach_frame`, and only after the
+- A `partial` row exists only in `approach_target`, and only after the
   gate returns `rate_limit`. `VendorLegIk` always returns allow, and it
   has no bisection.
 - The partial alphas are on the 1/256 grid (`0.4609375` is 118/256,
@@ -73,7 +73,7 @@ FollowGaitGenerator          move.py
         |
         v
 StepController.loop          a Python thread, sleep 0.02 s
-  Gait5Session.step
+  Gait5Session.mini_step
         |
         v
 HexapodLegIk.solve
@@ -701,8 +701,8 @@ does not throw.
 The solver has named eighteen angles. A second question remains: given
 those angles and the angles last actually sent, may this pose be
 published? The gate answers once for the whole pose. It does not fold
-a triangle, pick a foot, clamp a hinge, or invent a shorter step. A
-shorter step is the caller's later repair, in `approach_frame`.
+a triangle, pick a foot, clamp a hinge, or invent a shorter move. A
+shorter fraction is the caller's later repair, in `approach_target`.
 
 ### Where it sits
 
@@ -926,31 +926,31 @@ window on the way to the servo. Its `IkDecision` is always allow.
 The import happens on the first solve. `establish_reference` is the
 special case at the start of a bout: the gate answers `no_reference`
 when previous is empty, even for a legal stand. The stand is compared
-with itself, so the window is checked and the step is zero. Those
-angles become `previous`. Nothing is published: the feet are already
-there. A stance the backend refuses leaves `previous` empty, and the
-next frame holds with that reason.
+with itself, so the window is checked and the joint change is zero.
+Those angles become `previous`. Nothing is published: the feet are
+already there. A stance the backend refuses leaves `previous` empty,
+and the next target holds with that reason.
 
-**approach_frame** is the only place that turns one `rate_limit` into
-a shorter step. The order is fixed.
+**approach_target** is the only place that turns one `rate_limit` into
+a shorter fraction of the target. The order is fixed.
 
-1. Solve the generator's own feet. If the gate allows them, this tick is `sent`, `alpha` becomes 1, and the next tick may ask the generator for a new frame.
-2. If the only failure is `rate_limit`, the feet are legal and the step is too big. Eight bisections search the open interval past `alpha_done`. One fraction is shared by all six legs:
+1. Solve the generator's own feet. If the gate allows them, this mini-step is `sent`, `alpha` becomes 1, and the next mini-step may ask the generator for a new target.
+2. If the only failure is `rate_limit`, the feet are legal and the joint move is too big. Eight bisections search the open interval past `alpha_done`. One fraction is shared by all six legs:
 
    ```
-   feet(alpha) = anchor + alpha * (frame - anchor)
+   feet(alpha) = anchor + alpha * (target_feet_positions - anchor)
    ```
 
-   A per-leg fraction would twist the body. The largest alpha that passes the whole gate is a `partial`. The generator stays on this frame.
+   A per-leg fraction would twist the body. The largest alpha that passes the whole gate is a `partial`. The generator stays on this target.
 3. Any other reason is a hard hold. Nothing is published. `alpha_done` and the previous sent pose stay where they are.
 4. A `rate_limit` whose search finds nothing is the same hold. A branch flip is this case: the foot barely moves and every fraction still jumps by about a radian, because the standing branch does not change along the segment. Catch-up must not publish that jump.
 
-`alpha` becomes 1 only when step 1 passes. Eight bisections land on
+`alpha` becomes 1 only when point 1 passes. Eight bisections land on
 a 1/256 grid of the remaining segment, so `0.996` is still a partial.
-Rounding that up to 1 would start the next frame while these feet
+Rounding that up to 1 would start the next target while these feet
 were still short, and it would do it without the gate having allowed
-this frame. A candidate less than one part in 256 past `alpha_done`
-is no progress, and that tick is a hold.
+this target. A candidate less than one part in 256 past `alpha_done`
+is no progress, and that mini-step is a hold.
 
 The partial row still says `rate_limit`, and it names the joint of
 the generator's own feet. The angles stored on a partial row are the
@@ -958,21 +958,21 @@ angles that were sent. The WARN names the generator's foot, because
 that is the foot that was refused.
 
 This pause is for a tripod. Three feet stay on the ground while one
-frame is stretched over several ticks, so the body is not depending
-on a swing finishing on time. A gait that stays upright by momentum
-would fall if a swing were slowed this way. That gait is outside
-this module.
+target is stretched over several mini-steps, so the body is not
+depending on a swing finishing on time. A gait that stays upright by
+momentum would fall if a swing were slowed this way. That gait is
+outside this module.
 
-**Gait5Session** is one generator and the film frame it has not
-finished. `send()` on the generator yields six feet and moves the
-cursor. While `waiting()` is true the loop keeps those feet and does
-not call `send()`. `open_frame` stores `last_part` and does not act
-on it. The boundary runs only when `step()` reports the frame
-accepted at alpha 1. Honoring `last_part` early would start the next
-cycle while the feet were still short.
+**Gait5Session** is one generator and the target it has not finished.
+`gen_next_mini_step_yield()` yields six feet and moves the cursor. While
+`waiting()` is true the loop keeps those feet and does not call it.
+`begin_target` stores `last_part` and does not act on it.
+The boundary runs only when `mini_step()` reports the target accepted
+at alpha 1. Honoring `last_part` early would start the next gait step
+while the feet were still short.
 
 **odometry_increment** scales the body twist by `delta_alpha`. A hold
-adds nothing. The tick that reaches alpha 1 adds only the leftover
+adds nothing. The mini-step that reaches alpha 1 adds only the leftover
 fraction. It does not repay the seconds the partials already covered.
 The yaw rotation into the world frame stays in the 20 ms loop. This
 function does not know the current yaw.
@@ -980,7 +980,7 @@ function does not know the current yaw.
 **TraceWriter** is a second thread, the only one that writes the CSV.
 The 20 ms loop calls `put` with `block=False`. A full queue (200
 rows) drops the row and warns once a second. A blocking put would
-stop the tick, which is the stall this thread exists to avoid. The
+stop the mini-step, which is the stall this thread exists to avoid. The
 file is appended, with a header when it is created. Flush is every
 25 rows or every 0.5 s. `close` waits at most 0.2 s, so a halt is
 not held up by the disk. The path is
@@ -1043,13 +1043,13 @@ it for the next generator, not for the session already walking.
 
 On each iteration, for a current moving generator:
 
-- If a gait-5 session is `waiting()`, reuse the held feet. Do not call `send()`.
-- Otherwise `send()` the generator. That yields six feet, `last_part`, the params, and the slow word.
+- If a gait-5 session is `waiting()`, reuse the held feet. Do not call `gen_next_mini_step_yield()`.
+- Otherwise call `gen_next_mini_step_yield()`. That yields six feet, `last_part`, the params, and the slow word.
 - If `params` is a `CmdVelParams` and `params.gait == 5`, this is the hunter follow walk.
-  - `_begin_gait5` creates the session on the first tick and logs `gait 5 backend=...`.
-  - `open_frame` on a freshly yielded pose.
-  - `session.step()`, then `_record_gait5` (the WARN, the one-hertz line, the CSV row).
-  - `honor_boundary` only when `step()` says the frame finished and this yield was `last_part`.
+  - `_begin_gait5` creates the session on the first mini-step and logs `gait 5 backend=...`.
+  - `begin_target` on a freshly yielded pose.
+  - `session.mini_step()`, then `_record_gait5` (the WARN, the one-hertz line, the CSV row).
+  - `honor_boundary` only when `mini_step()` says the target finished and this yield was `last_part`.
   - Duration 0.05 s on the first slice of a `cmd_true` blend, otherwise 0.02 s. The thread still sleeps 0.02 s.
   - `should_publish`: a hold does not publish. A dry run (`pseudo`) does not publish either.
   - `_publish_leg_radians` hands eighteen radians, ids 1..18, to `JointControl`. It does not call `kinematics.so`, and it does not replace `self.pose`.
@@ -1089,7 +1089,7 @@ a walk on the robot.
 ### Recap
 
 - The loop is a 20 ms Python thread. Gait 5 goes through `Gait5Session`. Every other gait goes through `set_pose_base`.
-- An unfinished frame is reused. `send()` waits until alpha is 1.
+- An unfinished target is reused. `gen_next_mini_step_yield()` waits until alpha is 1.
 - Publish is eighteen radians into `JointControl`, and only when the session's `publish` flag is true.
 
 ## Sitting 11 — Read the hunt as a worked example
@@ -1100,9 +1100,9 @@ functions, with the CSV open.
 1. Find the startup line. It was false, and it printed the step limit. That print is `read_max_step_rad` importing the module at process start. It is not the backend of the walk.
 2. Find the first `gait 5 backend=hexapod`. That is `_begin_gait5` → `start_gait5` → `begin_generator`. From there to the end of that log, count vendor. The count is zero.
 3. Pick a second-log line `backend=hexapod decision=sent max_dq=0.2642`. That `max_dq` is the largest absolute joint step `SecondLog` saw in that second. It sits just under `max_step_rad()`. A vendor walk would not be clipped to this number, and it would not print `backend=hexapod`.
-4. In the CSV, filter `decision == partial`. Confirm every `reason` is `rate_limit` and every `joint` is a femur (2, 5, 8, 11, 14, or 17). That is `approach_frame` step 2, and it matches the calibration sentence that the peak lives on a femur.
-5. Take one partial whose alpha is `0.99609375`. That is 255/256. The next rows of that bout should reach a `sent` with alpha 1. The generator was held on that frame until the gate allowed the generator's own feet.
-6. Confirm there is no `held` row and no `holding last safe pose` ERROR. The hunt never asked for an unreachable foot, a near-singular knee, or a joint past ±120°. The only refusal was "this legal step is too big for one tick," and the catch-up finished it.
+4. In the CSV, filter `decision == partial`. Confirm every `reason` is `rate_limit` and every `joint` is a femur (2, 5, 8, 11, 14, or 17). That is `approach_target` point 2, and it matches the calibration sentence that the peak lives on a femur.
+5. Take one partial whose alpha is `0.99609375`. That is 255/256. The next rows of that bout should reach a `sent` with alpha 1. The generator was held on that target until the gate allowed the generator's own feet.
+6. Confirm there is no `held` row and no `holding last safe pose` ERROR. The hunt never asked for an unreachable foot, a near-singular knee, or a joint past ±120°. The only refusal was "this legal joint move is too big for one mini-step," and the catch-up finished it.
 
 ### Recap
 

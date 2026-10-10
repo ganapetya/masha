@@ -127,7 +127,7 @@ each 20 ms:
 
 **Rule the comments insist on:** a gait step that has started is finished before a new generator is swapped in (`last_part` flag). That is why a halt can take up to one step period, and why Sprint 3 should wait a fraction of a second after `gait=-2` before playing a dance.
 
-Generators are created on the ROS callback thread, primed with `.send(None)`, stored as `new_moving_generator` under `self.lock`. The loop thread consumes them. Same pattern for pose transformers.
+Generators are created on the ROS callback thread, parked with `gen_advance_to_first_yield`, and stored as `new_moving_generator` under `self.lock`. The loop thread consumes them. The pose transformer uses the same park, then `gen_next_lean_slice`.
 
 The teacher walk-through of that walk job (two generators, table-of-xyz, finish-the-step, same grain as the lean write-up) is [`DANCE_ACTION_SETS_DETAILS.md`](DANCE_ACTION_SETS_DETAILS.md) §8.
 

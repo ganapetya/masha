@@ -120,12 +120,14 @@ def print_stand(name, feet):
 def cycle_frames(vx_mm_s, vy_mm_s, wz_rad_s, stance):
     """One steady gait-5 cycle, in the order the 20 ms loop plays it.
 
-    FollowGaitGenerator is primed with send(None), the way
-    StepController starts it. Status 'first' plays the intro. Only
-    its first frame is returned, so the stand-to-splice step can be
-    printed beside the cycle. Status 'running' then yields the baked
-    table from frame 0 through the last frame. That table is one
-    period. The caller adds the seam from the last frame back to the
+    This script drives the generator itself, so it calls send().
+    StepController does the same two resumes through
+    gen_advance_to_first_yield and gen_next_mini_step_yield.
+    Status 'first' plays the intro. Only its first frame is
+    returned, so the stand-to-splice step can be printed beside
+    the cycle. Status 'running' then yields the baked table from
+    frame 0 through the last frame. That table is one period.
+    The caller adds the seam from the last frame back to the
     first, which is the tick the next lap actually takes.
 
     finish_ps is cleared first. A leftover hand-off pose would splice
