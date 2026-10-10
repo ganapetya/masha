@@ -11,16 +11,17 @@ import copy
 # it through _GeneratorCall, and those methods are what call send():
 #   1) gen_advance_to_first_yield once, up to the first yield
 #   2) then gen_next_mini_step_yield(pose, generator_slice), which returns
-#      (out_pose, last_part, params, slow)
+#      (out_pose, last_part, params, ask_for_50_ms_blend)
 # generator_slice is one of the three texts defined just below.
 # The generator uses it to choose which part of its prepared foot
 # list to yield. last_part is True when a gait step just wrapped,
 # so the outer loop in step_controller can swap or stop generators
 # on that accepted gait step.
-# slow is a bool. True asks for a 50 ms servo blend on this one pose.
-# False keeps the usual 20 ms command. A counted walk always yields
-# False. The boundary tells a counted walk from a velocity walk by the
-# params object (MovingParams versus CmdVelParams), not by this flag.
+# ask_for_50_ms_blend is a bool. True asks for a 50 ms servo blend
+# on this one pose. False keeps the usual 20 ms command. A counted
+# walk always yields False. The walk state tells a counted walk
+# from a velocity walk by the params object (MovingParams versus
+# CmdVelParams), not by this flag.
 
 # The three texts _WalkState.generator_slice can hold. They are
 # defined here because this file is where the generator compares
@@ -33,8 +34,8 @@ import copy
 # generator_running is the whole prepared gait step, wrapping at
 # the end. generator_outro is the ending section, from the start
 # of the list up to the splice. While that ending plays, each
-# pose is saved in finish_ps so the next generator can begin
-# near those feet.
+# pose is saved in feet_saved_for_the_next_generator so the next
+# generator can begin near those feet.
 generator_intro = 'generator_intro'
 generator_running = 'generator_running'
 generator_outro = 'generator_outro'
@@ -209,18 +210,19 @@ def total_dist_sq(a_pts, b_pts):
 
 # Module-level handoff shared by CmdVelGenerator and FollowGaitGenerator.
 # While generator_slice is generator_outro, the live generator stores
-# the pose it is about to yield into finish_ps, on every outro wake,
+# the pose it is about to yield into feet_saved_for_the_next_generator, on every outro wake,
 # so the last one is the pose the feet were given when that section
 # wrapped. The next generator searches its new gait step for the
 # target nearest that pose and starts there, which keeps the feet
-# from jumping. slow is the blend flag yielded with each pose. True
-# asks the servo loop for a 50 ms blend. False keeps the usual 20 ms
-# command. stop means we refused to splice at target 0, because that
-# target would make the outro an empty list. finish_index is the
+# from jumping. ask_for_50_ms_blend is the blend flag yielded with
+# each pose. True asks the servo loop for a 50 ms blend. False
+# keeps the usual 20 ms command. refused_to_start_at_the_seam means
+# we refused to splice at target 0, because that target would make
+# the outro an empty list. finish_index is the
 # cursor after an outro yield. No other function reads it.
-finish_ps = []
-slow = False
-stop = False   
+feet_saved_for_the_next_generator = []
+ask_for_50_ms_blend = False
+refused_to_start_at_the_seam = False   
 finish_index = None
 
 def CmdVelGenerator(params, log=None):
@@ -236,13 +238,13 @@ def CmdVelGenerator(params, log=None):
     the next generator knows how to meet. generator_running ignores
     the cut and reads the whole table, wrapping at the end.
     """
-    global finish_ps, slow,  stop, finish_index
+    global feet_saved_for_the_next_generator, ask_for_50_ms_blend, refused_to_start_at_the_seam, finish_index
     height = params.height
     # kinematics.cmd_vel_new_point uses the opposite numbering from MovingParams:
     # here 1 = tripod, 2 = ripple. Incoming params.gait is still 1=ripple, 2=tripod.
     gait = 2 if params.gait == 1 else 1
 
-    org_pose = None
+    stance_this_table_was_baked_from = None
     phase_index = 0 # 当前相位游标(index into the current phase slice being played)
     # One target every 20 ms. round then ceil so 1.0 s → 50 targets.
     targets_per_gait_step = math.ceil(
@@ -266,9 +268,9 @@ def CmdVelGenerator(params, log=None):
     cur_pose, generator_slice = yield None
     while True:
         # phase_index = 0
-        org_pose = cur_pose
+        stance_this_table_was_baked_from = cur_pose
         if params.relative_h:
-            height = abs(org_pose[0][2]) * (params.height / 100.0) 
+            height = abs(stance_this_table_was_baked_from[0][2]) * (params.height / 100.0) 
         aep, pep = kinematics.cmd_vel_aep_pep(
             cur_pose,
             aep_offset_x,
@@ -278,7 +280,7 @@ def CmdVelGenerator(params, log=None):
         )
 
         # Precompute one full cycle of 6-leg poses, one pose per phase.
-        steps = []
+        prepared_targets = []
         for phase in phase_list:
             ps = kinematics.cmd_vel_new_point(
                 gait,
@@ -287,38 +289,38 @@ def CmdVelGenerator(params, log=None):
                 aep,
                 pep
             )
-            steps.append(ps)
+            prepared_targets.append(ps)
 
-        # Pick a splice index `idx` so we do not start at a pose far from
-        # the feet's current position (finish_ps from the previous generator).
-        if finish_ps:
-            dists = [ total_dist_sq(finish_ps, bi) for bi in steps ]
-            idx = min(range(len(dists)), key=lambda i: dists[i])
+        # Pick a splice index `splice_index` so we do not start at a pose far from
+        # the feet's current position (feet_saved_for_the_next_generator from the previous generator).
+        if feet_saved_for_the_next_generator:
+            dists = [ total_dist_sq(feet_saved_for_the_next_generator, bi) for bi in prepared_targets ]
+            splice_index = min(range(len(dists)), key=lambda i: dists[i])
 
-            if idx == 0:
+            if splice_index == 0:
                 # phase 0 is the gait-step wrap; skip it so the first yield is a real target
-                idx = 1
+                splice_index = 1
 
-                stop = True    
+                refused_to_start_at_the_seam = True    
             else:
-                stop = False                     
+                refused_to_start_at_the_seam = False                     
         else:
             # No previous pose: start near the mid-cycle sample whose leg-1 x is closest to 0
-            idx = min(range(len(steps)//2), key=lambda i: abs(steps[:len(steps) // 2][i][1][0]))
-            if idx == 0:
-                idx = 1
+            splice_index = min(range(len(prepared_targets)//2), key=lambda i: abs(prepared_targets[:len(prepared_targets) // 2][i][1][0]))
+            if splice_index == 0:
+                splice_index = 1
 
-                stop = True      
+                refused_to_start_at_the_seam = True      
             else:
-                stop = False     
+                refused_to_start_at_the_seam = False     
  
-        # The table is cut at the splice. steps1 is the opening
+        # The table is cut at the splice. targets_for_generator_intro is the opening
         # section, played while the walk state says generator_intro.
-        # steps2 is the ending section, played while it says
+        # targets_for_generator_outro is the ending section, played while it says
         # generator_outro. generator_running does not use either
-        # cut. It reads steps from beginning to end.
-        steps1 = steps[idx:]
-        steps2 = steps[:idx]
+        # cut. It reads prepared_targets from beginning to end.
+        targets_for_generator_intro = prepared_targets[splice_index:]
+        targets_for_generator_outro = prepared_targets[:splice_index]
 
         while True:
             if generator_slice == generator_intro:
@@ -330,31 +332,31 @@ def CmdVelGenerator(params, log=None):
                 # 50 ms blend on this one wake. The saved pose is
                 # then cleared, so later wakes of this same opening
                 # do not ask again.
-                ps = steps1[phase_index]
-                if finish_ps:
-                    distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, finish_ps)])
-                    if distances > 7 or stop:
-                        slow = True
-                    finish_ps = []
+                ps = targets_for_generator_intro[phase_index]
+                if feet_saved_for_the_next_generator:
+                    distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, feet_saved_for_the_next_generator)])
+                    if distances > 7 or refused_to_start_at_the_seam:
+                        ask_for_50_ms_blend = True
+                    feet_saved_for_the_next_generator = []
                 else:
-                    slow = False
-                phase_index = (phase_index + 1) % (len(steps) - idx)
+                    ask_for_50_ms_blend = False
+                phase_index = (phase_index + 1) % (len(prepared_targets) - splice_index)
             elif generator_slice == generator_outro:
                 # Ending section: from the start of the table up to
                 # the splice, so a stop can park on a pose the next
                 # generator can meet. Every pose of this section is
-                # written into finish_ps. The write that matters is
+                # written into feet_saved_for_the_next_generator. The write that matters is
                 # the last one, because that is the pose the feet
                 # actually hold when the section wraps.
-                ps = steps2[phase_index]
-                phase_index = (phase_index + 1) % (idx)
-                finish_ps = ps
+                ps = targets_for_generator_outro[phase_index]
+                phase_index = (phase_index + 1) % (splice_index)
+                feet_saved_for_the_next_generator = ps
                 finish_index = phase_index
             else:
                 # generator_running, and any text that is neither
                 # the opening nor the ending. The whole gait step,
                 # seam included, one target after another.
-                ps = steps[phase_index]
+                ps = prepared_targets[phase_index]
                 phase_index = (phase_index + 1) % targets_per_gait_step
             if phase_index == 0:
                 # The cursor wrapped, so this pose is the last
@@ -364,11 +366,11 @@ def CmdVelGenerator(params, log=None):
                 # comes back on the resume is the walk state's new
                 # generator_slice, which is how the section changes
                 # without this function writing the walk state.
-                cur_pose, generator_slice = yield ps, True, params, slow
+                cur_pose, generator_slice = yield ps, True, params, ask_for_50_ms_blend
             else:
-                cur_pose, generator_slice = yield ps, False, params, slow
+                cur_pose, generator_slice = yield ps, False, params, ask_for_50_ms_blend
             # 两次初始姿态变了我们需要重算(stance pose object changed: recompute AEP/PEP and the cycle table)
-            if cur_pose is not org_pose:
+            if cur_pose is not stance_this_table_was_baked_from:
                 break
 
 
@@ -390,20 +392,36 @@ def CmdVelGenerator(params, log=None):
 
 _PI = math.pi
 _TWO_PI = 2.0 * math.pi
-_W_EPS = 1.0e-6
-_GROUP_A = (0, 2, 4)
+# A yaw rate smaller than this is treated as a straight walk.
+# The SE(2) formula divides by yaw rate, and that division is
+# the straight-line case written out by hand.
+yaw_rate_treated_as_straight = 1.0e-6
+# Leg indices 0, 2, 4 are left-front, left-rear, right-middle.
+# That tripod swings in the first half of the gait step. The
+# other tripod is 1, 3, 5.
+legs_that_swing_in_the_first_half = (0, 2, 4)
 
 
-def _sigma(tau):
-    """Swing clock only. σ-dot = 0 at lift and land (kiss the floor)."""
-    t = 0.0 if tau < 0.0 else (1.0 if tau > 1.0 else tau)
+def _swing_progress_smooth_at_lift_and_land(fraction_through_this_half):
+    """Swing clock only. The speed is 0 at lift and at land.
+
+    fraction_through_this_half runs from 0 at the start of this
+    half of the gait step to 1 at the end of that half. The
+    polynomial is flat at both ends, so the toe meets the floor
+    without a speed jump.
+    """
+    t = fraction_through_this_half
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
     return 10.0 * t**3 - 15.0 * t**4 + 6.0 * t**5
 
 
 def _se2_exp(vx, vy, wz, t):
     """SE(2) exponential of a constant body twist. vx, vy mm/s, t seconds."""
     theta = wz * t
-    if abs(wz) < _W_EPS:
+    if abs(wz) < yaw_rate_treated_as_straight:
         return vx * t, vy * t, theta
     s = math.sin(theta)
     omc = 1.0 - math.cos(theta)
@@ -415,61 +433,109 @@ def _rot2(x, y, a):
     return x * c - y * s, x * s + y * c
 
 
-def _body_of_world_fixed(p0, vx, vy, wz, t):
+def _foot_if_it_stayed_planted_in_the_world(home_foot, vx, vy, wz, t):
+    """Where a planted toe sits in the body frame after time t.
+
+    The toe does not move in the world. The body does. This is
+    the toe's coordinates once the body has been driven by the
+    twist for t seconds.
+    """
     tx, ty, th = _se2_exp(vx, vy, wz, t)
-    x, y = _rot2(p0[0] - tx, p0[1] - ty, -th)
-    return x, y, p0[2]
+    x, y = _rot2(home_foot[0] - tx, home_foot[1] - ty, -th)
+    return x, y, home_foot[2]
 
 
-def _clamp_stride(end_xy, p0, stride_max):
-    dx = end_xy[0] - p0[0]
-    dy = end_xy[1] - p0[1]
+def _clamp_stride(end_xy, home_foot, stride_max):
+    dx = end_xy[0] - home_foot[0]
+    dy = end_xy[1] - home_foot[1]
     d = math.hypot(dx, dy)
     if d <= stride_max or d < 1e-9:
         return end_xy
     s = stride_max / d
-    return (p0[0] + dx * s, p0[1] + dy * s)
+    return (home_foot[0] + dx * s, home_foot[1] + dy * s)
 
 
-def _aep_pep(p0, vx, vy, wz, ts, stride_max, linear_factor=1.0):
+def _where_the_foot_lands_and_lifts(
+        home_foot, vx, vy, wz, ts, stride_max, linear_factor=1.0):
+    """Landing point and lift point of one foot, in the body frame.
+
+    ts is half a gait step, in seconds. The swing foot lands at
+    where_the_swing_foot_lands. The stance foot lifts from
+    where_the_stance_foot_lifts. Both are clamped so they stay
+    inside stride_max of home_foot.
+    """
     vx *= linear_factor
     vy *= linear_factor
     half = 0.5 * ts
-    aep = _body_of_world_fixed(p0, vx, vy, wz, -half)
-    pep = _body_of_world_fixed(p0, vx, vy, wz, +half)
-    ax, ay = _clamp_stride((aep[0], aep[1]), p0, stride_max)
-    px, py = _clamp_stride((pep[0], pep[1]), p0, stride_max)
-    return (ax, ay, p0[2]), (px, py, p0[2])
+    where_the_swing_foot_lands = _foot_if_it_stayed_planted_in_the_world(
+        home_foot, vx, vy, wz, -half)
+    where_the_stance_foot_lifts = _foot_if_it_stayed_planted_in_the_world(
+        home_foot, vx, vy, wz, +half)
+    ax, ay = _clamp_stride(
+        (where_the_swing_foot_lands[0], where_the_swing_foot_lands[1]),
+        home_foot, stride_max)
+    px, py = _clamp_stride(
+        (where_the_stance_foot_lifts[0], where_the_stance_foot_lifts[1]),
+        home_foot, stride_max)
+    return (ax, ay, home_foot[2]), (px, py, home_foot[2])
 
 
-def sample_follow_gait(phi, vx, vy, wz, lift, period, nominal, stride_max=55.0, linear_factor=1.0):
-    """One 20 ms bead. vx,vy mm/s; lift mm; period s; nominal six (x,y,z) mm.
+def sample_follow_gait(
+        phase_radians_along_the_gait_step, vx, vy, wz,
+        peak_toe_clearance_mm, period, six_home_feet,
+        stride_max=55.0, linear_factor=1.0):
+    """One 20 ms sample of the six toes for gait 5.
 
-    Cycle clock keeps rolling (no rest at wrap). Swing uses sigma(τ).
+    vx, vy are millimetres per second. peak_toe_clearance_mm is
+    the highest the swing toe rises. period is one gait step, in
+    seconds. six_home_feet are the six stance tips the curves are
+    drawn around. The clock keeps rolling: there is no rest at
+    the wrap. A swinging toe uses the smooth swing progress.
     """
-    phi = phi % _TWO_PI
-    if phi < 0.0:
-        phi += _TWO_PI
+    phase = phase_radians_along_the_gait_step % _TWO_PI
+    if phase < 0.0:
+        phase += _TWO_PI
     T = period if period > 1e-3 else 0.70
     ts = 0.5 * T
-    a_swing = phi < _PI
-    tau_lin = (phi / _PI) if a_swing else ((phi - _PI) / _PI)
-    sig = _sigma(tau_lin)
+    first_half_of_the_gait_step = phase < _PI
+    if first_half_of_the_gait_step:
+        fraction_through_this_half = phase / _PI
+    else:
+        fraction_through_this_half = (phase - _PI) / _PI
+    swing_progress_smooth_at_lift_and_land = (
+        _swing_progress_smooth_at_lift_and_land(
+            fraction_through_this_half))
     feet = []
     for leg in range(6):
-        p0 = nominal[leg]
-        aep, pep = _aep_pep(p0, vx, vy, wz, ts, stride_max, linear_factor)
-        swinging = a_swing if (leg in _GROUP_A) else (not a_swing)
-        if swinging:
-            o = 1.0 - sig
-            x = o * pep[0] + sig * aep[0]
-            y = o * pep[1] + sig * aep[1]
-            z = p0[2] + 4.0 * sig * (1.0 - sig) * lift
+        home_foot = six_home_feet[leg]
+        where_the_swing_foot_lands, where_the_stance_foot_lifts = (
+            _where_the_foot_lands_and_lifts(
+                home_foot, vx, vy, wz, ts, stride_max, linear_factor))
+        if leg in legs_that_swing_in_the_first_half:
+            swinging = first_half_of_the_gait_step
         else:
-            o = 1.0 - tau_lin
-            x = o * aep[0] + tau_lin * pep[0]
-            y = o * aep[1] + tau_lin * pep[1]
-            z = p0[2]
+            swinging = not first_half_of_the_gait_step
+        if swinging:
+            still = 1.0 - swing_progress_smooth_at_lift_and_land
+            x = (still * where_the_stance_foot_lifts[0]
+                 + swing_progress_smooth_at_lift_and_land
+                 * where_the_swing_foot_lands[0])
+            y = (still * where_the_stance_foot_lifts[1]
+                 + swing_progress_smooth_at_lift_and_land
+                 * where_the_swing_foot_lands[1])
+            z = home_foot[2] + 4.0 * (
+                swing_progress_smooth_at_lift_and_land
+                * (1.0 - swing_progress_smooth_at_lift_and_land)
+                * peak_toe_clearance_mm)
+        else:
+            still = 1.0 - fraction_through_this_half
+            x = (still * where_the_swing_foot_lands[0]
+                 + fraction_through_this_half
+                 * where_the_stance_foot_lifts[0])
+            y = (still * where_the_swing_foot_lands[1]
+                 + fraction_through_this_half
+                 * where_the_stance_foot_lifts[1])
+            z = home_foot[2]
         feet.append((x, y, z))
     return feet
 
@@ -493,7 +559,7 @@ def FollowGaitGenerator(params, log=None):
     opening section, from the splice to the end of the table, which
     is a cold start and also the first period after a swap.
     generator_running reads the whole table. generator_outro reads
-    the ending section and saves each pose into finish_ps. The bool
+    the ending section and saves each pose into feet_saved_for_the_next_generator. The bool
     beside each pose is last_part. True means this section just
     wrapped, so the controller may order an outro or start a
     generator it stored earlier. A new Twist does not edit this
@@ -501,11 +567,11 @@ def FollowGaitGenerator(params, log=None):
     """
     # `global` is a write permit, not an import. These four names already
     # exist at the top of this file and are shared with CmdVelGenerator.
-    # Without `global`, `finish_ps = []` below would create a local and
+    # Without `global`, `feet_saved_for_the_next_generator = []` below would create a local and
     # the next generator would never see the hand-off pose.
-    # finish_ps is that hand-off: the previous animation's last feet, used
+    # feet_saved_for_the_next_generator is that hand-off: the previous animation's last feet, used
     # once so two generators can be glued without a servo snap.
-    global finish_ps, slow, stop, finish_index
+    global feet_saved_for_the_next_generator, ask_for_50_ms_blend, refused_to_start_at_the_seam, finish_index
 
     # Requested peak toe clearance, millimetres. relative_h may replace it
     # with a percent of the current stance height on each bake.
@@ -513,7 +579,7 @@ def FollowGaitGenerator(params, log=None):
     # Stance object this bake was computed from. The inner loop compares
     # it with `is` (same Python object). It is StepController.pose, the
     # stored foot targets, not a reading from the servos.
-    org_pose = None
+    stance_this_table_was_baked_from = None
     # Cursor into whichever slice we are playing. Survives a rebake;
     # the outer loop does not put it back to 0.
     phase_index = 0
@@ -544,7 +610,8 @@ def FollowGaitGenerator(params, log=None):
     # 40 mm was the short shuffle. sample_follow_gait clamps each foot so
     # a large command cannot park a toe past this radius from its home.
     stride_max = 55.0
-    # Multiplies vx and vy inside _aep_pep. wz is left alone.
+    # Multiplies vx and vy inside _where_the_foot_lands_and_lifts.
+    # wz is left alone.
     # CmdVelParams always has this attribute; getattr keeps a stray params
     # object from crashing the bake. Missing → 1.0, meaning "use vx, vy as given".
     linear_factor = getattr(params, 'linear_factor', 1.0)
@@ -567,16 +634,16 @@ def FollowGaitGenerator(params, log=None):
     # every new generator on the opening section.
     cur_pose, generator_slice = yield None
 
-    # Outer loop, the animator. Bakes one full cycle into `steps`, then
+    # Outer loop, the animator. Bakes one full cycle into `prepared_targets`, then
     # the inner loop plays it. We come back here only when the controller
     # replaces self.pose with a different object (a stand, or a body move).
     # A normal mini-step does not. A new velocity does not either: that
     # waits for last_part and then runs a new generator from the top.
     while True:
-        org_pose = cur_pose
+        stance_this_table_was_baked_from = cur_pose
         # Six homes as plain (x, y, z) floats, millimetres, body frame.
         # Each foot's curve is drawn around its own home.
-        nominal = [(float(p[0]), float(p[1]), float(p[2])) for p in cur_pose]
+        six_home_feet = [(float(p[0]), float(p[1]), float(p[2])) for p in cur_pose]
         if params.relative_h:
             # Stance z is negative: the feet are below the body origin
             # (DEFAULT_POSE uses −INITIAL_HEIGHT). abs() is the ruler.
@@ -585,23 +652,23 @@ def FollowGaitGenerator(params, log=None):
             # z = home_z + 4·σ·(1−σ)·height, highest when σ = 0.5.
             # Twist walking passes relative_h False, so this stays off;
             # set_step_mode gait 5 can turn it on.
-            height = abs(nominal[0][2]) * (params.height / 100.0)
+            height = abs(six_home_feet[0][2]) * (params.height / 100.0)
 
         # Bake every target now. This for-loop does not yield. After it,
-        # `steps[i]` is the six toes at phase_list[i].
-        steps = []
+        # `prepared_targets[i]` is the six toes at phase_list[i].
+        prepared_targets = []
         for phase in phase_list:
             # phase: radians along the circle. vx, vy: mm/s. angular_z:
-            # rad/s. height: peak lift, mm. period: seconds. nominal: the
+            # rad/s. height: peak lift, mm. period: seconds. six_home_feet: the
             # six homes. stride_max / linear_factor: resolved above.
-            steps.append(sample_follow_gait(
+            prepared_targets.append(sample_follow_gait(
                 phase,
                 params.velocity_x,
                 params.velocity_y,
                 params.angular_z,
                 height,
                 params.period,
-                nominal,
+                six_home_feet,
                 stride_max,
                 linear_factor,
             ))
@@ -609,50 +676,52 @@ def FollowGaitGenerator(params, log=None):
         # Splice, once per bake. Target 0 puts one tripod at PEP and the
         # other at AEP, the two extremes. Playback has to be allowed to
         # start at a later target that already looks like the current feet.
-        if finish_ps:
+        if feet_saved_for_the_next_generator:
             # Sum of squared foot-to-foot distances. Skipping the square
             # root is enough: we only need which target is nearest.
-            dists = [total_dist_sq(finish_ps, bi) for bi in steps]
-            idx = min(range(len(dists)), key=lambda i: dists[i])
-            if idx == 0:
-                # Target 0 would make the outro steps[:0] empty, and
+            dists = [total_dist_sq(feet_saved_for_the_next_generator, bi) for bi in prepared_targets]
+            splice_index = min(range(len(dists)), key=lambda i: dists[i])
+            if splice_index == 0:
+                # Target 0 would make the outro prepared_targets[:0] empty, and
                 # the first generator_outro wake would index that
-                # empty list. Start one target later. stop remembers
-                # that we refused the seam. The generator_intro branch
-                # uses that memory, while finish_ps is still set, to
-                # ask for the slow blend.
-                idx = 1
-                stop = True
+                # empty list. Start one target later.
+                # refused_to_start_at_the_seam remembers that we
+                # refused the seam. The generator_intro branch uses
+                # that memory, while the saved feet are still set,
+                # to ask for the 50 ms blend.
+                splice_index = 1
+                refused_to_start_at_the_seam = True
             else:
-                stop = False
+                refused_to_start_at_the_seam = False
         else:
             # No hand-off pose. That is a cold start, and also a rebake.
-            # The opening section already cleared finish_ps, so a later
+            # The opening section already cleared feet_saved_for_the_next_generator, so a later
             # stance change comes through here too. Leg 1 (the second
             # tuple) stands at x = 0 in DEFAULT_POSE, so "leg 1's x
             # closest to 0" means that foot is near its forward home.
             # Search only the first half of the cycle. The second half
             # is the other tripod.
-            idx = min(range(len(steps) // 2), key=lambda i: abs(steps[i][1][0]))
-            if idx == 0:
+            splice_index = min(range(len(prepared_targets) // 2), key=lambda i: abs(prepared_targets[i][1][0]))
+            if splice_index == 0:
                 # Same empty-outro guard as the hand-off path. This
-                # branch does not arm the slow blend. finish_ps is
+                # branch does not ask for the 50 ms blend.
+                # feet_saved_for_the_next_generator is
                 # empty, so the opening section below takes the other
-                # arm and writes slow = False.
-                idx = 1
-                stop = True
+                # arm and writes ask_for_50_ms_blend = False.
+                splice_index = 1
+                refused_to_start_at_the_seam = True
             else:
-                stop = False
+                refused_to_start_at_the_seam = False
 
         # Cut the table at the splice. Target 0 is the seam, where
         # the two tripods are at opposite extremes, so playback has
-        # to be allowed to start mid-table. steps1 is the opening
+        # to be allowed to start mid-table. targets_for_generator_intro is the opening
         # section, played when generator_slice is generator_intro.
-        # steps2 is the ending section, played when it is
+        # targets_for_generator_outro is the ending section, played when it is
         # generator_outro. generator_running ignores both cuts and
         # reads the whole table.
-        steps1 = steps[idx:]
-        steps2 = steps[:idx]
+        targets_for_generator_intro = prepared_targets[splice_index:]
+        targets_for_generator_outro = prepared_targets[:splice_index]
 
         # Inner loop. One yield per resume. At each yield we freeze.
         # About 20 ms later the controller resumes us with the stance
@@ -672,35 +741,35 @@ def FollowGaitGenerator(params, log=None):
                 # replaces that pulse. The saved pose is cleared
                 # here, or every later wake of the opening would
                 # run the test again.
-                ps = steps1[phase_index]
-                if finish_ps:
-                    distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, finish_ps)])
-                    if distances > 7 or stop:
-                        slow = True
-                    finish_ps = []
+                ps = targets_for_generator_intro[phase_index]
+                if feet_saved_for_the_next_generator:
+                    distances = max([math.dist(p1, p2) for p1, p2 in zip(ps, feet_saved_for_the_next_generator)])
+                    if distances > 7 or refused_to_start_at_the_seam:
+                        ask_for_50_ms_blend = True
+                    feet_saved_for_the_next_generator = []
                 else:
                     # Later wakes of the opening, and a cold start
                     # that had nothing saved: ordinary 20 ms timing.
-                    slow = False
+                    ask_for_50_ms_blend = False
                 # Advance inside the opening. Its length is
-                # targets_per_gait_step minus idx, which is
-                # len(steps1). Wrapping this modulo is what makes
+                # targets_per_gait_step minus splice_index, which is
+                # len(targets_for_generator_intro). Wrapping this modulo is what makes
                 # phase_index come back to 0 at the end of the
                 # opening, and that 0 is what sets last_part.
-                phase_index = (phase_index + 1) % (len(steps) - idx)
+                phase_index = (phase_index + 1) % (len(prepared_targets) - splice_index)
             elif generator_slice == generator_outro:
                 # Ending section: from the math seam back toward the
                 # splice, so a stop can park on a pose the next
                 # generator knows how to meet. Every pose is written
-                # into finish_ps. The write that matters is the one
+                # into feet_saved_for_the_next_generator. The write that matters is the one
                 # on the wrapping yield, because that pose is what
                 # the next generator splices against.
-                ps = steps2[phase_index]
-                # max(idx, 1) keeps this modulo off zero if idx were
+                ps = targets_for_generator_outro[phase_index]
+                # max(splice_index, 1) keeps this modulo off zero if splice_index were
                 # ever left at 0. The splice above already forces
-                # idx to 1.
-                phase_index = (phase_index + 1) % max(idx, 1)
-                finish_ps = ps
+                # splice_index to 1.
+                phase_index = (phase_index + 1) % max(splice_index, 1)
+                feet_saved_for_the_next_generator = ps
                 # Cursor after the increment. Stored, never read.
                 finish_index = phase_index
             else:
@@ -709,7 +778,7 @@ def FollowGaitGenerator(params, log=None):
                 # included. When targets_per_gait_step is 30, the
                 # step from 29 back to 0 is the wrap. The target we
                 # just took was the last one of this gait step.
-                ps = steps[phase_index]
+                ps = prepared_targets[phase_index]
                 phase_index = (phase_index + 1) % targets_per_gait_step
 
             # The target was chosen first, then the cursor moved.
@@ -719,16 +788,16 @@ def FollowGaitGenerator(params, log=None):
             # stored earlier. False means we are still in the middle
             # of the section.
             if phase_index == 0:
-                cur_pose, generator_slice = yield ps, True, params, slow
+                cur_pose, generator_slice = yield ps, True, params, ask_for_50_ms_blend
             else:
-                cur_pose, generator_slice = yield ps, False, params, slow
+                cur_pose, generator_slice = yield ps, False, params, ask_for_50_ms_blend
 
             # Wake-up, about 20 ms later. `is` checks the object, not the
             # millimetres. Gait ticks call set_pose_base(..., update_pose=
-            # False), so self.pose stays this same object and `steps` keeps
+            # False), so self.pose stays this same object and `prepared_targets` keeps
             # playing. A stand or a pose transform stores a new tuple; that
             # object arrives here and we break out to bake again.
             # phase_index is still wherever the old table had reached.
-            if cur_pose is not org_pose:
+            if cur_pose is not stance_this_table_was_baked_from:
                 break
 

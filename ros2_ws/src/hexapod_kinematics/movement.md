@@ -139,7 +139,7 @@ sequenceDiagram
     Note over Legs: time.sleep(0.02) ended. This is one leg tick.
     Legs->>Pull: current stance, generator_slice
     alt a gait-5 page is still open
-        Pull-->>Legs: the same six feet, reused, hunter
+        Pull-->>Legs: the same six feet, same_target_as_last_wake, hunter
         Note over Pull: gen_next_mini_step_yield is not called. The bookmark stays.
     else a generator is playing
         Pull->>Pull: gen_next_mini_step_yield(stance, generator_slice)
@@ -161,7 +161,7 @@ sequenceDiagram
         Note over Hunter: Diagram 4. May publish eighteen radians, or nothing.
     else legacy
         Legs->>Legacy: frame, walk_state
-        alt generator_slice is generator_intro and slow is true
+        alt generator_slice is generator_intro and ask_for_50_ms_blend is true
             Legacy->>Base: six feet, duration 0.05 s
         else every other legacy frame
             Legacy->>Base: six feet, duration 0.02 s
@@ -169,7 +169,7 @@ sequenceDiagram
         Base->>So: set_leg_position, once per leg
         So-->>Base: 18 radians
         Base->>Servo: set_multi_joints, those radians, that duration
-        Note over Legacy: CmdVelParams adds a full 0.02 s of the command to odometry. A discrete step, slow move, does not.
+        Note over Legacy: CmdVelParams adds a full 0.02 s of the command to odometry. A counted walk does not.
     end
     Legs->>Legs: time.sleep(0.02)
 ```
@@ -218,16 +218,16 @@ sequenceDiagram
     participant Film as FollowGaitGenerator in move.py
     participant Sample as sample_follow_gait() in move.py
 
-    Legs->>Film: first gen_next_mini_step_yield(stance, "first") after gen_advance_to_first_yield
+    Legs->>Film: first gen_next_mini_step_yield(stance, generator_intro) after gen_advance_to_first_yield
     Note over Film: Stance object changed, or this is the first bake. The for-loop below does not yield.
     loop one phase per 20 ms of the period
         Film->>Sample: phase, vx, vy, wz, height, period, six homes
         Sample-->>Film: six feet, millimetres
     end
-    Note over Film: the steps list is the whole cycle. steps1 is the intro, steps2 the wind-down.
-    Film-->>Legs: yield the first intro frame, last_part, params, slow
+    Note over Film: prepared_targets is the whole cycle. targets_for_generator_intro is the opening. targets_for_generator_outro is the ending.
+    Film-->>Legs: yield the first opening frame, last_part, params, ask_for_50_ms_blend
     Note over Legs,Film: About 20 ms later
-    Legs->>Film: gen_next_mini_step_yield(stance, status)
+    Legs->>Film: gen_next_mini_step_yield(stance, generator_slice)
     Film-->>Legs: yield the next stored frame
     Note over Sample: not called. The table already exists.
 ```
@@ -241,7 +241,8 @@ library, one call per phase, during the bake.
 `MovingGenerator` is the discrete step. One step is 6 parts. Each
 part is `period / 6 / 0.02` servo frames, at least one. A 1.00 s
 step is 9 frames per part, 54 yields. Each part is one call to
-`kinematics.set_step_mode`. The yield tag is `slow = "move"`, so
+`kinematics.set_step_mode`. The yield's fourth value,
+`ask_for_50_ms_blend`, is false, so
 the legacy tick always uses the 20 ms blend, and a wrapped step
 swaps at once.
 
@@ -252,7 +253,7 @@ sequenceDiagram
     participant Move as MovingGenerator in move.py
     participant So as kinematics.set_step_mode in kinematics.so
 
-    Legs->>Move: gen_next_mini_step_yield(stance, status)
+    Legs->>Move: gen_next_mini_step_yield(stance, generator_slice)
     Note over Move: New stance object. Bake six parts before the next yield.
     loop part i from 0 to 5
         Move->>So: sub_action_num, part i, start pose, gait, stride, height
@@ -280,17 +281,19 @@ The gate is one yes or no for all eighteen joints. It lives in
 `safety.cpp`. It does not move a foot. `approach_target` is the
 repair, and it lives in `leg_ik.py`.
 
-A partial page moves all six feet by the same fraction `alpha`
-along the straight line from the start of this page to the
-generator's own feet:
+A shorter point moves all six feet by the same fraction
+along the straight line from the feet where this target started
+to the generator's own feet:
 
 ```text
-feet(alpha) = anchor + alpha * (target_feet_positions - anchor)
+feet(fraction) = feet_where_this_target_started
+    + fraction * (target_feet_positions - feet_where_this_target_started)
 ```
 
-`alpha` 1 is the page the generator yielded. A smaller `alpha`
+Fraction 1 is the page the generator yielded. A smaller fraction
 is the same page, not finished. All eighteen angles of that
-shorter pose are published together.
+shorter pose are published together. The CSV column for that
+fraction is still named `alpha`.
 
 ```mermaid
 sequenceDiagram
@@ -307,7 +310,7 @@ sequenceDiagram
     Note over Tick,Gate: This picture is use_hexapod_kinematics true. Flag false uses VendorLegIk in leg_ik.py and never calls gate().
     Tick->>Session: begin_target on a fresh page, or keep the open one
     Tick->>Session: mini_step()
-    Session->>Target: anchor, target_feet_positions, alpha_done
+    Session->>Target: feet_where_this_target_started, target_feet_positions, fraction_of_target_sent
     Target->>Hex: solve(generator's own six feet)
     Hex->>Bind: solve_pose(feet)
     Bind->>Solve: six Vec3, max_step_rad()
@@ -315,24 +318,24 @@ sequenceDiagram
     Bind->>Gate: those angles, plus the last angles this gate allowed
     Gate-->>Hex: allow, or rate_limit, or another reason
     alt gate allows the generator's own feet
-        Target-->>Session: decision sent, alpha = 1, publish
+        Target-->>Session: generators_own_feet_sent, fraction 1, publish
         Session-->>Tick: gait_step_accepted if this page was last_part and the gate sent it
         Tick->>Servo: eighteen radians, duration 0.02 s or 0.05 s
-        Note over Tick: Odometry adds alpha's fraction of 0.02 s. The next tick may call gen_next_mini_step_yield().
+        Note over Tick: Odometry adds fraction_sent_this_wake of 0.02 s. The next tick may call gen_next_mini_step_yield(). The CSV writes decision=sent.
     else reason is rate_limit
-        loop up to eight bisections, one shared alpha
-            Target->>Hex: solve(feet at that alpha)
+        loop up to eight bisections, one shared fraction
+            Target->>Hex: solve(feet at that fraction)
             Hex->>Gate: eighteen angles against the last sent angles
         end
-        alt some alpha passes
-            Target-->>Session: decision partial, publish those feet
+        alt some fraction passes
+            Target-->>Session: shorter_point_sent, publish those feet
             Tick->>Servo: eighteen radians of the shorter pose
-            Note over Session: alpha_done stays below 1. Next tick reuses this page.
+            Note over Session: fraction_of_target_sent stays below 1. Next tick keeps this page. The CSV writes decision=partial.
         else no shorter pose passes
-            Target-->>Session: decision held, publish nothing
+            Target-->>Session: last_safe_pose_kept, publish nothing
         end
     else unreachable, singular, window, or no reference
-        Target-->>Session: decision held, publish nothing
+        Target-->>Session: last_safe_pose_kept, publish nothing
         Note over Servo: The same page would fail again. A later tick does not change that.
     end
 ```
@@ -353,7 +356,7 @@ sequenceDiagram
     participant Servo as JointControl in x_joint_control.py
 
     Note over Legs: Tick A, 20 ms
-    Legs->>Pull: session is not waiting
+    Legs->>Pull: target_still_open() is false
     Pull->>Film: gen_next_mini_step_yield()
     Film-->>Pull: this page, bookmark moves
     Pull-->>Legs: six feet, hunter
@@ -366,13 +369,13 @@ sequenceDiagram
     Note over Film: Bookmark stays. gen_next_mini_step_yield() will not be called next tick.
 
     Note over Legs: Tick B, 20 ms later
-    Legs->>Pull: waiting() is true
+    Legs->>Pull: target_still_open() is true
     Pull-->>Legs: the same six feet
     Note over Film: not woken
     Legs->>Gate: angles of the whole page, against the halfway angles
     Gate-->>Legs: allow, the remainder fits
     Legs->>Servo: eighteen angles of the generator's own feet
-    Note over Legs: alpha is 1. If the page was last_part, the book may change now.
+    Note over Legs: fraction_of_target_sent is 1. If the page was last_part, the book may change now.
 ```
 
 The second tick cures the refusal because the feet already moved.
@@ -384,11 +387,11 @@ waking again on those same feet gets the same refusal.
 
 On the first frame after two films are spliced, the new page can
 sit more than 7 mm away from the old feet. The generator then
-yields `slow = "cmd_true"`. The leg thread still sleeps 20 ms.
+yields `ask_for_50_ms_blend` true. The leg thread still sleeps 20 ms.
 The servo message for that one frame asks for a 50 ms blend.
 The next wake, 20 ms later, sends a new target and replaces it.
 
-`MovingGenerator` yields `slow = "move"`, so this branch never
+`MovingGenerator` yields `ask_for_50_ms_blend` false, so this branch never
 runs for a discrete step. Its blend is 20 ms.
 
 ```mermaid
@@ -399,7 +402,7 @@ sequenceDiagram
     participant Servo as JointControl in x_joint_control.py
     participant Legs as leg thread in step_controller.py
 
-    Film-->>Tick: first frame, slow = cmd_true
+    Film-->>Tick: first frame, ask_for_50_ms_blend true
     Tick->>Servo: eighteen targets, duration 0.05 s
     Legs->>Legs: sleep 0.02 s
     Note over Servo: The 50 ms blend is still in progress.

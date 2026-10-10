@@ -195,18 +195,19 @@ class _MiniStepInput:
 
     One mini-step is one wake of the loop, in every gait. moving_pose
     is None when this mini-step has no feet. hunter is gait 5.
-    reused means the gait-5 gate has not accepted
-    target_feet_positions, so gen_next_mini_step_yield was not
-    called and the cursor did not move. slow is a bool: True asks
-    for a 50 ms servo blend on this pose.
+    same_target_as_last_wake means the gait-5 gate has not
+    accepted target_feet_positions, so gen_next_mini_step_yield
+    was not called and the cursor did not move.
+    ask_for_50_ms_blend is a bool: True asks for a 50 ms servo
+    blend on this pose.
     """
 
     def __init__(self):
         self.moving_pose = None
         self.params = None
-        self.slow = None
+        self.ask_for_50_ms_blend = None
         self.last_part = False
-        self.reused = False
+        self.same_target_as_last_wake = False
         self.hunter = False
 
 
@@ -239,7 +240,7 @@ class _GeneratorCall:
         generator_outro. The generator uses it to choose which
         part of its prepared foot list to hand back. The yield is
         six feet, the flag that says this yield closed the period,
-        the params, and the slow flag. The caller handles
+        the params, and ask_for_50_ms_blend. The caller handles
         StopIteration when the generator has ended.
         """
         return generator.send((pose, generator_slice))
@@ -330,7 +331,7 @@ class StepController(Node):
         self._declare_if_needed(
             'use_hexapod_kinematics', USE_HEXAPOD_KINEMATICS_DEFAULT)
         self._declare_if_needed('hexapod_ik_trace', TRACE_PATH_DEFAULT)
-        self._gait5 = None
+        self.gait5_session = None
         self._hold_watch = HoldWatch()
         self._second_log = SecondLog()
         use_hexapod = bool(
@@ -379,28 +380,28 @@ class StepController(Node):
         to the generator that is walking, so a replacement clears
         that too.
         """
-        if self._gait5 is None:
+        if self.gait5_session is None:
             return
-        if self._gait5.generator is self.cur_moving_generator:
+        if self.gait5_session.generator is self.cur_moving_generator:
             return
-        self._gait5 = None
+        self.gait5_session = None
         self._hold_watch = HoldWatch()
 
     def _begin_gait5(self, generator, pose):
         """Return this generator's session, creating it on the first mini-step.
 
-        The flag is read here, once. attach() solves the stance and
-        does not publish it. The same generator keeps this object
-        through partial targets and through a gait-step wrap that does
-        not swap the generator.
+        The flag is read here, once. solve_stance_already_stood_on
+        solves the stance and does not publish it. The same generator
+        keeps this object through shorter points and through a
+        gait-step wrap that does not swap the generator.
         """
-        if self._gait5 is not None and self._gait5.generator is generator:
-            return self._gait5
+        if self.gait5_session is not None and self.gait5_session.generator is generator:
+            return self.gait5_session
         flag = bool(self.get_parameter('use_hexapod_kinematics').value)
         session, line = start_gait5(generator, flag)
         self.get_logger().info(line)
-        session.attach(pose)
-        self._gait5 = session
+        session.solve_stance_already_stood_on(pose)
+        self.gait5_session = session
         self._hold_watch = HoldWatch()
         return session
 
@@ -416,25 +417,27 @@ class StepController(Node):
         self._hold_watch.note(self.get_logger(), mini_step_result)
         self._second_log.note(
             self.get_logger(), t_s, session.backend,
-            mini_step_result.decision, mini_step_result.dq)
+            mini_step_result.what_this_wake_published,
+            mini_step_result.joint_change_from_last_sent)
         self._trace.put(trace_row(t_s, session.backend, mini_step_result))
 
-    def _integrate_fraction(self, params, delta_alpha):
-        """Add twist * 0.02 * delta_alpha to the body odometry.
+    def _integrate_fraction(self, params, fraction_sent_this_wake):
+        """Add twist * 0.02 * fraction_sent_this_wake to the odometry.
 
-        A hold passes delta 0 and adds nothing. The mini-step that
-        reaches alpha 1 adds only the leftover fraction. It does
-        not repay the seconds the partials already covered. The
-        velocity fields stored on the node are the command scaled
-        by that same fraction, so a partial line is not a full
-        command for one sample. The yaw rotation into the world
-        frame stays here. The next target, after
+        A hold passes a fraction of 0 and adds nothing. The mini-step
+        that reaches fraction 1 adds only the leftover fraction. It
+        does not repay the seconds the shorter points already
+        covered. The velocity fields stored on the node are the
+        command scaled by that same fraction, so a shorter point is
+        not a full command for one sample. The yaw rotation into
+        the world frame stays here. The next target, after
         gen_next_mini_step_yield(), is a fresh 0.02 s of the full twist.
         """
         command_x = params.velocity_x / 1000.0
         command_y = params.velocity_y / 1000.0
         vx, vy, wz, dx, dy, dyaw = odometry_increment(
-            command_x, command_y, params.angular_z, delta_alpha)
+            command_x, command_y, params.angular_z,
+            fraction_sent_this_wake)
         self.linear_x = vx
         self.linear_y = vy
         self.angular_z = wz
@@ -590,12 +593,14 @@ class StepController(Node):
         self._drop_gait5_if_replaced()
         if self.cur_moving_generator is None:
             return mini_step_input
-        if self._gait5 is not None and self._gait5.waiting():
-            held = self._gait5.held()
-            mini_step_input.moving_pose = held[0]
-            mini_step_input.params = held[1]
-            mini_step_input.slow = held[2]
-            mini_step_input.reused = True
+        if (self.gait5_session is not None
+                and self.gait5_session.target_still_open()):
+            six_feet, command, ask_for_50_ms_blend = (
+                self.gait5_session.open_target())
+            mini_step_input.moving_pose = six_feet
+            mini_step_input.params = command
+            mini_step_input.ask_for_50_ms_blend = ask_for_50_ms_blend
+            mini_step_input.same_target_as_last_wake = True
             mini_step_input.hunter = _is_hunter_gait(mini_step_input.params)
             return mini_step_input
         try:
@@ -604,7 +609,7 @@ class StepController(Node):
             mini_step_input.moving_pose = yielded[0]
             mini_step_input.last_part = yielded[1]
             mini_step_input.params = yielded[2]
-            mini_step_input.slow = yielded[3]
+            mini_step_input.ask_for_50_ms_blend = yielded[3]
         except StopIteration:
             self.cur_moving_generator = None
             return mini_step_input
@@ -647,14 +652,14 @@ class StepController(Node):
         This is the walk from before the hunter. Feet go through
         set_pose_base and kinematics.set_leg_position. The opening
         section of a velocity walk blends for 50 ms when the
-        generator also asks for a slow blend. Every other mini-step
+        generator also asks for that blend. Every other mini-step
         blends for 20 ms. CmdVelParams integrates a full 20 ms of
         the command. A counted walk carries MovingParams, so it
         does not integrate here. A raised error drops the generator.
         """
         try:
             if (walk_state.generator_slice == generator_intro
-                    and mini_step_input.slow):
+                    and mini_step_input.ask_for_50_ms_blend):
                 # The generator is on its opening section and this
                 # pose would jump from the feet of the previous
                 # generator. The servos are given 50 ms to arrive.
@@ -710,15 +715,17 @@ class StepController(Node):
         """
         try:
             session = self._begin_gait5(self.cur_moving_generator, stance)
-            if not mini_step_input.reused:
+            if not mini_step_input.same_target_as_last_wake:
                 session.begin_target(
                     mini_step_input.moving_pose, mini_step_input.params,
-                    mini_step_input.slow, mini_step_input.last_part)
-            mini_step_result, delta, gait_step_accepted = session.mini_step()
+                    mini_step_input.ask_for_50_ms_blend,
+                    mini_step_input.last_part)
+            (mini_step_result, fraction_sent_this_wake,
+             gait_step_accepted) = session.mini_step()
             self._record_gait5(session, mini_step_result)
             if gait_step_accepted:
                 # The gate sent the six feet, and those feet close
-                # the period. A partial or a hold leaves this false,
+                # the period. A shorter point or a hold leaves this false,
                 # so the generator is not asked for its outro while
                 # the feet are still on the way to the target. Gait 5
                 # is a velocity walk, so this call orders the outro
@@ -726,10 +733,11 @@ class StepController(Node):
                 # install that generator yet.
                 walk_state.after_accepted_gait_step(self, session.params)
             # The opening section blends for 50 ms when the generator
-            # asks for it. A later mini-step, including a partial of
-            # the same target, is 20 ms. The thread still sleeps 20 ms.
+            # asks for it. A later mini-step, including a shorter
+            # point of the same target, is 20 ms. The thread still
+            # sleeps 20 ms.
             if (walk_state.generator_slice == generator_intro
-                    and mini_step_input.slow):
+                    and mini_step_input.ask_for_50_ms_blend):
                 duration = 0.05
             else:
                 duration = 0.02
@@ -745,7 +753,8 @@ class StepController(Node):
                 # it may start the stored generator.
                 walk_state.generator_outro_order = 'in_effect'
             self.transform = transform
-            self._integrate_fraction(mini_step_input.params, delta)
+            self._integrate_fraction(
+                mini_step_input.params, fraction_sent_this_wake)
         except Exception as e:
             self.get_logger().info("MOVING_POSE " + str(e))
             self.cur_moving_generator = None

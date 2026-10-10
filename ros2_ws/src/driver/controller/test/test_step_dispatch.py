@@ -57,17 +57,20 @@ class _Log:
 class _Hold:
     """A gait-5 session whose open target is not finished."""
 
-    def __init__(self, target_feet_positions, params, slow):
+    def __init__(self, target_feet_positions, params, ask_for_50_ms_blend):
         self.target_feet_positions = target_feet_positions
         self.params = params
-        self.slow = slow
+        self.ask_for_50_ms_blend = ask_for_50_ms_blend
         self.sends = 0
 
-    def waiting(self):
+    def target_still_open(self):
         return True
 
-    def held(self):
-        return self.target_feet_positions, self.params, self.slow
+    def open_target(self):
+        return (
+            self.target_feet_positions,
+            self.params,
+            self.ask_for_50_ms_blend)
 
 
 class _Gen:
@@ -88,7 +91,7 @@ def _step():
     robot = _Log()
     robot.cur_moving_generator = None
     robot.new_moving_generator = None
-    robot._gait5 = None
+    robot.gait5_session = None
     robot.linear_x = 1
     robot.linear_y = 2
     robot.angular_z = 3
@@ -175,13 +178,13 @@ def test_waiting_hunter_target_is_not_sent_again():
     step = _step()
     params = CmdVelParams(gait=5)
     feet = ((4, 5, 6),)
-    step._gait5 = _Hold(feet, params, False)
+    step.gait5_session = _Hold(feet, params, False)
     gen = _Gen(error=AssertionError(
         'gen_next_mini_step_yield dropped the open target'))
     step.cur_moving_generator = gen
     mini_step_input = StepController._pull_mini_step_input(step, 'pose', _WalkState())
     assert mini_step_input.hunter is True
-    assert mini_step_input.reused is True
+    assert mini_step_input.same_target_as_last_wake is True
     assert mini_step_input.moving_pose == feet
     assert gen.sent == []
 
@@ -216,7 +219,7 @@ def test_legacy_tick_uses_set_pose_base_and_a_full_20_ms():
     mini_step_input = _MiniStepInput()
     mini_step_input.moving_pose = ((1, 2, 3),)
     mini_step_input.params = CmdVelParams(gait=2, velocity_x=1000, velocity_y=0, angular_z=0)
-    mini_step_input.slow = False
+    mini_step_input.ask_for_50_ms_blend = False
     walk_state = _WalkState()
     walk_state.generator_slice = generator_running
     StepController._tick_legacy_gait(step, mini_step_input, 'lean', walk_state)
@@ -239,12 +242,12 @@ def test_legacy_first_slice_blends_for_50_ms_and_a_move_does_not_integrate():
     mini_step_input = _MiniStepInput()
     mini_step_input.moving_pose = ((1, 2, 3),)
     mini_step_input.params = MovingParams(gait=2)
-    mini_step_input.slow = False
+    mini_step_input.ask_for_50_ms_blend = False
     StepController._tick_legacy_gait(step, mini_step_input, 'lean', _WalkState())
     assert calls == [0.02]
     assert step.linear_x == 1
 
-    mini_step_input.slow = True
+    mini_step_input.ask_for_50_ms_blend = True
     mini_step_input.params = CmdVelParams(gait=2, velocity_x=0, velocity_y=0, angular_z=0)
     StepController._tick_legacy_gait(step, mini_step_input, 'lean', _WalkState())
     assert calls == [0.02, 0.05]
@@ -273,7 +276,7 @@ def test_hunter_mini_step_begins_a_new_target_and_publishes_radians():
     mini_step_input = _MiniStepInput()
     mini_step_input.moving_pose = ((9, 9, 9),)
     mini_step_input.params = CmdVelParams(gait=5)
-    mini_step_input.slow = False
+    mini_step_input.ask_for_50_ms_blend = False
     mini_step_input.last_part = True
     mini_step_input.hunter = True
     StepController._tick_hunter_gait(step, mini_step_input, 'stance', 'lean', _WalkState())
@@ -311,8 +314,8 @@ def test_hunter_reuse_does_not_open_and_a_boundary_winds_down():
     mini_step_input = _MiniStepInput()
     mini_step_input.moving_pose = ((1, 1, 1),)
     mini_step_input.params = CmdVelParams(gait=5)
-    mini_step_input.slow = False
-    mini_step_input.reused = True
+    mini_step_input.ask_for_50_ms_blend = False
+    mini_step_input.same_target_as_last_wake = True
     walk_state = _WalkState()
     StepController._tick_hunter_gait(step, mini_step_input, 'stance', 'lean', walk_state)
     assert opened == []
@@ -329,5 +332,5 @@ class _StepResult:
     def __init__(self, publish):
         self.publish = publish
         self.angles = (0.1,) * 18
-        self.decision = 'sent'
-        self.dq = ()
+        self.what_this_wake_published = 'generators_own_feet_sent'
+        self.joint_change_from_last_sent = ()

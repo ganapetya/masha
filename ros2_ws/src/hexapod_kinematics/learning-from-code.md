@@ -920,37 +920,42 @@ is the parameter.
 The import of `kinematics.so` happens on the first solve, so
 constructing the object does not load the binary. This backend does
 not run the new rate gate. `JointControl` still enforces the ±120°
-window on the way to the servo. Its `IkDecision` is always allow.
+window on the way to the servo. Its `IkDecision` always has
+`gate_allows_these_radians` true. The C++ gate still calls that
+answer `allow`.
 
-**HexapodLegIk.** `hk.solve_pose(pose)` then `hk.gate(result, previous)`.
+**HexapodLegIk.** `hk.solve_pose(six_feet)` then
+`hk.gate(result, last_sent_joint_radians)`.
 The import happens on the first solve. `establish_reference` is the
 special case at the start of a bout: the gate answers `no_reference`
-when previous is empty, even for a legal stand. The stand is compared
-with itself, so the window is checked and the joint change is zero.
-Those angles become `previous`. Nothing is published: the feet are
-already there. A stance the backend refuses leaves `previous` empty,
-and the next target holds with that reason.
+when `last_sent_joint_radians` is empty, even for a legal stand.
+The stand is compared with itself, so the window is checked and the
+joint change is zero. Those angles become `last_sent_joint_radians`.
+Nothing is published: the feet are already there. A stance the
+backend refuses leaves that memory empty, and the next target keeps
+the last safe pose with that reason.
 
 **approach_target** is the only place that turns one `rate_limit` into
 a shorter fraction of the target. The order is fixed.
 
-1. Solve the generator's own feet. If the gate allows them, this mini-step is `sent`, `alpha` becomes 1, and the next mini-step may ask the generator for a new target.
-2. If the only failure is `rate_limit`, the feet are legal and the joint move is too big. Eight bisections search the open interval past `alpha_done`. One fraction is shared by all six legs:
+1. Solve the generator's own feet. If the gate allows them, this mini-step is `generators_own_feet_sent`, the fraction becomes 1, and the next mini-step may ask the generator for a new target. The CSV writes `sent`.
+2. If the only failure is `rate_limit`, the feet are legal and the joint move is too big. Eight bisections search the open interval past `fraction_of_target_sent`. One fraction is shared by all six legs:
 
    ```
-   feet(alpha) = anchor + alpha * (target_feet_positions - anchor)
+   feet(fraction) = feet_where_this_target_started + fraction * (target_feet_positions - feet_where_this_target_started)
    ```
 
-   A per-leg fraction would twist the body. The largest alpha that passes the whole gate is a `partial`. The generator stays on this target.
-3. Any other reason is a hard hold. Nothing is published. `alpha_done` and the previous sent pose stay where they are.
+   A per-leg fraction would twist the body. The largest fraction that passes the whole gate is `shorter_point_sent`. The generator stays on this target. The CSV writes `partial`.
+3. Any other reason keeps the last safe pose. Nothing is published. `fraction_of_target_sent` and the last sent radians stay where they are. The CSV writes `held`.
 4. A `rate_limit` whose search finds nothing is the same hold. A branch flip is this case: the foot barely moves and every fraction still jumps by about a radian, because the standing branch does not change along the segment. Catch-up must not publish that jump.
 
-`alpha` becomes 1 only when point 1 passes. Eight bisections land on
-a 1/256 grid of the remaining segment, so `0.996` is still a partial.
-Rounding that up to 1 would start the next target while these feet
-were still short, and it would do it without the gate having allowed
-this target. A candidate less than one part in 256 past `alpha_done`
-is no progress, and that mini-step is a hold.
+`fraction_of_target_sent` becomes 1 only when point 1 passes. Eight
+bisections land on a 1/256 grid of the remaining segment, so `0.996`
+is still a shorter point. Rounding that up to 1 would start the next
+target while these feet were still short, and it would do it without
+the gate having allowed this target. A candidate less than one part
+in 256 past `fraction_of_target_sent` is no progress, and that
+mini-step keeps the last safe pose.
 
 The partial row still says `rate_limit`, and it names the joint of
 the generator's own feet. The angles stored on a partial row are the
@@ -965,16 +970,17 @@ outside this module.
 
 **Gait5Session** is one generator and the target it has not finished.
 `gen_next_mini_step_yield()` yields six feet and moves the cursor. While
-`waiting()` is true the loop keeps those feet and does not call it.
-`begin_target` stores `last_part` and does not act on it.
-`gait_step_accepted` is true only when `mini_step()` reports the
-target sent at alpha 1 and that target closed the period. Acting
+`target_still_open()` is true the loop keeps those feet and does not
+call it. `begin_target` stores `last_part` and does not act on it.
+`gait_step_accepted` is true only when `mini_step()` reports
+`generators_own_feet_sent` and that target closed the period. Acting
 on `last_part` any earlier would start the next gait step while
 the feet were still short.
 
-**odometry_increment** scales the body twist by `delta_alpha`. A hold
-adds nothing. The mini-step that reaches alpha 1 adds only the leftover
-fraction. It does not repay the seconds the partials already covered.
+**odometry_increment** scales the body twist by
+`fraction_sent_this_wake`. A hold adds nothing. The mini-step that
+reaches fraction 1 adds only the leftover fraction. It does not
+repay the seconds the shorter points already covered.
 The yaw rotation into the world frame stays in the 20 ms loop. This
 function does not know the current yaw.
 
@@ -1044,17 +1050,17 @@ it for the next generator, not for the session already walking.
 
 On each iteration, for a current moving generator:
 
-- If a gait-5 session is `waiting()`, reuse the held feet. Do not call `gen_next_mini_step_yield()`.
-- Otherwise call `gen_next_mini_step_yield()`. That yields six feet, `last_part`, the params, and the slow word.
+- If a gait-5 session `target_still_open()` is true, reuse `open_target()`. Do not call `gen_next_mini_step_yield()`.
+- Otherwise call `gen_next_mini_step_yield()`. That yields six feet, `last_part`, the params, and `ask_for_50_ms_blend`.
 - If `params` is a `CmdVelParams` and `params.gait == 5`, this is the hunter follow walk.
   - `_begin_gait5` creates the session on the first mini-step and logs `gait 5 backend=...`.
   - `begin_target` on a freshly yielded pose.
   - `session.mini_step()`, then `_record_gait5` (the WARN, the one-hertz line, the CSV row).
   - `after_accepted_gait_step` only when `mini_step()` says the target finished and this yield was `last_part`. That pair is `gait_step_accepted`. A velocity walk uses it to order the outro, and the same wake then moves the order to `in_effect` after the feet go out.
   - Duration 0.05 s on the first slice of a `cmd_true` blend, otherwise 0.02 s. The thread still sleeps 0.02 s.
-  - `should_publish`: a hold does not publish. A dry run (`pseudo`) does not publish either.
+  - `should_publish`: a hold does not publish. A dry run (`dry_run_do_not_publish`) does not publish either. The vendor keyword on `set_pose_base` is still `pseudo`.
   - `_publish_leg_radians` hands eighteen radians, ids 1..18, to `JointControl`. It does not call `kinematics.so`, and it does not replace `self.pose`.
-  - `_integrate_fraction` adds `twist * 0.02 * delta_alpha` to the odometry.
+  - `_integrate_fraction` adds `twist * 0.02 * fraction_sent_this_wake` to the odometry.
 - Any other gait calls `set_pose_base`, which calls `kinematics.set_leg_position` six times.
 
 `_drop_gait5_if_replaced` forgets the session when `cur_moving_generator`
@@ -1092,7 +1098,7 @@ a walk on the robot.
 ### Recap
 
 - The loop is a 20 ms Python thread. Gait 5 goes through `Gait5Session`. Every other gait goes through `set_pose_base`.
-- An unfinished target is reused. `gen_next_mini_step_yield()` waits until alpha is 1.
+- An unfinished target is the same target as the last wake. `gen_next_mini_step_yield()` waits until `fraction_of_target_sent` is 1.
 - Publish is eighteen radians into `JointControl`, and only when the session's `publish` flag is true.
 
 ## Sitting 11 — Read the hunt as a worked example

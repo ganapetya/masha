@@ -130,14 +130,14 @@ def cycle_frames(vx_mm_s, vy_mm_s, wz_rad_s, stance):
     period. The caller adds the seam from the last frame back to
     the first, which is the wake the next lap actually takes.
 
-    finish_ps is cleared first. A leftover hand-off pose would splice
-    this cycle against some earlier run.
+    feet_saved_for_the_next_generator is cleared first. A leftover
+    hand-off pose would splice this cycle against some earlier run.
     """
     import controller.move as move
 
-    move.finish_ps = []
-    move.stop = False
-    move.slow = False
+    move.feet_saved_for_the_next_generator = []
+    move.refused_to_start_at_the_seam = False
+    move.ask_for_50_ms_blend = False
     params = move.CmdVelParams(
         gait=5,
         velocity_x=vx_mm_s,

@@ -353,7 +353,7 @@ class HexapodLegIk(LegIk):     # hexapod_kinematics.solve_pose, then safety.gate
 def make_leg_ik(use_hexapod: bool) -> LegIk: ...
 ```
 
-`IkDecision` is `allow`, the 18 radians if allowed, and a reason string either way. `VendorLegIk` does not run the new rate gate. Its angles are the reference the rate limit was measured from, and `JointControl` still enforces the ±120° window on them as it does today. `HexapodLegIk` runs the gate once on the feet it was given. It does not subdivide. The subdivision lives in a separate function in this same file, `approach_target`, so a test can call it without a generator and the gate stays a pure yes or no. On a hard refusal the caller publishes nothing.
+`IkDecision.gate_allows_these_radians` is whether the 18 radians may be published, plus a reason string either way. The C++ field is still `allow`. `VendorLegIk` does not run the new rate gate. Its angles are the reference the rate limit was measured from, and `JointControl` still enforces the ±120° window on them as it does today. `HexapodLegIk` runs the gate once on the feet it was given. It does not subdivide. The subdivision lives in a separate function in this same file, `approach_target`, so a test can call it without a generator and the gate stays a pure yes or no. On a hard refusal the caller publishes nothing.
 
 The flag is a ROS parameter on the step_controller node:
 
@@ -397,7 +397,7 @@ Columns:
 - Five hard holds in a row (100 ms): one `ERROR`, `holding last safe pose, generator frame frozen`. A `partial` send is not a hold, and it resets the streak. The generator is **not** dropped. A stand (`gait` -2) clears the generators the way a pose-set already does, and that is the way out of a hard hold. A new Twist waiting in `new_moving_generator` does not take over while the frame is unfinished, because takeover waits for `last_part`, and `last_part` arrives only from `gen_next_mini_step_yield()`.
 - A 1 Hz `INFO`: backend, last decision, and the largest `|dq|` in that second. The 50 Hz detail stays in the CSV.
 
-`pseudo=True` still solves, still gates, still enqueues a row with `decision=held`, `partial`, or `sent`, and still does not publish. A dry run is a trace with no motion.
+`dry_run_do_not_publish=True` still solves, still gates, still enqueues a row with `decision=held`, `partial`, or `sent`, and still does not publish. A dry run is a trace with no motion. The vendor keyword on `set_pose_base` is still `pseudo`.
 
 ## Wiring in the 20 ms loop
 
@@ -405,20 +405,20 @@ Columns:
 
 At both places that send `moving_pose` to the servos (the 20 ms mini-step and the 50 ms first-slice blend): if `params` is a `CmdVelParams` and `params.gait == 5`, call the plug selected for this generator. The generator is one phase for all six feet. Each `gen_next_mini_step_yield()` yields the next target and then advances `phase_index`. While a target is unfinished the loop keeps those six feet and does not call `gen_next_mini_step_yield()`.
 
-`approach_target(feet_anchor, target_feet_positions, alpha_done)` in `leg_ik.py` is the only place that turns one refused target into motion. `feet_anchor` is where this target started (the last feet that were sent at `alpha = 1`, or the feet of `self.pose` at the start of a bout). `alpha_done` is how far along the segment we have already sent, in `[0, 1]`.
+`approach_target(feet_where_this_target_started, target_feet_positions, fraction_of_target_sent)` in `leg_ik.py` is the only place that turns one refused target into motion. `feet_where_this_target_started` is where this target started (the last feet that were sent when the fraction reached 1, or the feet of `self.pose` at the start of a bout). `fraction_of_target_sent` is how far along the segment we have already sent, in `[0, 1]`.
 
-1. Solve the target's own feet (`alpha = 1`). If the gate allows them, send those angles, set `alpha_done = 1`, and the next mini-step may call `gen_next_mini_step_yield()`.
-2. If the only failure is `rate_limit`, the feet are legal and the joint move is too big. Search a fraction `alpha` in `(alpha_done, 1]` by eight bisections, which keeps this mini-step bounded. The candidate feet are one shared fraction for all six legs:
+1. Solve the target's own feet (fraction 1). If the gate allows them, send those angles, set `fraction_of_target_sent = 1`, and the next mini-step may call `gen_next_mini_step_yield()`. The CSV writes `sent`.
+2. If the only failure is `rate_limit`, the feet are legal and the joint move is too big. Search a fraction in `(fraction_of_target_sent, 1]` by eight bisections, which keeps this mini-step bounded. The candidate feet are one shared fraction for all six legs:
 
 ```
-feet(alpha) = feet_anchor + alpha * (target_feet_positions - feet_anchor)
+feet(fraction) = feet_where_this_target_started + fraction * (target_feet_positions - feet_where_this_target_started)
 ```
 
-   Accept the largest `alpha` whose solve passes the whole gate, including the joint-move check. Send that pose, remember it as `q_previous`, and store the new `alpha_done`. The generator stays on this target until some later mini-step is allowed at `alpha = 1`.
-3. If the target fails for any other reason (`unreachable`, `near_singular`, `joint_limit`, `non_finite`, `no_reference`), do not search. Publish nothing. Leave `q_previous` and `alpha_done` where they are.
-4. If the target is only `rate_limit` but no `alpha` above `alpha_done` passes, that is the same hard hold. A branch flip is this case: the foot barely moves, the knee solution jumps by about a radian, and every fraction has that same jump because the standing branch does not change. Catch-up must not sneak into the other fold.
+   Accept the largest fraction whose solve passes the whole gate, including the joint-move check. Send that pose, remember it as `last_sent_joint_radians`, and store the new `fraction_of_target_sent`. The generator stays on this target until some later mini-step is allowed at fraction 1. The CSV writes `partial`. The C++ pair on a refusal is still `q_now_rad` and `q_previous_rad`.
+3. If the target fails for any other reason (`unreachable`, `near_singular`, `joint_limit`, `non_finite`, `no_reference`), do not search. Publish nothing. Leave `last_sent_joint_radians` and `fraction_of_target_sent` where they are. The CSV writes `held`.
+4. If the target is only `rate_limit` but no fraction above `fraction_of_target_sent` passes, that is the same hard hold. A branch flip is this case: the foot barely moves, the knee solution jumps by about a radian, and every fraction has that same jump because the standing branch does not change. Catch-up must not sneak into the other fold.
 
-The target is finished only when point 1 allows the six feet the generator actually yielded. That path stores `alpha_done = 1` by assignment, so the later check is that stored value. It is not a comparison against the bisection result. Eight bisections leave the best fraction on a 1/256 grid of the remaining segment, so a value such as 0.996 is a partial, not a finished target. Snapping `alpha_done >= 0.999` up to 1 and calling `gen_next_mini_step_yield()` would start the next target while the feet are still short of this one, and it would do it without the gate having allowed this target. A candidate that is not at least one part in 256 past `alpha_done` is no progress, and that mini-step is a hard hold. Point 1 solves the generator's own foot tuple. It does not solve `feet_anchor + 1 * (target_feet_positions - feet_anchor)`, because that reconstruction can miss the original millimetres by a fraction of a unit in the last place.
+The target is finished only when point 1 allows the six feet the generator actually yielded. That path stores `fraction_of_target_sent = 1` by assignment, so the later check is that stored value. It is not a comparison against the bisection result. Eight bisections leave the best fraction on a 1/256 grid of the remaining segment, so a value such as 0.996 is a shorter point, not a finished target. Snapping `fraction_of_target_sent >= 0.999` up to 1 and calling `gen_next_mini_step_yield()` would start the next target while the feet are still short of this one, and it would do it without the gate having allowed this target. A candidate that is not at least one part in 256 past `fraction_of_target_sent` is no progress, and that mini-step is a hard hold. Point 1 solves the generator's own foot tuple. It does not solve `feet_where_this_target_started + 1 * (target_feet_positions - feet_where_this_target_started)`, because that reconstruction can miss the original millimetres by a fraction of a unit in the last place.
 
 This pause is for hunter gait 5, a tripod: three feet stay on the ground while one target is stretched over several mini-steps, so the body is not depending on a swing finishing on time. A gait that stays upright by momentum would fall if a swing were slowed this way. That gait is outside this module. The comment on `approach_target` says so.
 

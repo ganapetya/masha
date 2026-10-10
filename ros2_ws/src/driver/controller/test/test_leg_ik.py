@@ -14,6 +14,9 @@ from controller.leg_ik import (
     TRACE_QUEUE_BOUND,
     USE_HEXAPOD_KINEMATICS_DEFAULT,
     MiniStepResult,
+    generators_own_feet_sent,
+    last_safe_pose_kept,
+    shorter_point_sent,
     HexapodLegIk,
     HoldWatch,
     IkDecision,
@@ -89,19 +92,19 @@ class ScriptedIk(object):
 
     def __init__(self, target_feet_positions):
         self.target_feet_positions = target_feet_positions
-        self.previous = (0.0,) * 18
+        self.last_sent_joint_radians = (0.0,) * 18
         self.allow_target = False
         self.calls = []
 
-    def solve(self, pose):
-        self.calls.append(pose)
-        if pose is self.target_feet_positions and not self.allow_target:
+    def solve(self, six_feet):
+        self.calls.append(six_feet)
+        if six_feet is self.target_feet_positions and not self.allow_target:
             return IkDecision(
                 False, (1.0,) * 18, "rate_limit", 8, 3, 1.0, 0.0)
         return IkDecision(True, (0.1,) * 18, "", 0, 0, 0.0, 0.0)
 
-    def remember(self, angles):
-        self.previous = tuple(angles)
+    def remember_last_sent_radians(self, angles):
+        self.last_sent_joint_radians = tuple(angles)
 
 
 def _near_straight_feet():
@@ -170,36 +173,36 @@ def test_approach_solves_the_generator_feet_and_0996_stays_partial():
     mini_step_result = approach_target(
         ik, target_feet_positions, target_feet_positions, 0.0)
     assert ik.calls[0] is target_feet_positions
-    assert mini_step_result.decision == "partial"
-    assert mini_step_result.alpha == pytest.approx(255.0 / 256.0)
-    assert mini_step_result.alpha < 1.0
-    assert mini_step_result.alpha_done == mini_step_result.alpha
+    assert mini_step_result.what_this_wake_published == shorter_point_sent
+    assert mini_step_result.fraction_reached_along_the_target == pytest.approx(255.0 / 256.0)
+    assert mini_step_result.fraction_reached_along_the_target < 1.0
+    assert mini_step_result.fraction_of_target_sent == mini_step_result.fraction_reached_along_the_target
     assert mini_step_result.publish is True
     assert mini_step_result.reason == "rate_limit"
     # A later mini-step on the same target still waits for those feet.
     later = approach_target(
         ik, target_feet_positions, target_feet_positions,
-        mini_step_result.alpha_done)
-    assert later.decision == "partial"
-    assert later.alpha < 1.0
-    assert later.alpha_done > mini_step_result.alpha_done
+        mini_step_result.fraction_of_target_sent)
+    assert later.what_this_wake_published == shorter_point_sent
+    assert later.fraction_reached_along_the_target < 1.0
+    assert later.fraction_of_target_sent > mini_step_result.fraction_of_target_sent
     ik.allow_target = True
     done = approach_target(
-        ik, target_feet_positions, target_feet_positions, later.alpha_done)
-    assert done.decision == "sent"
-    assert done.alpha == 1.0
-    assert done.alpha_done == 1.0
+        ik, target_feet_positions, target_feet_positions, later.fraction_of_target_sent)
+    assert done.what_this_wake_published == generators_own_feet_sent
+    assert done.fraction_reached_along_the_target == 1.0
+    assert done.fraction_of_target_sent == 1.0
     assert ik.calls[-1] is target_feet_positions
-    assert should_publish(done, pseudo=True) is False
-    assert should_publish(done, pseudo=False) is True
+    assert should_publish(done, dry_run_do_not_publish=True) is False
+    assert should_publish(done, dry_run_do_not_publish=False) is True
 
 
 def test_odometry_leftover_is_not_a_full_mini_step():
     twist = (0.12, -0.05, 0.6)
-    full = odometry_increment(*twist, delta_alpha=1.0)
-    early = odometry_increment(*twist, delta_alpha=0.25)
-    rest = odometry_increment(*twist, delta_alpha=0.75)
-    hold = odometry_increment(*twist, delta_alpha=0.0)
+    full = odometry_increment(*twist, fraction_sent_this_wake=1.0)
+    early = odometry_increment(*twist, fraction_sent_this_wake=0.25)
+    rest = odometry_increment(*twist, fraction_sent_this_wake=0.75)
+    hold = odometry_increment(*twist, fraction_sent_this_wake=0.0)
     assert hold == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     for whole, left, right in zip(full, early, rest):
         assert whole == pytest.approx(left + right)
@@ -232,7 +235,7 @@ def test_the_writer_appends_a_header_and_a_row(tmp_path):
     log = Log()
     writer = TraceWriter(str(path), log)
     mini_step_result = MiniStepResult(
-        "sent", 1.0, 1.0, (0.1,) * 18, "", 0, 0, 0.0, 0.0,
+        generators_own_feet_sent, 1.0, 1.0, (0.1,) * 18, "", 0, 0, 0.0, 0.0,
         default_feet(), default_feet(), ("",) * 18, True)
     row = trace_row(1.5, "vendor", mini_step_result)
     assert len(row) == len(TRACE_COLUMNS)
@@ -258,7 +261,7 @@ def test_five_hard_holds_log_one_error_and_a_partial_resets():
     watch = HoldWatch()
     feet = default_feet()
     held = MiniStepResult(
-        "held", 0.0, 0.0, (0.0,) * 18, "unreachable", 0, 4,
+        last_safe_pose_kept, 0.0, 0.0, (0.0,) * 18, "unreachable", 0, 4,
         0.0, 0.0, feet, feet, ("",) * 18, False)
     for _ in range(4):
         watch.note(log, held)
@@ -271,7 +274,7 @@ def test_five_hard_holds_log_one_error_and_a_partial_resets():
     watch.note(log, held)
     assert watch.errors == 1
     partial = MiniStepResult(
-        "partial", 0.5, 0.5, (0.1,) * 18, "rate_limit", 8, 3,
+        shorter_point_sent, 0.5, 0.5, (0.1,) * 18, "rate_limit", 8, 3,
         1.0, 0.0, feet, feet, (0.01,) * 18, True)
     watch.note(log, partial)
     assert watch.streak == 0
@@ -284,10 +287,10 @@ def test_five_hard_holds_log_one_error_and_a_partial_resets():
 def test_second_log_prints_the_finished_second():
     log = Log()
     second = SecondLog()
-    second.note(log, 0.2, "vendor", "sent", (0.01, ""))
-    second.note(log, 0.8, "vendor", "partial", (0.2,))
+    second.note(log, 0.2, "vendor", generators_own_feet_sent, (0.01, ""))
+    second.note(log, 0.8, "vendor", shorter_point_sent, (0.2,))
     assert log.infos == []
-    second.note(log, 1.05, "vendor", "sent", (0.0,))
+    second.note(log, 1.05, "vendor", generators_own_feet_sent, (0.0,))
     assert log.infos == ["backend=vendor decision=partial max_dq=0.2000"]
 
 
@@ -295,10 +298,10 @@ def test_stand_is_sent_and_matches_the_vendor_tape():
     ik = HexapodLegIk()
     feet = default_feet()
     reference = ik.establish_reference(feet)
-    assert reference.allow is True
+    assert reference.gate_allows_these_radians is True
     mini_step_result = approach_target(ik, feet, feet, 0.0)
-    assert mini_step_result.decision == "sent"
-    assert mini_step_result.alpha == 1.0
+    assert mini_step_result.what_this_wake_published == generators_own_feet_sent
+    assert mini_step_result.fraction_reached_along_the_target == 1.0
     assert mini_step_result.publish is True
     assert mini_step_result.reason == ""
     flat = []
@@ -311,70 +314,70 @@ def test_stand_is_sent_and_matches_the_vendor_tape():
 def test_unreachable_and_near_singular_hold_without_moving_alpha():
     ik = HexapodLegIk()
     feet = default_feet()
-    assert ik.establish_reference(feet).allow is True
-    previous = ik.previous
+    assert ik.establish_reference(feet).gate_allows_these_radians is True
+    last_sent_joint_radians = ik.last_sent_joint_radians
     far = list(feet)
     far[3] = (0.0, 0.0, 500.0)
     far = tuple(far)
     held = approach_target(ik, feet, far, 0.25)
-    assert held.decision == "held"
+    assert held.what_this_wake_published == last_safe_pose_kept
     assert held.reason == "unreachable"
     assert held.leg == 4
-    assert held.alpha == 0.0
-    assert held.alpha_done == 0.25
+    assert held.fraction_reached_along_the_target == 0.0
+    assert held.fraction_of_target_sent == 0.25
     assert held.publish is False
-    assert ik.previous is previous
+    assert ik.last_sent_joint_radians is last_sent_joint_radians
     straight = _near_straight_feet()
     knee = approach_target(ik, feet, straight, 0.25)
-    assert knee.decision == "held"
+    assert knee.what_this_wake_published == last_safe_pose_kept
     assert knee.reason == "near_singular"
     assert knee.leg == 6
-    assert knee.alpha_done == 0.25
-    assert ik.previous is previous
+    assert knee.fraction_of_target_sent == 0.25
+    assert ik.last_sent_joint_radians is last_sent_joint_radians
 
 
 def test_no_reference_holds_when_the_stand_was_not_solved():
     ik = HexapodLegIk()
     feet = default_feet()
     held = approach_target(ik, feet, feet, 0.0)
-    assert held.decision == "held"
+    assert held.what_this_wake_published == last_safe_pose_kept
     assert held.reason == "no_reference"
     assert held.publish is False
-    assert ik.previous is None
+    assert ik.last_sent_joint_radians is None
 
 
 def test_a_long_legal_target_sums_its_alphas_to_one():
     ik = HexapodLegIk()
     anchor = default_feet()
-    assert ik.establish_reference(anchor).allow is True
+    assert ik.establish_reference(anchor).gate_allows_these_radians is True
     target_feet_positions = _rate_limit_target(ik, anchor)
-    alpha_done = 0.0
+    fraction_of_target_sent = 0.0
     deltas = []
     first = None
     finished = None
     for _ in range(BISECTION_PARTS + 8):
-        before = alpha_done
+        before = fraction_of_target_sent
         mini_step_result = approach_target(
-            ik, anchor, target_feet_positions, alpha_done)
-        assert mini_step_result.decision != "held"
+            ik, anchor, target_feet_positions, fraction_of_target_sent)
+        assert mini_step_result.what_this_wake_published != last_safe_pose_kept
         if first is None:
             first = mini_step_result
-        deltas.append(mini_step_result.alpha_done - before)
-        alpha_done = mini_step_result.alpha_done
-        if mini_step_result.decision == "sent":
+        deltas.append(mini_step_result.fraction_of_target_sent - before)
+        fraction_of_target_sent = mini_step_result.fraction_of_target_sent
+        if mini_step_result.what_this_wake_published == generators_own_feet_sent:
             finished = mini_step_result
             break
-    assert first.decision == "partial"
-    assert first.alpha < 1.0
+    assert first.what_this_wake_published == shorter_point_sent
+    assert first.fraction_reached_along_the_target < 1.0
     assert first.publish is True
     assert finished is not None
-    assert finished.alpha == 1.0
-    assert finished.decision == "sent"
+    assert finished.fraction_reached_along_the_target == 1.0
+    assert finished.what_this_wake_published == generators_own_feet_sent
     assert sum(deltas) == pytest.approx(1.0)
     assert deltas[-1] == pytest.approx(1.0 - sum(deltas[:-1]))
     twist = (0.12, 0.10, 0.6)
-    pieces = [odometry_increment(*twist, delta_alpha=d) for d in deltas]
-    whole = odometry_increment(*twist, delta_alpha=1.0)
+    pieces = [odometry_increment(*twist, fraction_sent_this_wake=d) for d in deltas]
+    whole = odometry_increment(*twist, fraction_sent_this_wake=1.0)
     for index in range(6):
         assert sum(piece[index] for piece in pieces) == pytest.approx(
             whole[index])
@@ -386,22 +389,22 @@ def test_a_long_legal_target_sums_its_alphas_to_one():
 def test_a_same_foot_branch_flip_is_a_hold():
     # The standing branch does not change. A one-radian disagreement
     # on a foot that moves 1 mm is still about a radian at every
-    # fraction, so no alpha passes and nothing is published.
+    # fraction, so no fraction passes and nothing is published.
     ik = HexapodLegIk()
     feet = default_feet()
-    assert ik.establish_reference(feet).allow is True
-    shifted = list(ik.previous)
+    assert ik.establish_reference(feet).gate_allows_these_radians is True
+    shifted = list(ik.last_sent_joint_radians)
     shifted[1] = shifted[1] + 1.0
-    ik.previous = tuple(shifted)
+    ik.last_sent_joint_radians = tuple(shifted)
     target_feet_positions = list(feet)
     target_feet_positions[0] = (feet[0][0] + 1.0, feet[0][1], feet[0][2])
     target_feet_positions = tuple(target_feet_positions)
-    before = ik.previous
+    before = ik.last_sent_joint_radians
     mini_step_result = approach_target(ik, feet, target_feet_positions, 0.0)
-    assert mini_step_result.decision == "held"
+    assert mini_step_result.what_this_wake_published == last_safe_pose_kept
     assert mini_step_result.reason == "rate_limit"
-    assert mini_step_result.alpha == 0.0
-    assert mini_step_result.alpha_done == 0.0
+    assert mini_step_result.fraction_reached_along_the_target == 0.0
+    assert mini_step_result.fraction_of_target_sent == 0.0
     assert mini_step_result.publish is False
-    assert ik.previous is before
+    assert ik.last_sent_joint_radians is before
     assert should_publish(mini_step_result) is False
