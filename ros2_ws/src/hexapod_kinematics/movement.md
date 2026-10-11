@@ -145,7 +145,7 @@ sequenceDiagram
         Pull->>Pull: gen_next_mini_step_yield(stance, generator_slice)
         Note over Pull: The generator yields the next baked page and moves its bookmark.
         alt last_part and the page is legacy
-            Pull->>State: counted walk swaps now; velocity walk only orders the outro
+            Pull->>State: counted walk swaps now. A velocity walk only orders the outro
         else last_part and the page is gait 5
             Note over State: left for the hunter tick, after the gate accepts the page
         end
