@@ -19,7 +19,7 @@ from std_msgs.msg import Bool
 from lk_body.envfile import load
 from lk_body.listen import HoldMic
 from lk_body.playback import PcmPlayer
-from lk_body.poses import jaw_while
+from lk_body.poses import jaw_while, play_once
 
 MIMICS = Path("/home/ubuntu/ros2_ws/src/lk_body/config/mimics.json")
 ACTIONS = Path("/home/ubuntu/software/actionset_editor/ActionGroups")
@@ -96,16 +96,30 @@ class LkBody(Node):
             return b""
         return wav
 
-    def enqueue(self, pcm: bytes) -> None:
+    def enqueue(self, pcm: bytes, actions: list | None = None) -> None:
+        names = []
+        for name in actions or []:
+            if not isinstance(name, str):
+                continue
+            base = Path(name).name
+            if base.endswith(".d6a"):
+                base = base[:-4]
+            if not base or base == self._speaking or base in names:
+                continue
+            if not (ACTIONS / f"{base}.d6a").is_file():
+                log.info("file_missing %s", base)
+                continue
+            names.append(base)
         self._stop_line.set()
         self._player.stop()
-        self._queue.put(pcm)
+        self._queue.put((pcm, names))
 
     def _play_loop(self) -> None:
         while True:
-            pcm = self._queue.get()
-            if pcm is None:
+            item = self._queue.get()
+            if item is None:
                 return
+            pcm, names = item
             self._stop_line.clear()
             self._player.play(pcm)
 
@@ -115,6 +129,10 @@ class LkBody(Node):
             jaw_while(still, self.publish_action, self._idle, self._speaking)
             self._player.stop()
             self._muted_until = time.monotonic() + MUTE_S
+            for name in names:
+                if self._stop_line.is_set():
+                    break
+                play_once(self.publish_action, self._idle, name)
 
     def shutdown(self) -> None:
         self._stop_line.set()
@@ -166,6 +184,10 @@ async def _session(node: LkBody, socket, token: str) -> None:
     if registered.get("type") != "registered":
         log.warning("register failed")
         return
+    ready_pose = node._mimics.get("ready") or {}
+    ready_name = ready_pose.get("action") if isinstance(ready_pose, dict) else ""
+    if isinstance(ready_name, str) and (ACTIONS / f"{ready_name}.d6a").is_file():
+        node.publish_action(ready_name)
     config = json.loads(await socket.recv())
     if config.get("type") != "config":
         log.warning("missing config")
@@ -180,7 +202,8 @@ async def _session(node: LkBody, socket, token: str) -> None:
             await _speak(node, socket, bool(message.get("down")))
         elif kind == "delivery":
             pcm = base64.b64decode(message.get("pcm") or "")
-            node.enqueue(pcm)
+            actions = message.get("actions") if isinstance(message.get("actions"), list) else []
+            node.enqueue(pcm, actions)
         elif kind == "config":
             ready, reason = node.startup_status()
             await socket.send(json.dumps({"type": "status", "ready": ready, "reason": reason}))
@@ -203,6 +226,7 @@ async def _speak(node: LkBody, socket, down: bool) -> None:
         return
     wav = node.on_up()
     if not wav:
+        await socket.send(json.dumps({"type": "audio", "data": "", "mime": "audio/wav"}))
         return
     await socket.send(
         json.dumps(

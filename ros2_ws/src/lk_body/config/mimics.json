@@ -1,9 +1,32 @@
 {
-  "speaking": {"action": "speaking_masha", "intent": "jaw"},
+  "speaking": {
+    "action": "speaking_masha",
+    "intent": "jaw"
+  },
   "stances": [
-    {"token": "agreement", "action": "lk_agreement", "intent": "One in-place nod, legs stay a stand."},
-    {"token": "disagreement", "action": "lk_disagreement", "intent": "One in-place rock, legs stay a stand."},
-    {"token": "frustration", "action": "lk_frustration", "intent": "One short dip, legs stay a stand."},
-    {"token": "curiosity", "action": "lk_curiosity", "intent": "Head up, small lean, legs stay a stand."}
-  ]
+    {
+      "token": "agreement",
+      "action": "lk_agreement",
+      "intent": "Pitch the head down, then back to the look-ahead pose. Legs stay a stand."
+    },
+    {
+      "token": "disagreement",
+      "action": "lk_disagreement",
+      "intent": "Lift the arm end a little, yaw left and right twice, then back. Legs stay a stand."
+    },
+    {
+      "token": "frustration",
+      "action": "lk_frustration",
+      "intent": "Arm straight up, looking at the ceiling. Legs stay a stand."
+    },
+    {
+      "token": "curiosity",
+      "action": "lk_curiosity",
+      "intent": "Rise on the legs, then back down."
+    }
+  ],
+  "ready": {
+    "action": "lk_look_ahead",
+    "intent": "Head level, looking straight ahead. Legs stay a stand."
+  }
 }

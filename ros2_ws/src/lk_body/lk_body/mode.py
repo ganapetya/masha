@@ -64,6 +64,43 @@ def body_running() -> bool:
 
 def stop_startup() -> None:
     _signal_marked(STARTUP_MARK, protect=BRINGUP_MARK)
+    _stop_voice_leftovers()
+
+
+def _stop_voice_leftovers() -> None:
+    """The launch can exit and leave the mic owner in bringup's process group.
+
+    Signal those pids only. Their group is bringup, and killing the group stops the legs.
+    """
+    marks = ("asr_node.py", "voice_control_move.py")
+    parents = []
+    for pid, cmd in _commands():
+        if BRINGUP_MARK in cmd:
+            continue
+        if any(mark in cmd for mark in marks):
+            parents.append(pid)
+    parent_set = set(parents)
+    children = []
+    for pid, cmd in _commands():
+        if "arecord" not in cmd.split():
+            continue
+        if _ppid(pid) in parent_set:
+            children.append(pid)
+    for pid in children + parents:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def _ppid(pid: int) -> int:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("PPid:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+    return 0
 
 
 def stop_body() -> None:

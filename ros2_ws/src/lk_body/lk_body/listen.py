@@ -25,21 +25,18 @@ class HoldMic:
             try:
                 proc = subprocess.Popen(
                     [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-f",
+                        "arecord",
+                        "-q",
+                        "-D",
                         "pulse",
-                        "-i",
-                        self._source,
-                        "-ac",
-                        "1",
-                        "-ar",
-                        str(RATE),
                         "-f",
-                        "s16le",
-                        "pipe:1",
+                        "S16_LE",
+                        "-c",
+                        "1",
+                        "-r",
+                        str(RATE),
+                        "-t",
+                        "raw",
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
@@ -101,5 +98,22 @@ def _wav(pcm: bytes) -> bytes:
         handle.setnchannels(1)
         handle.setsampwidth(2)
         handle.setframerate(RATE)
-        handle.writeframes(pcm)
+        handle.writeframes(_louder(pcm))
     return buffer.getvalue()
+
+
+def _louder(pcm: bytes) -> bytes:
+    """The iFlytek stream sits near silence. Lift a quiet take so the recognizer keeps it."""
+    import array
+    if len(pcm) < 2:
+        return pcm
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    peak = max((abs(item) for item in samples), default=0)
+    if peak < 400 or peak >= 12000:
+        return pcm
+    gain = min(12.0, 12000.0 / peak)
+    raised = array.array("h", (max(-32767, min(32767, int(item * gain))) for item in samples))
+    return raised.tobytes()
