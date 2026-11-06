@@ -1,0 +1,10 @@
+#!/bin/bash
+# Sources Humble and the workspace, then enters or leaves her talk mode.
+set -eu
+source /opt/ros/humble/setup.bash
+if [ -f /home/ubuntu/ros2_ws/install/setup.bash ]; then
+  source /home/ubuntu/ros2_ws/install/setup.bash
+fi
+export ROS_DOMAIN_ID=27
+export PYTHONPATH="/home/ubuntu/ros2_ws/src/lk_body${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m lk_body.mode "$@"
