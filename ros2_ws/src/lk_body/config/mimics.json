@@ -17,7 +17,7 @@
     {
       "token": "frustration",
       "action": "lk_frustration",
-      "intent": "Arm straight up, looking at the ceiling. Legs stay a stand."
+      "intent": "Arm up, the gripper opens and closes twice, then the arm returns to the look-ahead stand."
     },
     {
       "token": "curiosity",
@@ -28,5 +28,13 @@
   "ready": {
     "action": "lk_look_ahead",
     "intent": "Head level, looking straight ahead. Legs stay a stand."
-  }
+  },
+  "involuntary_animocity": true,
+  "involuntary": [
+    "involuntary_1",
+    "involuntary_2",
+    "involuntary_3",
+    "involuntary_4",
+    "involuntary_5"
+  ]
 }

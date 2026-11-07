@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import random
 import logging
 import queue
 import shutil
@@ -44,6 +45,11 @@ class LkBody(Node):
         self._discard = False
         self._mimics = json.loads(MIMICS.read_text(encoding="utf-8"))
         self._speaking = self._mimics["speaking"]["action"]
+        self._involuntary_on = bool(self._mimics.get("involuntary_animocity", True))
+        self._involuntary = [
+            name for name in (self._mimics.get("involuntary") or [])
+            if isinstance(name, str) and (ACTIONS / f"{name}.d6a").is_file()
+        ]
         self._worker = threading.Thread(target=self._play_loop, daemon=True)
         self._worker.start()
 
@@ -129,6 +135,8 @@ class LkBody(Node):
             jaw_while(still, self.publish_action, self._idle, self._speaking)
             self._player.stop()
             self._muted_until = time.monotonic() + MUTE_S
+            if not names and self._involuntary_on and self._involuntary:
+                names = [random.choice(self._involuntary)]
             for name in names:
                 if self._stop_line.is_set():
                     break
