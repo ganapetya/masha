@@ -102,7 +102,7 @@ class LkBody(Node):
             return b""
         return wav
 
-    def enqueue(self, pcm: bytes, actions: list | None = None) -> None:
+    def enqueue(self, pcm: bytes, actions: list | None = None, language: str = "") -> None:
         names = []
         for name in actions or []:
             if not isinstance(name, str):
@@ -118,16 +118,16 @@ class LkBody(Node):
             names.append(base)
         self._stop_line.set()
         self._player.stop()
-        self._queue.put((pcm, names))
+        self._queue.put((pcm, names, language or ""))
 
     def _play_loop(self) -> None:
         while True:
             item = self._queue.get()
             if item is None:
                 return
-            pcm, names = item
+            pcm, names, language = item
             self._stop_line.clear()
-            self._player.play(pcm)
+            self._player.play(pcm, _speech_volume(language))
 
             def still() -> bool:
                 return self._player.playing() and not self._stop_line.is_set()
@@ -211,7 +211,7 @@ async def _session(node: LkBody, socket, token: str) -> None:
         elif kind == "delivery":
             pcm = base64.b64decode(message.get("pcm") or "")
             actions = message.get("actions") if isinstance(message.get("actions"), list) else []
-            node.enqueue(pcm, actions)
+            node.enqueue(pcm, actions, str(message.get("language") or ""))
         elif kind == "config":
             ready, reason = node.startup_status()
             await socket.send(json.dumps({"type": "status", "ready": ready, "reason": reason}))
@@ -232,6 +232,8 @@ async def _speak(node: LkBody, socket, down: bool) -> None:
         if reason:
             await socket.send(json.dumps({"type": "status", "ready": False, "reason": reason}))
         return
+    # The finger lifts on the last word. Keep the mic for one second so that word is in the wav.
+    await asyncio.sleep(1.0)
     wav = node.on_up()
     if not wav:
         await socket.send(json.dumps({"type": "audio", "data": "", "mime": "audio/wav"}))
@@ -245,6 +247,13 @@ async def _speak(node: LkBody, socket, down: bool) -> None:
             }
         )
     )
+
+
+
+def _speech_volume(language: str) -> int:
+    """Pulse stream volume. 65536 is the level she had. English quieter, Norsk louder."""
+    gain = {"en": 0.8, "nb": 1.3}.get(language, 1.0)
+    return int(65536 * gain)
 
 
 def _running(mark: str) -> bool:

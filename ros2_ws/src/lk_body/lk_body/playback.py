@@ -1,4 +1,4 @@
-"""Play 22050 Hz mono PCM on Pulse. ffmpeg and aplay share one process group."""
+"""Play 22050 Hz mono PCM on Pulse. pacat is one process group."""
 
 import os
 import signal
@@ -16,22 +16,47 @@ class PcmPlayer:
             proc = self._proc
         return proc is not None and proc.poll() is None
 
-    def play(self, pcm: bytes) -> None:
+    def play(self, pcm: bytes, volume: int = 65536) -> None:
         self.stop()
         proc = subprocess.Popen(
-            "ffmpeg -hide_banner -loglevel error -f s16le -ar 22050 -ac 1 -i pipe:0 -f wav - | aplay -q -D pulse",
-            shell=True,
+            [
+                "pacat",
+                "--playback",
+                "--rate",
+                "22050",
+                "--format",
+                "s16le",
+                "--channels",
+                "1",
+                "--volume",
+                str(int(volume)),
+                "--latency-msec",
+                "50",
+                "--client-name",
+                "lk_body",
+            ],
             stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        if proc.stdin is not None:
-            try:
-                proc.stdin.write(pcm)
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
         with self._lock:
             self._proc = proc
+
+        def feed() -> None:
+            try:
+                if proc.stdin is None:
+                    return
+                view = memoryview(pcm)
+                step = 4096
+                for start in range(0, len(view), step):
+                    proc.stdin.write(view[start : start + step])
+                    proc.stdin.flush()
+                proc.stdin.close()
+            except (BrokenPipeError, ValueError, OSError):
+                pass
+
+        threading.Thread(target=feed, daemon=True).start()
 
     def stop(self) -> None:
         with self._lock:
