@@ -40,6 +40,7 @@ class LkBody(Node):
         self._queue: queue.Queue = queue.Queue()
         self._names: queue.Queue = queue.Queue()
         self._stop_line = threading.Event()
+        self._on_played = None
         self.create_timer(0.05, self._flush_actions)
         self._muted_until = 0.0
         self._discard = False
@@ -134,6 +135,8 @@ class LkBody(Node):
 
             jaw_while(still, self.publish_action, self._idle, self._speaking)
             self._player.stop()
+            if pcm and not self._stop_line.is_set():
+                self._note_played()
             self._muted_until = time.monotonic() + MUTE_S
             if not names and self._involuntary_on and self._involuntary:
                 names = [random.choice(self._involuntary)]
@@ -141,6 +144,11 @@ class LkBody(Node):
                 if self._stop_line.is_set():
                     break
                 play_once(self.publish_action, self._idle, name)
+
+    def _note_played(self) -> None:
+        notify = self._on_played
+        if notify is not None:
+            notify()
 
     def shutdown(self) -> None:
         self._stop_line.set()
@@ -159,7 +167,34 @@ def main() -> None:
         raise SystemExit(1)
     rclpy.init()
     node = LkBody()
-    thread = threading.Thread(target=lambda: asyncio.run(_dial(node, url, token)), daemon=True)
+    from lk_body.session import run as run_session
+
+    def _registered() -> None:
+        ready_pose = node._mimics.get("ready") or {}
+        ready_name = ready_pose.get("action") if isinstance(ready_pose, dict) else ""
+        if isinstance(ready_name, str) and (ACTIONS / f"{ready_name}.d6a").is_file():
+            node.publish_action(ready_name)
+
+    async def _on_speak(down: bool, socket) -> None:
+        await _speak(node, socket, down)
+
+    thread = threading.Thread(
+        target=lambda: asyncio.run(
+            run_session(
+                url,
+                token,
+                "masha",
+                _register(node),
+                node.startup_status,
+                node.enqueue,
+                _on_speak,
+                lambda callback: setattr(node, "_on_played", callback),
+                rclpy.ok,
+                _registered,
+            )
+        ),
+        daemon=True,
+    )
     thread.start()
     try:
         rclpy.spin(node)
@@ -167,54 +202,6 @@ def main() -> None:
         node.shutdown()
         node.destroy_node()
         rclpy.shutdown()
-
-
-async def _dial(node: LkBody, url: str, token: str) -> None:
-    import websockets
-
-    while rclpy.ok():
-        try:
-            async with websockets.connect(url, open_timeout=10) as socket:
-                await _session(node, socket, token)
-        except Exception as exc:
-            log.warning("dial failed: %s", type(exc).__name__)
-            await asyncio.sleep(2)
-
-
-async def _session(node: LkBody, socket, token: str) -> None:
-    await socket.send(json.dumps({"type": "attach", "body_id": "masha", "token": token}))
-    attached = json.loads(await socket.recv())
-    if attached.get("type") != "attached":
-        log.warning("attach refused: %s", attached.get("reason", ""))
-        return
-    await socket.send(json.dumps(_register(node)))
-    registered = json.loads(await socket.recv())
-    if registered.get("type") != "registered":
-        log.warning("register failed")
-        return
-    ready_pose = node._mimics.get("ready") or {}
-    ready_name = ready_pose.get("action") if isinstance(ready_pose, dict) else ""
-    if isinstance(ready_name, str) and (ACTIONS / f"{ready_name}.d6a").is_file():
-        node.publish_action(ready_name)
-    config = json.loads(await socket.recv())
-    if config.get("type") != "config":
-        log.warning("missing config")
-        return
-    ready, reason = node.startup_status()
-    await socket.send(json.dumps({"type": "status", "ready": ready, "reason": reason}))
-    while True:
-        raw = await socket.recv()
-        message = json.loads(raw)
-        kind = message.get("type")
-        if kind == "speak":
-            await _speak(node, socket, bool(message.get("down")))
-        elif kind == "delivery":
-            pcm = base64.b64decode(message.get("pcm") or "")
-            actions = message.get("actions") if isinstance(message.get("actions"), list) else []
-            node.enqueue(pcm, actions, str(message.get("language") or ""))
-        elif kind == "config":
-            ready, reason = node.startup_status()
-            await socket.send(json.dumps({"type": "status", "ready": ready, "reason": reason}))
 
 
 def _register(node: LkBody) -> dict:
