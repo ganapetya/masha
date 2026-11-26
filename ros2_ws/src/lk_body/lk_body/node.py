@@ -238,8 +238,8 @@ async def _speak(node: LkBody, socket, down: bool) -> None:
 
 
 def _speech_volume(language: str) -> int:
-    """Pulse stream volume. 65536 is the level she had. English quieter, Norsk louder."""
-    gain = {"en": 0.8, "nb": 1.3}.get(language, 1.0)
+    """Pulse stream volume. 65536 is the level she had. English and Ukrainian quieter, Norsk louder."""
+    gain = {"en": 0.8, "nb": 1.3, "uk": 0.7}.get(language, 1.0)
     return int(65536 * gain)
 
 
